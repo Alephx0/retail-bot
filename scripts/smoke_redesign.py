@@ -1,0 +1,81 @@
+"""Redesign acceptance checks on isolated port 8766; never purchases."""
+import asyncio
+from uuid import uuid4
+from patchright.async_api import async_playwright, expect
+
+BASE='http://127.0.0.1:8766'
+
+
+async def main():
+    async with async_playwright() as driver:
+        browser=await driver.chromium.launch()
+        page=await browser.new_page(viewport={'width':1440,'height':1000})
+        errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+        tag=uuid4().hex[:6]
+        await page.goto(BASE)
+        await page.locator('.analytics-cards').wait_for()
+        assert await page.locator('.sidebar [data-view]').count()==8
+        await page.locator('[data-view=profiles]').click()
+        await page.locator('[data-new-folder]').click()
+        await page.get_by_label('Folder name',exact=True).fill('Family '+tag)
+        await page.locator('dialog[open] button[type=submit]').click()
+        await page.locator('[data-import-existing]').wait_for()
+        await page.locator('[data-resource-create]').click()
+        await page.get_by_label('Profile name',exact=True).fill('Profile '+tag)
+        await page.locator('[data-profile-tab=shipping]').click()
+        await page.get_by_label('Full name',exact=True).first.fill('Fixture Person')
+        await page.get_by_label('City',exact=True).first.fill('Test City')
+        await page.locator('#editor button[type=submit]').click()
+        await page.locator('.resource-items').get_by_text('Profile '+tag,exact=True).wait_for()
+        await page.locator('[data-folder=""]').click()
+        await page.get_by_text('Profile '+tag,exact=True).wait_for()
+        await page.locator('[data-view=accounts]').click()
+        await page.locator('[data-resource-create]').click()
+        await page.get_by_label('Login username / email',exact=True).fill('fixture-'+tag+'@example.com')
+        await page.locator('#editor button[type=submit]').click()
+        row=page.locator('tr').filter(has_text='fixture-'+tag+'@example.com')
+        await row.locator('[data-link-account]').click()
+        await page.locator('dialog[open]').get_by_label('Profile '+tag,exact=True).check()
+        await page.get_by_role('button',name='Save relationships',exact=True).click()
+        await page.locator('[data-view=tasks]').click()
+        await page.locator('#primary').click()
+        await page.get_by_label('Group name',exact=True).fill('Group '+tag)
+        await page.get_by_role('button',name='Create task group',exact=True).click()
+        await page.locator('[data-group-tab=monitoring]').click()
+        await page.get_by_label('Monitor Input',exact=True).fill('B0DEMO0001;35')
+        await page.get_by_role('button',name='Save settings',exact=True).click()
+        await page.locator('#primary').click()
+        await page.locator('[data-assignment-profile=profile_group]').click()
+        await page.get_by_label('Profile Group',exact=True).select_option(label='Family '+tag)
+        await page.get_by_label('Match Accounts to Profiles',exact=True).check()
+        await page.get_by_label('Task quantity',exact=True).fill('2')
+        await expect(page.locator('.assignment-preview tbody tr')).to_have_count(2)
+        await expect(page.locator('.assignment-preview')).to_contain_text('fixture-'+tag+'@example.com')
+        await page.get_by_role('button',name='Create 2 tasks',exact=True).click()
+        await page.wait_for_timeout(700)
+        if await page.locator('#assignment-editor').count(): print((await page.locator('#assignment-editor').inner_text()).encode('ascii','replace').decode())
+        await expect(page.locator('.task-panel tbody tr')).to_have_count(2)
+        await page.get_by_role('button',name='Start all',exact=True).click()
+        await page.get_by_text('Simulated checkout completed; no order placed',exact=True).first.wait_for(timeout=15000)
+        await page.screenshot(path='artifacts/redesign-tasks.png',full_page=True)
+        await page.locator('[data-view=home]').click()
+        await page.locator('#home-simulation').check()
+        await page.wait_for_function("Number(document.querySelectorAll('.analytics-cards strong')[2].textContent)>=2")
+        await page.locator('[data-view=settings]').click()
+        await page.locator('[data-settings-tab=integrations]').click()
+        await page.get_by_label('Local AI Diagnosis Endpoint',exact=True).wait_for()
+        await page.locator('[data-settings-tab=browser]').click()
+        await page.get_by_label('Local CDP Endpoint',exact=True).wait_for()
+        await page.get_by_role('button',name='Save settings',exact=True).click()
+        await page.locator('[data-view=manager]').click()
+        await page.locator('[data-manage=verify]').wait_for()
+        await page.locator('[data-view=home]').click()
+        await page.set_viewport_size({'width':390,'height':844})
+        await page.screenshot(path='artifacts/redesign-mobile.png',full_page=True)
+        assert await page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+        assert not errors,errors
+        await browser.close()
+        print('PASS: navigation, folders, tabbed profiles, relationships, assignment preview, tasks, simulation, analytics, settings, manager, mobile')
+
+
+if __name__=='__main__':asyncio.run(main())
