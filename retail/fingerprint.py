@@ -28,8 +28,8 @@ Design rules:
     unsupported features reject with TypeError.
   - Audio metadata fallbacks are keyed on the same seed as the GPU profile,
     but semantically valid native values are preserved. Positive sample
-    rates, non-negative latency values, mono channel counts, and the zero
-    maxChannelCount used by OfflineAudioContext are left untouched. Rendered
+    rates, non-negative latency values, mono channel counts, and native
+    OfflineAudioContext maxChannelCount values are left untouched. Rendered
     audio buffers and DynamicsCompressorNode.reduction remain fully native;
     this layer does not alter DSP output.
   - Native adapter/device methods are returned bound to the real target with
@@ -1316,8 +1316,8 @@ CANVAS_JS_TEMPLATE = r"""
       }
 
       // maxChannelCount is an unsigned value. Preserve every finite
-      // non-negative native result: 1 is a valid mono device and 0 is the
-      // defined OfflineAudioContext behavior.
+      // non-negative native result, including mono devices and offline
+      // contexts whose channel capacity depends on the runtime.
       const ADN = win.AudioDestinationNode;
       if (ADN && ADN.prototype) {
         replaceIfDegenerate(ADN.prototype, 'maxChannelCount',
@@ -1479,7 +1479,7 @@ def build_scripts(
                               Positive sample rates and all finite
                               non-negative latency/channel-count values are
                               preserved, including zero latency, mono output,
-                              and OfflineAudioContext maxChannelCount == 0.
+                              and native OfflineAudioContext channel capacity.
                               Rendered audio and compressor state stay native.
     ``intercept_workers``     Wrap Worker and SharedWorker constructors,
                               including data: sources.

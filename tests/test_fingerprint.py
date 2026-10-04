@@ -575,35 +575,57 @@ def test_audio_spoof_preserves_usable_native_values(tmp_path):
 
     asyncio.run(scenario())
 
-def test_audio_spoof_preserves_offline_audio_semantics(tmp_path):
-    """OfflineAudioContext's zero channel-capacity must remain native."""
+@pytest.mark.parametrize(('channels', 'sample_rate'), [(1, 44100), (2, 48000)])
+def test_audio_spoof_preserves_offline_audio_semantics(tmp_path, channels, sample_rate):
+    """Offline audio metadata and rendered output must match the native runtime."""
+    async def read_offline_audio(adapter, *, patched):
+        context = await adapter.browser.new_context()
+        try:
+            if patched:
+                for script in build_scripts(123, spoof_audio=True):
+                    await context.add_init_script(script)
+            page = await context.new_page()
+            await page.goto('about:blank')
+            return await page.evaluate("""async ([channels, sampleRate]) => {
+                const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+                if (!OAC) return null;
+                const ctx = new OAC(channels, 128, sampleRate);
+                const source = ctx.createConstantSource();
+                source.offset.value = 0.25;
+                source.connect(ctx.destination);
+                source.start();
+                const buffer = await ctx.startRendering();
+                return {
+                    sampleRate: ctx.sampleRate,
+                    maxChannelCount: ctx.destination.maxChannelCount,
+                    channelCount: ctx.destination.channelCount,
+                    renderedSampleRate: buffer.sampleRate,
+                    samples: Array.from({length: buffer.numberOfChannels},
+                        (_, i) => Array.from(buffer.getChannelData(i))),
+                };
+            }""", [channels, sample_rate], isolated_context=False)
+        finally:
+            await context.close()
+
     async def scenario():
         store = Store(tmp_path)
         adapter = Amazon(store)
-        await adapter.ready()
-        context = await adapter.browser.new_context()
-        for script in build_scripts(123, spoof_audio=True):
-            await context.add_init_script(script)
-        page = await context.new_page()
-        await page.goto('about:blank')
-        result = await page.evaluate("""() => {
-            const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-            if (!OAC) return { unavailable: true };
-            const ctx = new OAC(1, 128, 44100);
-            return {
-                sampleRate: ctx.sampleRate,
-                maxChannelCount: ctx.destination.maxChannelCount,
-            };
-        }""", isolated_context=False)
-        await context.close()
-        await adapter.close()
-        store.db.close()
-
-        if result.get('unavailable'):
-            pytest.skip('OfflineAudioContext unavailable in this runtime')
-
-        assert result['sampleRate'] == 44100
-        assert result['maxChannelCount'] == 0
+        try:
+            await adapter.ready()
+            native = await read_offline_audio(adapter, patched=False)
+            patched = await read_offline_audio(adapter, patched=True)
+            if native is None or patched is None:
+                pytest.skip('OfflineAudioContext unavailable in this runtime')
+            # Browser versions can report different offline channel capacities.
+            # Preserve the native value instead of assuming it is always zero.
+            assert patched == native
+            assert patched['sampleRate'] == sample_rate
+            assert patched['renderedSampleRate'] == sample_rate
+            assert patched['channelCount'] == channels
+            assert patched['samples'] == [[0.25] * 128 for _ in range(channels)]
+        finally:
+            await adapter.close()
+            store.db.close()
 
     asyncio.run(scenario())
 
