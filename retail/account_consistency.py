@@ -1,7 +1,15 @@
 """Persistent account configuration and purchase policy.
 
-Only supported browser settings are applied. Observed hardware identifiers and
-retailer-issued authentication values are never synthesized.
+Only supported browser settings are applied. Observed hardware identifiers
+and retailer-issued authentication values are never synthesized here: the
+AccountBrowserProfiles class stores and restores locale, viewport, screen
+and device scale factor only.
+
+Fingerprint transformations (canvas, WebGL, WebGPU, audio, worker
+interception) live in ``retail.fingerprint`` and are applied by the caller
+from explicit Settings flags. They are independent of headed/headless
+launch mode. That module fabricates device identity values when enabled;
+this module does not.
 """
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -51,7 +59,6 @@ class AccountBrowserProfiles:
         prior = profile.get('observed')
         drift = [key for key in observed if prior and observed[key] != prior.get(key)]
         # Keep the first observation as a baseline; never repeatedly redefine
-        # drift away, and never patch navigator/WebGL APIs to hide a change.
         if prior is None:
             self.store.put('browser_profiles', {**profile, 'observed': observed}, profile['id'])
         report = {'account_id': account['id'], 'at': now(), 'drift': drift,

@@ -180,7 +180,7 @@ def create_app(data_dir=None):
             field = "account_id" if kind == "accounts" else "proxy_id"
             if any(t.get(field) == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
                 raise HTTPException(409, "Stop tasks using this record before editing")
-        if kind == "proxies" and id in app.state.proxy_health.jobs:
+        if kind == "proxies" and app.state.proxy_health.busy(id):
             raise HTTPException(409, "Wait for the proxy check to finish before editing")
         if kind == "input_lists" and id and any(g.get("input_list_id") == id and any(t["group_id"] == g["id"] and t["id"] in app.state.engine.jobs for t in store().all("tasks")) for g in store().all("groups")):
             raise HTTPException(409, "Stop tasks using this input list before editing")
@@ -244,7 +244,7 @@ def create_app(data_dir=None):
         for collection, field in dependencies.get(kind, []):
             if any(x.get(field) == id for x in store().all(collection)):
                 raise HTTPException(409, "Unlink associated records before deleting")
-        if kind == "proxies" and id in app.state.proxy_health.jobs:
+        if kind == "proxies" and app.state.proxy_health.busy(id):
             raise HTTPException(409, "Wait for the proxy check to finish")
         if kind == "accounts" and id in app.state.engine.amazon.logins:
             await app.state.engine.amazon.logins.pop(id).close()
@@ -380,13 +380,17 @@ def create_app(data_dir=None):
         record = require("proxies", id)
         body = await request.json()
         retailer = body.get("retailer", "amazon")
+        mode = body.get("mode", "connectivity")
         if retailer not in RETAILERS:
             raise HTTPException(422, "Unknown retailer")
+        if mode not in ("connectivity", "browser"):
+            raise HTTPException(422, "Proxy check mode must be connectivity or browser")
         try:
-            await app.state.proxy_health.start(record, retailer)
+            await app.state.proxy_health.start(record, retailer, mode)
         except ValueError as exc:
             raise HTTPException(409, str(exc))
-        return {"ok": True, "message": "Proxy checks started"}
+        label = "Raw connectivity" if mode == "connectivity" else "Browser-session"
+        return {"ok": True, "message": f"{label} proxy checks started"}
 
     @app.post("/api/import/{kind}")
     async def import_records(kind: str, request: Request):

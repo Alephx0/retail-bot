@@ -33,9 +33,9 @@ class ProxyPool:
                 if proxy_fingerprint(line)==binding['fingerprint']:return line
         health=self.store.get('proxy_health','health-'+pool_id)
         if health and health.get('status')=='completed':
-            healthy={x['fingerprint'] for x in health.get('results',[]) if x['status']=='healthy'}
+            healthy={x['fingerprint'] for x in health.get('results',[]) if x.get('status') in ('reachable','healthy')}
             lines=[line for line in lines if proxy_fingerprint(line) in healthy]
-            if not lines:raise ValueError('No healthy proxies in this pool; test or update the pool')
+            if not lines:raise ValueError('No reachable proxies in this pool; run the connectivity check or update the pool')
         if not lines:return ''
         line=lines[int(hashlib.sha256(owner.encode()).hexdigest()[:8],16)%len(lines)]
         self.store.put('network_routes',{'pool_id':pool_id,'owner':owner,'fingerprint':proxy_fingerprint(line)},binding_id)

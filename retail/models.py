@@ -229,6 +229,16 @@ class Settings(BaseModel):
     agent_max_steps: int = Field(default=4, ge=1, le=8)
     agent_timeout_seconds: int = Field(default=60, ge=10, le=180)
 
+    # Fingerprint transformations are explicit per-surface opt-ins, kept
+    # independent of headed/headless launch mode. Enable only when the
+    # runtime cannot be trusted to expose a coherent native profile.
+    # Each flag turns on the corresponding surface in build_scripts().
+    fingerprint_canvas: bool = False
+    fingerprint_webgl: bool = False
+    fingerprint_webgpu: bool = False
+    fingerprint_audio: bool = False
+    fingerprint_workers: bool = False
+
     @field_validator("diagnosis_endpoint", "cdp_endpoint")
     @classmethod
     def local_browser_service(cls, value):

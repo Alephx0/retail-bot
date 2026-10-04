@@ -1,15 +1,18 @@
 import asyncio
 import json
+import profile
 import re
 import time
 import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from .fingerprint import build_scripts
 from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
 from .models import DOMAINS, proxy_config
 from .identity import IdentityService
-from .services import SolverService
 from .store import now
 from .interactions import resolve, InteractionError
 from .browser_bridge import validate_endpoint
@@ -32,6 +35,23 @@ class AuthenticationRequired(Attention):
     """Login or security verification interrupted a retriable workflow step."""
 
 
+class ChallengeDetected(AuthenticationRequired):
+    """A retailer verification/challenge page that must be handled manually."""
+
+    def __init__(self, message: str, *, kind: str = "verification"):
+        super().__init__(message)
+        self.kind = kind
+
+
+class BackoffRequired(Attention):
+    """The retailer asked the client to slow down or is temporarily unavailable."""
+
+    def __init__(self, message: str, *, status: int, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after_seconds = retry_after_seconds
+
+
 class CartRejected(Attention):
     """A verified pre-cart failure; no cart mutation was attempted."""
     pass
@@ -46,13 +66,55 @@ class Amazon:
         self.login_watchers = {}
         self.launch_lock = asyncio.Lock()
         self.identities = IdentityService(store)
-        self.solvers = SolverService()
         self.context_accounts = {}
         self.cdp_attached = False
         self.browser_visible = False
         self.browser_initially_visible = False
         self.agent = BrowserAgent(store) if store else None
         self.profiles = AccountBrowserProfiles(store) if store else None
+
+    @staticmethod
+    def _retry_after_seconds(response) -> int | None:
+        if not response:
+            return None
+        try:
+            raw = (response.headers or {}).get("retry-after")
+        except Exception:
+            raw = None
+        if not raw:
+            return None
+        raw = str(raw).strip()
+        if raw.isdigit():
+            return max(0, min(3600, int(raw)))
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = int((when - datetime.now(timezone.utc)).total_seconds())
+            return max(0, min(3600, seconds))
+        except Exception:
+            return None
+
+    @classmethod
+    def _raise_for_response(cls, response):
+        if not response:
+            return
+        status = int(response.status)
+        if status == 403:
+            raise AccessDenied("Amazon refused the browser request (HTTP 403); automatic retry is disabled.")
+        if status in (429, 503):
+            retry_after = cls._retry_after_seconds(response)
+            detail = f" Retry after {retry_after}s." if retry_after is not None else ""
+            raise BackoffRequired(
+                f"Amazon requested a slower retry (HTTP {status}).{detail}",
+                status=status,
+                retry_after_seconds=retry_after,
+            )
+
+    async def navigate(self, page, url: str, **kwargs):
+        response = await page.goto(url, **kwargs)
+        self._raise_for_response(response)
+        return response
 
     async def resolve_action(self, page, action):
         settings = (self.store.get('settings', 'settings') or {}) if self.store else {}
@@ -132,6 +194,7 @@ class Amazon:
 
     async def context(self, account, proxy=None, solver_id=""):
         await self.ready()
+        settings = self.store.get("settings", "settings") or {}
         options = self.profiles.options(account)
         if account.get("session"):
             options["storage_state"] = account["session"]
@@ -140,6 +203,23 @@ class Amazon:
         if proxy:
             options["proxy"] = proxy_config(proxy)
         context = await self.browser.new_context(**options)
+        # Fingerprint transformations are explicit Settings opt-ins, not
+        # derived from the headed/headless launch mode. Each surface is
+        # selected independently. Site-created workers remain native unless
+        # `fingerprint_workers` is enabled; when it is, the wrapped
+        # constructors inject the same bootstrap the page already runs.
+        if self.profiles:
+            profile = self.profiles.get(account)
+            seed_int = int(profile['seed'], 16) & 0xFFFFFFFF
+            for script in build_scripts(
+                seed_int,
+                perturb_canvas=settings.get('fingerprint_canvas', False),
+                spoof_webgl=settings.get('fingerprint_webgl', False),
+                spoof_webgpu=settings.get('fingerprint_webgpu', False),
+                spoof_audio=settings.get('fingerprint_audio', False),
+                intercept_workers=settings.get('fingerprint_workers', False),
+            ):
+                await context.add_init_script(script)
         saved_storage = account.get('session_storage', {})
         domain = DOMAINS[account['region']]
         values = saved_storage.get(domain, {}) if isinstance(saved_storage, dict) else {}
@@ -151,7 +231,6 @@ class Amazon:
                     for (const [key, value] of Object.entries(%s)) sessionStorage.setItem(key, value);
                     sessionStorage.setItem('__retail_restored_v1', '1');
                 })()''' % (json.dumps(domain), json.dumps(safe)))
-        settings = self.store.get("settings", "settings") or {}
         context.set_default_timeout(settings.get("browser_timeout_ms", 30000))
         if settings.get("trace_enabled"):
             await context.tracing.start(screenshots=True,snapshots=True,sources=False)
@@ -171,7 +250,7 @@ class Amazon:
         try:
             page = await context.new_page()
             await self.expose(page)
-            await page.goto(f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
+            await self.navigate(page, f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
             self.logins[account["id"]] = context
             await self.authenticate(page, account)
             self.login_watchers[account['id']] = asyncio.create_task(self.watch_login(account['id'], context, page))
@@ -263,7 +342,7 @@ class Amazon:
         self.logins[account["id"]] = context
         page = await context.new_page()
         await self.expose(page)
-        await page.goto(f"https://{DOMAINS[account['region']]}/ap/register", wait_until="domcontentloaded")
+        await self.navigate(page, f"https://{DOMAINS[account['region']]}/ap/register", wait_until="domcontentloaded")
         for selector, value in [("#ap_customer_name", account["name"]), ("#ap_email", account["email"]), ("#ap_password", account["password"]), ("#ap_password_check", account["password"])]:
             if await page.locator(selector).count():
                 await page.locator(selector).fill(value)
@@ -280,7 +359,7 @@ class Amazon:
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
         page = context.pages[0]
-        await page.goto(f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
+        await self.navigate(page, f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
         await self.check(page)
         if await page.locator("#ap_email, #ap_password").count() or "/ap/" in page.url:
             raise ValueError("Finish signing in to Amazon before saving the session")
@@ -304,7 +383,7 @@ class Amazon:
         if urlparse(page.url).hostname in DOMAINS.values() and ("/ap/" in urlparse(page.url).path or await page.locator("#ap_email, #ap_password, #auth-mfa-otpcode, #captchacharacters").count()):
             await self.authenticate(page, account)
             await self.check(page)
-        await page.goto(getattr(page, '_retail_start_url', None) or f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
+        await self.navigate(page, getattr(page, '_retail_start_url', None) or f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
         start_url = getattr(page, '_retail_start_url', None)
         # Product pages do not redirect signed-out shoppers automatically, unlike
         # Your Orders. Follow only Amazon's own sign-in link when needed.
@@ -314,13 +393,13 @@ class Amazon:
             href = await sign_in.evaluate("e => e.href || ''") if await sign_in.count() == 1 else ''
             parsed = urlparse(href)
             if parsed.scheme == 'https' and parsed.hostname == DOMAINS[account['region']] and parsed.path.startswith(('/ap/signin', '/gp/sign-in')):
-                await page.goto(href, wait_until='domcontentloaded')
+                await self.navigate(page, href, wait_until='domcontentloaded')
             else:
                 raise AuthenticationRequired('Sign in in the task browser, then Resume. The product page shows a signed-out session.')
         await self.authenticate(page, account)
         await self.check(page)
         if start_url and page.url != start_url:
-            await page.goto(start_url, wait_until='domcontentloaded')
+            await self.navigate(page, start_url, wait_until='domcontentloaded')
             await self.check(page)
         label = await self.text(page, "#nav-link-accountList .nav-line-1")
         if not label or "sign in" in label.lower() or "/ap/" in page.url:
@@ -386,33 +465,58 @@ class Amazon:
     async def check(self, page):
         account = self.context_accounts.get(page.context, {})
         if urlparse(page.url).hostname in DOMAINS.values():
+            # Account-owned OTP may still be filled automatically. Retailer
+            # anti-bot/image challenges are never solved here; they are
+            # detected and escalated for manual review.
             if await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
                 try:
                     await self.fill_otp(page, account)
                 except ValueError:
                     pass
-            if await page.locator("#captchacharacters:visible").count() and account.get("solver_id"):
-                solver = self.store.get("solvers", account["solver_id"])
-                image = page.locator("img[src*='captcha']").first
-                if solver and solver["provider"] not in ("manual", "flaresolverr") and await image.count():
-                    try:
-                        answer = await self.solvers.solve_image(solver, await image.screenshot())
-                        await page.locator("#captchacharacters").fill(answer)
-                        await page.locator("button[type='submit']").first.click()
-                        await page.wait_for_timeout(800)
-                    except Exception:
-                        pass
+
         body = (await page.locator("body").inner_text())[:30000].lower()
+        path = urlparse(page.url).path.lower()
+
+        if "access denied" in body:
+            raise AccessDenied("Access Denied; account or connection was refused")
+
+        if (
+            await page.locator("#captchacharacters:visible").count()
+            or "validatecaptcha" in path
+            or any(x in body for x in (
+                "enter the characters you see",
+                "type the characters you see",
+                "robot check",
+                "make sure you're not a robot",
+                "make sure you are not a robot",
+            ))
+        ):
+            raise ChallengeDetected(
+                "Amazon presented a robot/CAPTCHA challenge. No automated solve was attempted. "
+                "Complete verification in the task browser, then Resume.",
+                kind="captcha",
+            )
+
         if "click the button below to continue shopping" in body:
-            raise Attention("Amazon requires a Continue shopping confirmation. Complete it in the task browser, then Resume.")
+            raise ChallengeDetected(
+                "Amazon requires a Continue shopping confirmation. No automatic confirmation was attempted. "
+                "Complete it in the task browser, then Resume.",
+                kind="continue-shopping",
+            )
+
+        if any(x in body for x in ("verify it's you", "verify your identity", "additional verification required")):
+            raise ChallengeDetected(
+                "Amazon requires additional verification. Complete it in the task browser, then Resume.",
+                kind="identity-verification",
+            )
+
         if "no default payment method" in body:
             raise Attention("No Default Payment Method: check the default card in your Amazon account")
         if "no default address" in body:
             raise Attention("No Default Address: select a default shipping address in your Amazon account")
-        if "access denied" in body:
-            raise AccessDenied("Access Denied; account or connection was refused")
-        if await page.locator("#captchacharacters, #auth-mfa-otpcode").count() or any(x in body for x in ("enter the characters you see", "robot check", "access denied", "verify it's you")):
-            raise AuthenticationRequired("Amazon needs verification. Complete it in the task browser, then Resume.")
+
+        if await page.locator("#auth-mfa-otpcode, #cvf-input-code").count():
+            raise AuthenticationRequired("Amazon needs account verification. Complete it in the task browser, then Resume.")
         if "/ap/signin" in page.url or await page.locator("#ap_password").count():
             raise AuthenticationRequired("Session expired. Sign in in the task browser, then Resume.")
 
@@ -420,9 +524,7 @@ class Amazon:
         target = f"https://{DOMAINS[region]}/dp/{item['asin']}"
         reuse_initial = getattr(page, '_retail_initial_product', None) == target and page.url == target
         page._retail_initial_product = None
-        response = None if reuse_initial else await page.goto(target, wait_until="domcontentloaded", timeout=45000)
-        if response and response.status in (403, 429, 503):
-            raise AccessDenied(f"Access Denied (HTTP {response.status})")
+        response = None if reuse_initial else await self.navigate(page, target, wait_until="domcontentloaded", timeout=45000)
         await self.check(page)
         title = await self.text(page, "#productTitle")
         if not title:
@@ -481,7 +583,7 @@ class Amazon:
         # Check the active cart before any mutation. Amazon increments quantity
         # when the same ASIN is added again; retries and pre-existing items must
         # not silently turn a one-item request into a two-item order.
-        await page.goto(f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
+        await self.navigate(page, f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
         await self.check(page)
         existing = await self.get_cart(page)
         if any(line['asin'] != asin for line in existing):
@@ -531,7 +633,7 @@ class Amazon:
             raise CartRejected("The target is already in the cart with a different quantity; adjust its quantity in Amazon before starting this task")
         if existing:
             raise CartRejected("Other items are already in the active cart. Clear or save those items in Amazon before automatic checkout")
-        await page.goto(product_url, wait_until="domcontentloaded")
+        await self.navigate(page, product_url, wait_until="domcontentloaded")
         await self.check(page)
         selector = page.locator("select#quantity")
         actual = 1
@@ -550,7 +652,7 @@ class Amazon:
         await page.wait_for_timeout(1500)
         await self.check(page)
         # Cart is a handoff, never evidence that an order was placed.
-        await page.goto(f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
+        await self.navigate(page, f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
         await self.check(page)
         lines=await self.get_cart(page)
         matching=[line for line in lines if line['asin']==asin]
@@ -568,7 +670,7 @@ class Amazon:
             return False
         selector = page.locator('select#quantity')
         if await selector.count():
-            values = await selector.locator('option').evaluate_all("els => els.map(e => Number(e.value)).filter(x => Number.isInteger(x) && x > 0)")
+            values = await selector.locator("option").evaluate_all("els => els.map(e => Number(e.value)).filter(x => Number.isInteger(x) && x > 0)")
             if quantity not in values:
                 raise CartRejected('Requested item quantity is unavailable; choose a supported quantity')
             await selector.select_option(str(quantity))

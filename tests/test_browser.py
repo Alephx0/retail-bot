@@ -3,7 +3,7 @@ import pytest
 
 from patchright.async_api import async_playwright
 
-from retail.amazon import Amazon, Attention
+from retail.amazon import Amazon, Attention, ChallengeDetected, BackoffRequired, AccessDenied
 
 
 def test_amazon_browser_adapter_with_fixtures():
@@ -33,13 +33,31 @@ def test_amazon_browser_adapter_with_fixtures():
                 await adapter.cart(page,5,'B012345678')
             assert await adapter.cart(page,2,'B012345678') == 2
             await page.set_content('<body><input id="captchacharacters"></body>')
-            try:
+            with pytest.raises(ChallengeDetected, match='No automated solve was attempted'):
                 await adapter.check(page)
-                raise AssertionError('Challenge must pause the task')
-            except Attention:
-                pass
             await page.set_content('<body>Click the button below to continue shopping<button>Continue shopping</button></body>')
-            with pytest.raises(Attention,match='Continue shopping confirmation'):
+            with pytest.raises(ChallengeDetected,match='Continue shopping confirmation'):
                 await adapter.check(page)
             await browser.close()
     asyncio.run(scenario())
+
+
+def test_amazon_response_guard_distinguishes_rate_limit_and_access_denied():
+    class Response:
+        def __init__(self, status, headers=None):
+            self.status = status
+            self.headers = headers or {}
+
+    with pytest.raises(BackoffRequired) as limited:
+        Amazon._raise_for_response(Response(429, {'retry-after': '120'}))
+    assert limited.value.status == 429
+    assert limited.value.retry_after_seconds == 120
+
+    with pytest.raises(BackoffRequired) as unavailable:
+        Amazon._raise_for_response(Response(503))
+    assert unavailable.value.status == 503
+
+    with pytest.raises(AccessDenied):
+        Amazon._raise_for_response(Response(403))
+
+    Amazon._raise_for_response(Response(200))

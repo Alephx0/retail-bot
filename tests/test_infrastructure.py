@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from retail.app import create_app
 from retail.identity import extract_otp, totp, IdentityService
 from retail.models import Account, Profile, Solver
-from retail.services import SolverService, ProxyHealth, proxy_url
+from retail.services import SolverService, ProxyHealth, proxy_url, classify_browser_probe
 from retail.store import Store
 
 
@@ -151,8 +151,19 @@ def test_proxy_health_results_redact_credentials(monkeypatch,tmp_path):
         await health.start(record,'amazon')
         await asyncio.gather(*list(health.jobs.values()))
         results=store.all('proxy_health')
-        assert results[0]['results'][0]['status'] == 'blocked'
+        assert results[0]['kind'] == 'connectivity'
+        assert results[0]['results'][0]['status'] == 'reachable'
+        assert results[0]['results'][0]['http_status'] == 403
+        assert results[0]['results'][0]['transport'] == 'httpx'
         assert 'SECRET' not in str(results)
         assert 'latency_ms' in results[0]['results'][0]
         store.db.close()
     asyncio.run(scenario())
+
+
+def test_browser_proxy_probe_classification_is_non_circumventing():
+    assert classify_browser_probe(200, '<body>Product page</body>') == 'ok'
+    assert classify_browser_probe(429, '<body></body>') == 'rate_limited'
+    assert classify_browser_probe(403, '<body></body>') == 'access_denied'
+    assert classify_browser_probe(200, '<body>Robot Check</body>') == 'challenge'
+    assert classify_browser_probe(None, '') == 'navigation_error'

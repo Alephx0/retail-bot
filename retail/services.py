@@ -85,48 +85,183 @@ def proxy_fingerprint(line):
     return hashlib.sha256(line.strip().encode()).hexdigest()[:16]
 
 
+BROWSER_CHALLENGE_MARKERS = (
+    "enter the characters you see",
+    "type the characters you see",
+    "robot check",
+    "make sure you're not a robot",
+    "make sure you are not a robot",
+    "click the button below to continue shopping",
+    "verify it's you",
+)
+
+
+def classify_browser_probe(http_status, body_text):
+    """Classify a read-only browser navigation without attempting recovery."""
+    body = (body_text or "").lower()
+    if http_status == 429:
+        return "rate_limited"
+    if http_status in (403, 503) or "access denied" in body:
+        return "access_denied"
+    if any(marker in body for marker in BROWSER_CHALLENGE_MARKERS):
+        return "challenge"
+    if http_status is None:
+        return "navigation_error"
+    if 200 <= http_status < 400:
+        return "ok"
+    return "http_error"
+
+
 class ProxyHealth:
+    """Keep raw transport reachability separate from Chromium-session health."""
+
     def __init__(self, store):
         self.store = store
         self.jobs = {}
 
-    async def start(self, record, retailer):
-        if record["id"] in self.jobs:
-            raise ValueError("This list is already being checked")
-        self.jobs[record["id"]] = asyncio.create_task(self.run(record, retailer))
+    def busy(self, record_id):
+        return any(key.endswith(":" + record_id) for key in self.jobs)
 
-    async def run(self, record, retailer):
+    async def start(self, record, retailer, mode="connectivity"):
+        if mode not in ("connectivity", "browser"):
+            raise ValueError("Proxy check mode must be connectivity or browser")
+        key = mode + ":" + record["id"]
+        if key in self.jobs:
+            raise ValueError(f"This list already has a {mode} check running")
+        self.jobs[key] = asyncio.create_task(self.run(record, retailer, mode, key))
+
+    def _persist(self, record, retailer, mode, results, status):
+        prefix = "health-" if mode == "connectivity" else "browser-health-"
+        self.store.put(
+            "proxy_health",
+            {
+                "list_id": record["id"],
+                "retailer": retailer,
+                "kind": mode,
+                "status": status,
+                "results": results,
+                "at": now(),
+            },
+            prefix + record["id"],
+        )
+
+    async def run(self, record, retailer, mode, key):
+        try:
+            if mode == "browser":
+                await self._run_browser(record, retailer)
+            else:
+                await self._run_connectivity(record, retailer)
+        finally:
+            self.jobs.pop(key, None)
+
+    async def _run_connectivity(self, record, retailer):
+        """Fast HTTP-client check: tests route reachability, not browser acceptance."""
         settings = self.store.get("settings", "settings") or {}
         semaphore = asyncio.Semaphore(settings.get("proxy_concurrency", 5))
-        result_id = "health-" + record["id"]
         results = []
-        def persist(status):
-            self.store.put("proxy_health", {"list_id": record["id"], "retailer": retailer, "status": status, "results": results, "at": now()}, result_id)
-        persist("testing")
+        self._persist(record, retailer, "connectivity", results, "testing")
 
         async def test(index, line):
             async with semaphore:
                 started = time.monotonic()
-                result = {"index": index + 1, "fingerprint": proxy_fingerprint(line), "host": line.split(":", 1)[0]}
+                result = {
+                    "index": index + 1,
+                    "fingerprint": proxy_fingerprint(line),
+                    "host": line.split(":", 1)[0],
+                    "transport": "httpx",
+                }
                 try:
-                    async with httpx.AsyncClient(proxy=proxy_url(line), timeout=settings.get("proxy_timeout_seconds", 15), trust_env=False) as client:
-                        async with client.stream("GET", "https://" + RETAILERS[retailer]["domain"] + "/", follow_redirects=False) as response:
-                            result.update(http_status=response.status_code, status="healthy" if 200 <= response.status_code < 400 else "blocked" if response.status_code in (403, 429, 503) else "http_error")
+                    async with httpx.AsyncClient(
+                        proxy=proxy_url(line),
+                        timeout=settings.get("proxy_timeout_seconds", 15),
+                        trust_env=False,
+                    ) as client:
+                        async with client.stream(
+                            "GET",
+                            "https://" + RETAILERS[retailer]["domain"] + "/",
+                            follow_redirects=False,
+                        ) as response:
+                            # Receiving any HTTP response proves the route is
+                            # reachable. 403/429/503 are application responses,
+                            # not transport failures.
+                            result.update(
+                                http_status=response.status_code,
+                                status="reachable",
+                            )
                 except Exception as exc:
                     result.update(status="failed", error=type(exc).__name__)
                 result["latency_ms"] = round((time.monotonic() - started) * 1000)
                 results.append(result)
-                persist("testing")
-        try:
-            await asyncio.gather(*(test(i, line) for i, line in enumerate(record["entries"].splitlines()) if line.strip()))
-            persist("completed")
-            from .proxy_pool import ProxyPool
-            ProxyPool(self.store).sync()
-        except asyncio.CancelledError:
-            persist("cancelled")
-            raise
-        finally:
-            self.jobs.pop(record["id"], None)
+                self._persist(record, retailer, "connectivity", results, "testing")
+
+        await asyncio.gather(*(
+            test(i, line)
+            for i, line in enumerate(record["entries"].splitlines())
+            if line.strip()
+        ))
+        self._persist(record, retailer, "connectivity", results, "completed")
+
+    async def _run_browser(self, record, retailer):
+        """Read-only Chromium probe using the same browser transport as tasks."""
+        from patchright.async_api import async_playwright
+
+        settings = self.store.get("settings", "settings") or {}
+        # Browser probes are intentionally lower-concurrency than raw health
+        # checks because each one creates a real browser session.
+        semaphore = asyncio.Semaphore(min(2, settings.get("proxy_concurrency", 5)))
+        results = []
+        self._persist(record, retailer, "browser", results, "testing")
+        timeout_ms = settings.get("browser_timeout_ms", 30000)
+        target = "https://" + RETAILERS[retailer]["domain"] + "/"
+
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            try:
+                async def test(index, line):
+                    async with semaphore:
+                        started = time.monotonic()
+                        result = {
+                            "index": index + 1,
+                            "fingerprint": proxy_fingerprint(line),
+                            "host": line.split(":", 1)[0],
+                            "transport": "chromium",
+                        }
+                        context = None
+                        try:
+                            context = await browser.new_context(proxy=proxy_config(line))
+                            page = await context.new_page()
+                            response = await page.goto(
+                                target,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                            body = ""
+                            try:
+                                body = (await page.locator("body").inner_text())[:15000]
+                            except Exception:
+                                pass
+                            http_status = response.status if response else None
+                            result.update(
+                                http_status=http_status,
+                                status=classify_browser_probe(http_status, body),
+                            )
+                        except Exception as exc:
+                            result.update(status="failed", error=type(exc).__name__)
+                        finally:
+                            if context:
+                                await context.close()
+                        result["latency_ms"] = round((time.monotonic() - started) * 1000)
+                        results.append(result)
+                        self._persist(record, retailer, "browser", results, "testing")
+
+                await asyncio.gather(*(
+                    test(i, line)
+                    for i, line in enumerate(record["entries"].splitlines())
+                    if line.strip()
+                ))
+            finally:
+                await browser.close()
+        self._persist(record, retailer, "browser", results, "completed")
 
     async def close(self):
         jobs = list(self.jobs.values())

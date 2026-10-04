@@ -160,12 +160,12 @@ def test_sticky_proxy_routes_and_redaction(tmp_path):
     from retail.services import proxy_fingerprint
     store=Store(tmp_path)
     pool=store.put('proxies',{'name':'Pool','entries':'first.example:8080:user:secret\nsecond.example:8080'})
-    store.put('proxy_health',{'status':'completed','results':[{'fingerprint':proxy_fingerprint('second.example:8080'),'status':'healthy'}]},'health-'+pool['id'])
+    store.put('proxy_health',{'status':'completed','results':[{'fingerprint':proxy_fingerprint('second.example:8080'),'status':'reachable'}]},'health-'+pool['id'])
     selector=ProxyPool(store);assert selector.choose(pool['id'],'account')=='second.example:8080'
     store.put('proxy_health',{'status':'completed','results':[]},'health-'+pool['id'])
     assert selector.choose(pool['id'],'account')=='second.example:8080', 'An existing session keeps its explicit route'
     import pytest
-    with pytest.raises(ValueError,match='No healthy proxies'):selector.choose(pool['id'],'new-account')
+    with pytest.raises(ValueError,match='No reachable proxies'):selector.choose(pool['id'],'new-account')
     selector.sync();assert len(store.all('proxy_endpoints'))==2
     store.db.close()
 

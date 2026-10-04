@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from .account_consistency import PurchaseCooldown
-from .amazon import Amazon, Attention, AuthenticationRequired, AccessDenied, CartRejected
+from .amazon import Amazon, Attention, AuthenticationRequired, ChallengeDetected, BackoffRequired, AccessDenied, CartRejected
 from .models import Group, Task, eligible, inputs, rejection_reasons, DOMAINS
 from .store import now
 from .adapters import MonitorService, CartService, CheckoutService
@@ -16,6 +16,20 @@ class TaskRunner:
         settings = self.store.get('settings', 'settings') or {}
         if isinstance(adapter, Amazon) and not settings.get('show_browser_window', False):
             await adapter.hide(page)
+
+    async def wait_for_backoff(self, id, exc, event_count):
+        """Apply a bounded cooldown without consuming the generic error budget."""
+        floor = 30 * (2 ** min(max(event_count - 1, 0), 3))
+        delay = min(900, max(exc.retry_after_seconds or 0, floor))
+        self.status(
+            id,
+            'backing_off',
+            f'Retailer requested a cooldown (HTTP {exc.status}); next read-only inspection in {delay}s',
+            rate_limit_status=exc.status,
+            retry_after_seconds=delay,
+            rate_limit_events=event_count,
+        )
+        await asyncio.sleep(delay)
 
     async def recover_authentication(self, id, adapter, context, account, page):
         """Keep this exact context alive; resume only after login is verified."""
@@ -123,6 +137,7 @@ class TaskRunner:
                 self.pages[id] = pages
             self.status(id,"ready","Account session and inputs are ready")
             attempts, successes = 0, 0
+            rate_limit_events = 0
             seen_offers = set()
             while True:
                 latest = self.store.get("groups", group["id"])
@@ -142,9 +157,20 @@ class TaskRunner:
                         else:
                             observations = await monitor.scan(pages,items,account['region'],group['retailer'],group['monitor_concurrency'])
                         failures = [x for x in observations if isinstance(x,BaseException)]
+                        # Never hide a challenge/rate-limit/access-denied signal
+                        # just because another concurrent product page succeeded.
+                        operational = next(
+                            (x for x in failures if isinstance(
+                                x, (ChallengeDetected, BackoffRequired, AccessDenied, AuthenticationRequired)
+                            )),
+                            None,
+                        )
+                        if operational:
+                            raise operational
                         if len(failures)==len(observations): raise failures[0]
                         products = [x.observation if not isinstance(x,BaseException) else {"asin":item['asin'],"title":"Observation unavailable","price":None,"available":False,"seller":"Unknown","condition":"unknown","offer_id":""} for x,item in zip(observations,items)]
                     attempts = 0
+                    rate_limit_events = 0
                     chosen = None
                     for index, (product, item) in enumerate(zip(products, items)):
                         self.store.put("feed", dict(product, at=now(), simulation=task["simulation"], group_id=group["id"], retailer=group["retailer"]), f"{id}-{item['asin']}")
@@ -284,12 +310,40 @@ class TaskRunner:
                         await asyncio.sleep(group["delay_ms"]/1000)
                         continue
                     break
+                except BackoffRequired as exc:
+                    if cart_attempted:
+                        await self.pause(id, "attention", "Rate limit or service backoff occurred after carting. Check Amazon order history before continuing.")
+                        self.status(id, "stopped", "Checkout state needs review; no automatic retry was attempted")
+                        break
+                    rate_limit_events += 1
+                    if rate_limit_events >= 3:
+                        await self.pause(
+                            id,
+                            'attention',
+                            'Repeated retailer rate limits/service backoffs were detected. Automatic polling is paused. '
+                            'Wait before resuming; Resume performs a fresh read-only inspection first.',
+                        )
+                        rate_limit_events = 0
+                        continue
+                    await self.wait_for_backoff(id, exc, rate_limit_events)
+                    continue
+                except ChallengeDetected as exc:
+                    if cart_attempted or self.store.get('submissions', 'submission-' + id):
+                        await self.pause(id, 'attention', 'A retailer verification challenge appeared after checkout activity. Check Your Orders before continuing.')
+                        self.status(id, 'stopped', 'Verification challenge after checkout; no automatic retry or solve attempted')
+                        break
+                    await self.pause(
+                        id,
+                        'attention',
+                        str(exc) + ' Automatic challenge solving is disabled; Resume only after verification is complete.',
+                    )
+                    continue
                 except AccessDenied:
                     if cart_attempted:
                         await self.pause(id, "attention", "Access denied after carting; inspect orders before continuing")
                         self.status(id, "stopped", "Checkout needs review")
                         break
-                    await self.pause(id, 'attention', 'Amazon denied access. Check the visible browser; Resume re-inspects the page without changing identity or bypassing the block.')
+                    await self.pause(id, 'attention', 'Amazon denied access. Automatic retry is disabled. Check the visible browser and connection; Resume performs a fresh inspection.')
                 except AuthenticationRequired:
                     if self.store.get('submissions', 'submission-' + id):
                         await self.pause(id, 'attention', 'Authentication changed after an order submission was attempted. Check Your Orders; this task will not submit again.')
