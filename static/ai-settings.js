@@ -12,15 +12,23 @@ settingsView = function () {
     check('show_browser_window', 'Use a visible Chrome window from the start (special cases)', s.show_browser_window ?? false) +
     '<p class="help">Changing browser mode requires no running tasks. External CDP browsers follow their own window setting. Headless mode uses less desktop rendering resources and does not open a Chrome window.</p>' +
     '<details><summary>Fingerprint profiles</summary>' +
-    select('fingerprint_backend', 'Profile implementation', [['javascript','JavaScript compatibility mode'],['native','Native Chromium profiles']], s.fingerprint_backend || 'javascript') +
+    select('fingerprint_backend', 'Profile implementation', [['javascript','JavaScript compatibility mode'],['native','Native Chromium profiles'],['fingerprint-suite','Apify fingerprint-suite (experimental)']], s.fingerprint_backend || 'javascript') +
     input('native_browser_executable', 'Native browser executable (blank uses installed build)', s.native_browser_executable || '') +
     '<p class="help">JavaScript graphics profiles keep GPU aliases within the hardware family and retain real WebGL capabilities. Workers initialize automatically. Each account uses a separate browser process, which uses more memory and requires an app-managed browser.</p>' +
     '<p class="help">Native profiles require the separately installed browser build. GPU identity is shared across WebGL, WebGPU and workers when either GPU option is enabled. Each active graphics profile uses its own browser process. This third-party build disables Safe Browsing.</p>' +
+    '<p class="help">Fingerprint-suite applies its complete generated profile when selected. The custom switches below are inactive in this mode. It requires the optional Node packages and an app-managed browser; the upstream injector does not include our service-worker initialization.</p>' +
     check('fingerprint_canvas', 'Vary canvas rendering by account', s.fingerprint_canvas ?? false) +
     check('fingerprint_webgl', 'Vary WebGL identity and rendering', s.fingerprint_webgl ?? false) +
     check('fingerprint_webgpu', 'Vary WebGPU features and GPU identity', s.fingerprint_webgpu ?? false) +
     check('fingerprint_audio', 'Repair invalid audio metadata', s.fingerprint_audio ?? false) +
     check('fingerprint_workers', 'Initialize workers (automatic with graphics profiles)', s.fingerprint_workers ?? false) +
+    check('fingerprint_fonts', 'Limit explicit local-font enumeration (preserve rendering)', s.fingerprint_fonts ?? false) +
+    check('fingerprint_navigator', 'Vary reported CPU and memory by account', s.fingerprint_navigator ?? false) +
+    check('fingerprint_screen', 'Vary desktop screen resolution and scaling by account', s.fingerprint_screen ?? false) +
+    check('fingerprint_proxy_location', 'Match US profile location to the selected proxy', s.fingerprint_proxy_location ?? true) +
+    select('fingerprint_timezone', 'US profile timezone', [['America/New_York','Eastern'],['America/Chicago','Central'],['America/Denver','Mountain'],['America/Los_Angeles','Pacific'],['America/Phoenix','Arizona'],['America/Anchorage','Alaska'],['Pacific/Honolulu','Hawaii']], s.fingerprint_timezone || 'America/New_York') +
+    '<p class="help">The font, navigator and screen options apply to JavaScript profiles for US accounts. They use en-US. Proxy matching checks ipwho.is through the selected proxy before opening the account browser, then verifies the exit again. It sets the reported timezone and approximate location without granting site location permission. Use a sticky US proxy session: lookup failures, non-US exits and changes during setup stop the session. Without a proxy, or with matching off, the selected timezone applies.</p>' +
+    '<p class="help">Values repeat for each account; the browser version and operating system stay genuine. Font filtering respects site permission and does not hide fonts inferred from rendering. Screen and font choices are independent of the proxy city.</p>' +
     '</details>' +
     '<details><summary>Advanced: use an existing Chrome or Edge window</summary>' + browser.innerHTML +
     check('cdp_attach', 'Use existing Chromium debugging connection', s.cdp_attach ?? false) +
@@ -40,18 +48,36 @@ settingsView = function () {
     input('agent_max_steps', 'Maximum model calls per action', s.agent_max_steps ?? 4, 'number', 'min="1" max="8"') +
     input('agent_timeout_seconds', 'Agent timeout (seconds)', s.agent_timeout_seconds ?? 60, 'number', 'min="10" max="180"') +
     '<p class="help">A local diagnosis endpoint is optional and only needed for legacy repair suggestions without a saved API connection.</p>' + legacyIntegrations + '</details>';
+  syncFingerprintBackendFields(template.content);
   return template.innerHTML;
 };
+
+function syncFingerprintBackendFields(root) {
+  const mode = root.querySelector('[name="fingerprint_backend"]')?.value;
+  for (const name of ['canvas','webgl','webgpu','audio','workers','fonts','navigator','screen']) {
+    const input = root.querySelector(`[name="fingerprint_${name}"]`);
+    if (input) input.disabled = mode === 'fingerprint-suite' || (mode === 'native' && ['fonts','navigator','screen'].includes(name));
+  }
+  const timezone = root.querySelector('[name="fingerprint_timezone"]');
+  if (timezone) timezone.disabled = mode !== 'javascript';
+  const proxyLocation = root.querySelector('[name="fingerprint_proxy_location"]');
+  if (proxyLocation) proxyLocation.disabled = mode !== 'javascript';
+}
+document.addEventListener('change', event => {
+  if (event.target.matches('[name="fingerprint_backend"]')) syncFingerprintBackendFields(event.target.form);
+});
 
 const originalAISerialize = serializeSettings;
 serializeSettings = function (data, form) {
   originalAISerialize(data, form);
   data.cdp_attach = form.elements.cdp_attach.checked;
   data.show_browser_window = form.elements.show_browser_window.checked;
-  for (const surface of ['canvas','webgl','webgpu','audio','workers']) {
+  for (const surface of ['canvas','webgl','webgpu','audio','workers','fonts','navigator','screen']) {
     const key = 'fingerprint_' + surface;
     data[key] = form.elements[key].checked;
   }
+  data.fingerprint_timezone = form.elements.fingerprint_timezone.value;
+  data.fingerprint_proxy_location = form.elements.fingerprint_proxy_location.checked;
   for (const key of ['agent_max_steps', 'agent_timeout_seconds']) data[key] = Number(data[key]);
 };
 

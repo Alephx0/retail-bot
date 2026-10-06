@@ -1,4 +1,4 @@
-"""Seeded 2D canvas + WebGL + WebGPU + AudioContext perturbation and identity.
+"""Seeded graphics, audio metadata, navigator and explicit font enumeration.
 
 ``build_scripts`` gates everything behind explicit opt-in. ``build_worker_script``
 supplies the same implementation for worker entrypoints the caller controls.
@@ -90,6 +90,8 @@ CANVAS_JS_TEMPLATE = r"""
     const ENABLE_WEBGPU   = __ENABLE_WEBGPU__;
     const ENABLE_AUDIO    = __ENABLE_AUDIO__;
     const ENABLE_WORKERS  = __ENABLE_WORKERS__;
+    const ENABLE_NAVIGATOR = __ENABLE_NAVIGATOR__;
+    const ENABLE_FONTS = __ENABLE_FONTS__;
     const ENABLE_FLOATGL  = __ENABLE_FLOATGL__;
 
     const win = globalThis;
@@ -987,6 +989,38 @@ CANVAS_JS_TEMPLATE = r"""
 
     /* ------------------------------------------------------------------ */
 
+    function installNavigator() {
+      for (const proto of [win.Navigator?.prototype, win.WorkerNavigator?.prototype]) {
+        hookGetter(proto, 'hardwareConcurrency', native => {
+          if (!Number.isInteger(native) || native < 2) return native;
+          const choices = [2, 4, 8, 12, 16].filter(value => value <= native);
+          return choices[(fin(SEED ^ 0x37A15) >>> 0) % choices.length];
+        });
+        hookGetter(proto, 'deviceMemory', native => {
+          // A 64-bit browser heap can exceed 4 GB. Do not claim a desktop
+          // memory bucket smaller than that engine capacity, or exceed native.
+          if (typeof native !== 'number' || native < 8) return native;
+          const choices = [8, 16, 32].filter(value => value <= native);
+          return choices[(fin(SEED ^ 0x96B31) >>> 0) % choices.length];
+        });
+      }
+    }
+
+    function installFontEnumeration() {
+      // Filter only native FontData objects after the real permission check.
+      // Keep each family together; never invent a font or change its bytes.
+      hook(win, 'queryLocalFonts', (target, self, args) =>
+        Reflect.apply(target, self, args).then(fonts => fonts.filter(font => {
+          const family = String(font.family).toLowerCase();
+          if (['arial','times new roman','courier new','segoe ui','segoe ui emoji'].includes(family)) return true;
+          let hash = SEED ^ 0x491FC;
+          for (let i=0; i<family.length; i++) hash = Math.imul(hash ^ family.charCodeAt(i), 16777619);
+          return (fin(hash) >>> 0) % 3 !== 0;
+        })));
+    }
+
+    if (ENABLE_NAVIGATOR) installNavigator();
+    if (ENABLE_FONTS) installFontEnumeration();
     if (ENABLE_2D)      install2D();
     if (ENABLE_WEBGL || ENABLE_WEBGPU) installWebGL();
     if (ENABLE_WEBGL || ENABLE_WEBGPU) installWebGPU();
@@ -1007,9 +1041,11 @@ def build_scripts(
     spoof_webgpu: bool = False,
     spoof_audio: bool = False,
     intercept_workers: bool = False,
+    spoof_navigator: bool = False,
+    restrict_fonts: bool = False,
     perturb_float_readback: bool = False,
 ) -> list[str]:
-    """Return graphics/audio init scripts for one account seed.
+    """Return selected compatibility init scripts for one account seed.
 
     Transformations are opt-in and independent of browser launch mode.
     Either GPU flag enables shared GPU identity policy; rendering/readback
@@ -1029,6 +1065,9 @@ def build_scripts(
                               Rendered audio and compressor state stay native.
     ``intercept_workers``     Wrap Worker and SharedWorker constructors,
                               including data: sources.
+    ``spoof_navigator``       Seeded CPU/memory buckets bounded by native values.
+    ``restrict_fonts``        Permission-gated native local-font subset; font
+                              rendering, FontFace and glyph metrics unchanged.
     ``perturb_float_readback`` Perturb RGBA FLOAT and HALF_FLOAT
                               readPixels destinations in WebGL.
 
@@ -1041,7 +1080,7 @@ def build_scripts(
     WebGPU device-level readback is not perturbed.
     """
     if not (perturb_canvas or spoof_webgl or spoof_webgpu or spoof_audio
-            or intercept_workers or perturb_float_readback):
+            or intercept_workers or perturb_float_readback or spoof_navigator or restrict_fonts):
         return []
 
     seed = int(seed_int) & 0xFFFFFFFF
@@ -1054,6 +1093,8 @@ def build_scripts(
     js = js.replace("__ENABLE_WEBGPU__",    "true" if spoof_webgpu           else "false")
     js = js.replace("__ENABLE_AUDIO__",     "true" if spoof_audio            else "false")
     js = js.replace("__ENABLE_WORKERS__",   "true" if intercept_workers      else "false")
+    js = js.replace("__ENABLE_NAVIGATOR__", "true" if spoof_navigator        else "false")
+    js = js.replace("__ENABLE_FONTS__",     "true" if restrict_fonts         else "false")
     js = js.replace("__ENABLE_FLOATGL__",   "true" if perturb_float_readback else "false")
     return [js]
 

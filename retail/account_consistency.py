@@ -43,9 +43,32 @@ class AccountBrowserProfiles:
 
     async def check(self, page, account):
         profile = self.get(account)
+        suite = getattr(page.context, '_retail_suite_profile', None)
+        expected_viewport = suite['options']['viewport'] if suite else profile['viewport']
+        observation_key = 'observed_suite' if suite else 'observed'
+        us = getattr(page.context, '_retail_us_profile_options', None)
+        if us:
+            expected_viewport = us['viewport']
+            observation_key = 'observed_us_' + '_'.join(us['surfaces'])
         corrected = False
-        if page.viewport_size != profile['viewport']:
-            await page.set_viewport_size(profile['viewport'])
+        if page.viewport_size != expected_viewport:
+            await page.set_viewport_size(expected_viewport)
+            explicit = us or (suite['options'] if suite else None)
+            if explicit:
+                # set_viewport_size also resets screen dimensions. Restore
+                # the profile's distinct display size using Chromium emulation.
+                session = getattr(page, '_retail_metrics_session', None)
+                if session is None:
+                    session = await page.context.new_cdp_session(page)
+                    page._retail_metrics_session = session
+                # Chromium clears overrides on detach. This session therefore
+                # belongs to the page and closes with its target/context.
+                await session.send('Emulation.setDeviceMetricsOverride', {
+                    **expected_viewport, 'mobile': False,
+                    'deviceScaleFactor': explicit['device_scale_factor'],
+                    'screenWidth': explicit['screen']['width'],
+                    'screenHeight': explicit['screen']['height'],
+                })
             corrected = True
         observed = await page.evaluate('''() => {
             const gl = document.createElement('canvas').getContext('webgl');
@@ -56,13 +79,16 @@ class AccountBrowserProfiles:
                     webglVendor: ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : null,
                     webglRenderer: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null};
         }''')
-        prior = profile.get('observed')
+        prior = profile.get(observation_key)
         drift = [key for key in observed if prior and observed[key] != prior.get(key)]
         # Keep the first observation as a baseline; never repeatedly redefine
         if prior is None:
-            self.store.put('browser_profiles', {**profile, 'observed': observed}, profile['id'])
+            self.store.put('browser_profiles', {**profile, observation_key: observed}, profile['id'])
         report = {'account_id': account['id'], 'at': now(), 'drift': drift,
                   'viewport_corrected': corrected, 'status': 'changed' if drift else 'consistent'}
+        location = getattr(page.context, '_retail_proxy_location', None)
+        if location:
+            report['proxy_location'] = location
         self.store.put('browser_health', report, 'browser-health-' + account['id'])
         return report
 

@@ -9,6 +9,8 @@ from email.utils import parsedate_to_datetime
 from .fingerprint import build_scripts
 from .native_fingerprint import launch_options as native_launch_options, needs_profile_browser
 from .worker_profiles import WorkerProfiles, debugging_port
+from .fingerprint_suite import build_profile as build_suite_profile
+from . import us_fingerprint, proxy_location
 from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
@@ -205,14 +207,31 @@ class Amazon:
         await self.ready()
         settings = self.store.get("settings", "settings") or {}
         options = self.profiles.options(account)
+        us_options = us_fingerprint.context_options(self.profiles.get(account), settings, account['region'])
+        options.update(us_options)
         if account.get("session"):
             options["storage_state"] = account["session"]
         if proxy is None:
             proxy = self.account_proxy(account)
         if proxy:
             options["proxy"] = proxy_config(proxy)
+        location = None
+        if us_options and settings.get('fingerprint_proxy_location', True):
+            if not proxy and (account.get('proxy') or account.get('proxy_list_id')):
+                raise proxy_location.ProxyLocationError('This account requires a proxy, but no proxy route was selected.')
+            if proxy:
+                location = await proxy_location.bootstrap_location(self.browser, options['proxy'])
+                options.update(proxy_location.context_options(location))
         native = settings.get('fingerprint_backend') == 'native'
-        managed_workers = not native and needs_profile_browser(settings)
+        suite = settings.get('fingerprint_backend') == 'fingerprint-suite'
+        suite_profile = None
+        if suite:
+            if self.cdp_attached:
+                raise ValueError('Fingerprint-suite requires an app-managed browser')
+            profile = self.profiles.get(account)
+            suite_profile = await build_suite_profile(int(profile['seed'], 16), profile['locale'], self.browser.version)
+            options.update(suite_profile['options'])
+        managed_workers = not native and not suite and (needs_profile_browser(settings) or bool(us_options))
         if managed_workers and self.cdp_attached:
             raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment.')
         owned_browser = None
@@ -231,6 +250,10 @@ class Amazon:
             launch = {'headless': not settings.get('show_browser_window', False),
                       'args': [f'--remote-debugging-port={worker_port}',
                                '--remote-debugging-address=127.0.0.1']}
+            if us_options:
+                # WorkerNavigator uses process languages, while context locale
+                # affects documents. Set both natively for US profiles.
+                launch['args'] += ['--lang=en-US', '--accept-lang=en-US']
             if settings.get('browser_channel', 'chromium') != 'chromium':
                 launch['channel'] = settings['browser_channel']
             owned_browser = await self.driver.chromium.launch(**launch)
@@ -263,13 +286,20 @@ class Amazon:
                         done.exception()  # Observe teardown errors; close() also drains owners.
                 task.add_done_callback(finished)
         context.on('close', release_context)
+        if us_options:
+            context._retail_us_profile_options = {key: options[key] for key in ('locale', 'viewport', 'screen', 'device_scale_factor', 'timezone_id')}
+            context._retail_us_profile_options['surfaces'] = [key for key in us_fingerprint.SURFACES if settings.get('fingerprint_' + key)]
         try:
             # Fingerprint transformations are explicit Settings opt-ins, not
             # derived from the headed/headless launch mode. GPU identity spans
             # both APIs; JS graphics contexts initialize workers automatically.
             # Native graphics are configured at process launch; only audio
             # fallbacks need an init script in that backend.
-            if self.profiles:
+            if suite_profile:
+                for script in suite_profile['scripts']:
+                    await context.add_init_script(script)
+                context._retail_suite_profile = suite_profile
+            elif self.profiles:
                 profile = self.profiles.get(account)
                 seed_int = int(profile['seed'], 16) & 0xFFFFFFFF
                 scripts = build_scripts(
@@ -278,6 +308,8 @@ class Amazon:
                     spoof_webgl=not native and settings.get('fingerprint_webgl', False),
                     spoof_webgpu=not native and settings.get('fingerprint_webgpu', False),
                     spoof_audio=settings.get('fingerprint_audio', False),
+                    spoof_navigator=not native and settings.get('fingerprint_navigator', False),
+                    restrict_fonts=not native and settings.get('fingerprint_fonts', False),
                     intercept_workers=not native and not managed_workers and settings.get('fingerprint_workers', False),
                 )
                 for script in scripts:
@@ -296,6 +328,10 @@ class Amazon:
                         for (const [key, value] of Object.entries(%s)) sessionStorage.setItem(key, value);
                         sessionStorage.setItem('__retail_restored_v1', '1');
                     })()''' % (json.dumps(domain), json.dumps(safe)))
+            if location:
+                confirmed = await proxy_location.lookup_location(context)
+                proxy_location.ensure_same_route(location, confirmed)
+                context._retail_proxy_location = proxy_location.summary(confirmed)
             context.set_default_timeout(settings.get("browser_timeout_ms", 30000))
             if settings.get("trace_enabled"):
                 await context.tracing.start(screenshots=True,snapshots=True,sources=False)

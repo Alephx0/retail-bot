@@ -33,7 +33,10 @@ def worker_origin():
         ctx.fillStyle=gradient;ctx.fillRect(0,0,32,16);
         const g=new OffscreenCanvas(1,1).getContext('webgl');
         const renderer=g.getParameter(g.getExtension('WEBGL_debug_renderer_info').UNMASKED_RENDERER_WEBGL);
-        return {renderer,pixels:[...ctx.getImageData(0,0,32,16).data]};
+        return {renderer,pixels:[...ctx.getImageData(0,0,32,16).data],
+            identity:{cpu:navigator.hardwareConcurrency,memory:navigator.deviceMemory,
+                language:navigator.language,languages:[...navigator.languages],
+                timezone:Intl.DateTimeFormat().resolvedOptions().timeZone}};
     };'''
 
     class Handler(BaseHTTPRequestHandler):
@@ -84,12 +87,15 @@ def worker_origin():
 
 
 @pytest.mark.parametrize('kind', ['classic', 'module'])
-def test_worker_startup_imports_restart_and_account_isolation(tmp_path, worker_origin, kind):
+@pytest.mark.parametrize('us_profile', [False, True])
+def test_worker_startup_imports_restart_and_account_isolation(tmp_path, worker_origin, kind, us_profile):
     async def scenario():
         origin, capture = worker_origin
         store = Store(tmp_path)
         store.put('settings', {'browser_channel': 'chrome', 'fingerprint_canvas': True,
                               'fingerprint_webgl': True, 'fingerprint_webgpu': True,
+                              'fingerprint_navigator': us_profile, 'fingerprint_fonts': us_profile,
+                              'fingerprint_screen': us_profile, 'fingerprint_timezone': 'America/Los_Angeles',
                               'fingerprint_workers': False}, 'settings')
         adapter = Amazon(store)
         contexts = []
@@ -133,6 +139,8 @@ def test_worker_startup_imports_restart_and_account_isolation(tmp_path, worker_o
                 for realm, value in result.items():
                     assert value['renderer'] == main['renderer'], (realm, value, main)
                     assert value['pixels'] == main['pixels'], realm
+                    if us_profile:
+                        assert value['identity'] == main['identity'], (realm, value['identity'], main['identity'])
                     assert value['url'].startswith(origin), value['url']
                 assert result['service'] == result['restarted']
                 assert not context._retail_worker_profiles.errors

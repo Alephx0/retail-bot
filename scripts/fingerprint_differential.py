@@ -20,6 +20,7 @@ from retail.store import Store
 from retail.native_fingerprint import launch_options as native_launch_options
 
 SURFACES = ('canvas', 'webgl', 'webgpu', 'audio', 'workers')
+US_SURFACES = ('fonts', 'navigator', 'screen')
 SITES = {
     'creepjs': 'https://abrahamjuliot.github.io/creepjs/',
     'browserleaks': 'https://browserleaks.com/webgl',
@@ -39,6 +40,35 @@ PROBE = r"""async () => {
  const worker=await new Promise(resolve=>{const url=URL.createObjectURL(new Blob([`const gl=new OffscreenCanvas(10,10).getContext('webgl');const e=gl?.getExtension('WEBGL_debug_renderer_info');postMessage({ua:navigator.userAgent,platform:navigator.platform,language:navigator.language,renderer:e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):null});`],{type:'text/javascript'}));let w;const timer=setTimeout(()=>{w?.terminate();URL.revokeObjectURL(url);resolve({error:'timeout'})},5000);try {w=new Worker(url);w.onmessage=e=>{clearTimeout(timer);w.terminate();URL.revokeObjectURL(url);resolve(e.data)};w.onerror=e=>{clearTimeout(timer);w.terminate();URL.revokeObjectURL(url);resolve({error:e.message})}}catch(e){clearTimeout(timer);URL.revokeObjectURL(url);resolve({error:String(e)})}});
  return {canvas:await digest(c.toDataURL()),gpu,webgpu,audio,worker,ua:navigator.userAgent,platform:navigator.platform,language:navigator.language,languages:navigator.languages,screen:{width:screen.width,height:screen.height,availWidth:screen.availWidth,availHeight:screen.availHeight,dpr:devicePixelRatio},timezone:Intl.DateTimeFormat().resolvedOptions().timeZone};
 }"""
+
+IDENTITY_PROBE = r'''async () => {
+ const capture = () => ({
+   hardwareConcurrency: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory,
+   ua: navigator.userAgent, platform: navigator.platform,
+   language: navigator.language, languages: [...navigator.languages],
+   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+ });
+ const main = capture();
+ const worker = await new Promise(resolve => {
+   const url = URL.createObjectURL(new Blob(['postMessage(('+capture.toString()+')())'], {type:'text/javascript'}));
+   const w = new Worker(url);
+   const finish = value => {clearTimeout(timer);w.terminate();URL.revokeObjectURL(url);resolve(value)};
+   const timer = setTimeout(()=>finish({error:'timeout'}),5000);
+   w.onmessage=e=>finish(e.data);w.onerror=e=>finish({error:e.message});
+ });
+ const frame=document.createElement('iframe');document.body.append(frame);
+ const other=frame.contentWindow;
+ const iframe={hardwareConcurrency:other.navigator.hardwareConcurrency,deviceMemory:other.navigator.deviceMemory,
+   ua:other.navigator.userAgent,platform:other.navigator.platform,language:other.navigator.language,
+   languages:[...other.navigator.languages],timezone:other.Intl.DateTimeFormat().resolvedOptions().timeZone};
+ frame.remove();
+ return {main,worker,iframe,screen:{width:screen.width,height:screen.height,
+   innerWidth,innerHeight,dpr:devicePixelRatio,
+   cssDpr:matchMedia('(resolution: '+devicePixelRatio+'dppx)').matches,
+   cssWidth:matchMedia('(width: '+innerWidth+'px)').matches,
+   cssScreen:matchMedia('(device-width: '+screen.width+'px)').matches}};
+}'''
+
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -117,6 +147,20 @@ def zero_warning_failures(records, expected_runs):
         probe = row.get('probe', {})
         renderer = (probe.get('gpu') or {}).get('renderer')
         worker = (probe.get('worker') or {}).get('renderer')
+        if 'identity_probe' in row or row.get('us_profile'):
+            identity = row.get('identity_probe') or {}
+            main = identity.get('main', {})
+            screen = identity.get('screen', {})
+            # Legacy context locale leaves an extra worker language fallback.
+            # Preserve that baseline observation; US profiles must fix it.
+            def comparable(value):
+                return {key: item for key, item in value.items() if row.get('us_profile') or key != 'languages'}
+            if (not main or comparable(identity.get('worker', {})) != comparable(main)
+                    or comparable(identity.get('iframe', {})) != comparable(main)
+                    or not all(screen.get(key) for key in ('cssDpr', 'cssWidth', 'cssScreen'))
+                    or screen.get('innerWidth', 0) > screen.get('width', 0)
+                    or screen.get('innerHeight', 0) > screen.get('height', 0)):
+                failures.append({'case': row['case'], 'repeat': row['repeat'], 'identity_probe': identity})
         if (type(creep.get('warning_count')) is not int or creep['warning_count'] != 0
                 or type(creep.get('captured_error_count')) is not int or creep['captured_error_count'] != 0
                 or not renderer or creep.get('worker_renderer') != renderer or worker != renderer
@@ -160,6 +204,21 @@ async def main(args):
     matrix = [('native-headed', True, ()), ('native-headless', False, ()), ('bot-off', False, ())]
     matrix += [(s+'-only', False, (s,)) for s in SURFACES]
     matrix += [('everything', False, SURFACES), ('restored-off', False, ())]
+    if args.us_profiles:
+        if args.backend != 'javascript' or args.all_configurations:
+            raise ValueError('--us-profiles requires the JavaScript backend and cannot be combined with --all-configurations')
+        matrix = [('bot-off', False, ()), ('existing-all', False, SURFACES)]
+        for size in range(1, 4):
+            for selected in combinations(US_SURFACES, size):
+                matrix.append(('us-' + '-'.join(selected), False, selected))
+                matrix.append(('combined-' + '-'.join(selected), False, SURFACES + selected))
+        matrix.append(('restored-off', False, ()))
+    if args.backend == 'fingerprint-suite':
+        if args.all_configurations:
+            raise ValueError('Fingerprint-suite uses a complete profile, not the five custom flags; omit --all-configurations')
+        matrix = [('native-headed', True, ()), ('native-headless', False, ()),
+                  ('bot-off', False, ()), ('suite-full', False, ('suite',)),
+                  ('restored-off', False, ())]
     if args.all_configurations:
         for size in range(2, len(SURFACES)):
             matrix += [('mixed-' + '-'.join(enabled), False, enabled)
@@ -184,10 +243,13 @@ async def main(args):
                         record = {'case': name, 'repeat': repeat, 'enabled': enabled, 'at': datetime.now(timezone.utc).isoformat()}
                         print(f'START {name} {repeat}', flush=True)
                         try:
+                            effective_backend = ('javascript' if args.backend == 'fingerprint-suite' and name != 'suite-full' else args.backend)
                             store.put('settings', {'browser_channel': 'chrome', 'show_browser_window': headed,
-                                'fingerprint_backend': args.backend, 'native_browser_executable': args.native_browser_executable,
-                                **{'fingerprint_'+s:s in enabled for s in SURFACES}}, 'settings')
+                                'fingerprint_backend': effective_backend, 'native_browser_executable': args.native_browser_executable,
+                                'fingerprint_timezone': args.timezone,
+                                **{'fingerprint_'+s:s in enabled for s in SURFACES + US_SURFACES}}, 'settings')
                             record['backend'] = args.backend
+                            record['effective_backend'] = effective_backend
                             if name.startswith('native-'):
                                 browser, context, process = await native_context(driver, folder, headed, args.backend, args.native_browser_executable)
                             else:
@@ -195,11 +257,21 @@ async def main(args):
                                 browser = adapter.browser
                             record['browser_version'] = browser.version
                             record['profile'] = adapter.profiles.get(account)
+                            if getattr(context, '_retail_us_profile_options', None):
+                                record['us_profile'] = context._retail_us_profile_options
+                            suite = getattr(context, '_retail_suite_profile', None)
+                            if suite:
+                                save(folder / 'suite-profile.json', suite)
+                                record['suite_profile_digest'] = suite['digest']
+                                record['suite_versions'] = suite['versions']
+                                record['suite_browser_major'] = suite['generatedBrowserMajor']
                             # Intercept only a dedicated synthetic HTTPS origin for a CSP-free probe.
                             await context.route('https://fingerprint-audit.test/', lambda route: route.fulfill(content_type='text/html', body='<title>Fingerprint audit</title>'))
                             probe = await context.new_page()
                             await probe.goto('https://fingerprint-audit.test/')
                             record['probe'] = await probe.evaluate(PROBE, isolated_context=False)
+                            if args.us_profiles:
+                                record['identity_probe'] = await probe.evaluate(IDENTITY_PROBE, isolated_context=False)
                             await probe.close()
                             record['sites'] = {}
                             for site in args.sites:
@@ -245,9 +317,11 @@ if __name__ == '__main__':
     parser.add_argument('--sites', nargs='+', choices=tuple(SITES), default=list(SITES))
     parser.add_argument('--require-zero-lies', action='store_true')
     parser.add_argument('--require-zero-warnings', action='store_true', help='Also require no warning-bin entries/errors and matching worker identities')
-    parser.add_argument('--backend', choices=('javascript', 'native'), default='javascript')
+    parser.add_argument('--backend', choices=('javascript', 'native', 'fingerprint-suite'), default='javascript')
     parser.add_argument('--native-browser-executable', default='')
     parser.add_argument('--all-configurations', action='store_true', help='Test all 32 combinations of the five fingerprint flags, plus baselines')
+    parser.add_argument('--us-profiles', action='store_true', help='Test all eight new font/navigator/screen combinations, both alone and with existing transformations')
+    parser.add_argument('--timezone', default='America/New_York')
     parser.add_argument('--account-id', default='differential-fixed-account-v1', help='Synthetic account identifier used to derive the repeatable seed')
     args = parser.parse_args()
     if (args.require_zero_lies or args.require_zero_warnings) and 'creepjs' not in args.sites:

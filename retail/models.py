@@ -238,14 +238,24 @@ class Settings(BaseModel):
     fingerprint_webgpu: bool = False
     fingerprint_audio: bool = False
     fingerprint_workers: bool = False
-    fingerprint_backend: Literal['javascript', 'native'] = 'javascript'
+    fingerprint_fonts: bool = False
+    fingerprint_navigator: bool = False
+    fingerprint_screen: bool = False
+    fingerprint_proxy_location: bool = True
+    fingerprint_timezone: Literal['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu'] = 'America/New_York'
+    fingerprint_backend: Literal['javascript', 'native', 'fingerprint-suite'] = 'javascript'
     native_browser_executable: str = ''
 
     @model_validator(mode='after')
     def profile_browser_connection(self):
+        if self.fingerprint_backend == 'fingerprint-suite':
+            if self.cdp_attach:
+                raise ValueError('Fingerprint-suite requires an app-managed browser')
+            return self  # Custom surface flags are inactive for this complete profile.
         if self.fingerprint_backend == 'native' and self.cdp_attach:
             raise ValueError('Native profiles require an app-managed browser; disable external CDP attachment')
-        if self.cdp_attach and any((self.fingerprint_canvas, self.fingerprint_webgl, self.fingerprint_webgpu)):
+        if self.cdp_attach and any((self.fingerprint_canvas, self.fingerprint_webgl, self.fingerprint_webgpu,
+                                   self.fingerprint_fonts, self.fingerprint_navigator, self.fingerprint_screen)):
             raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment')
         return self
 

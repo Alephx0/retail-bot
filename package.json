@@ -1,0 +1,10 @@
+{
+  "name": "retail-desk-fingerprint-adapter",
+  "private": true,
+  "description": "Optional Node helper for the independent Apify fingerprint-suite backend",
+  "dependencies": {
+    "fingerprint-generator": "2.1.88",
+    "fingerprint-injector": "2.1.88"
+  },
+  "engines": { "node": ">=20" }
+}

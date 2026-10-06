@@ -69,3 +69,22 @@ def test_warning_check_rejects_worker_failures(fault):
     else:
         row['worker_profile_errors'] = ['Worker restart failed']
     assert zero_warning_failures([row], 1)
+
+
+@pytest.mark.parametrize('fault', ['none', 'missing', 'languages', 'timezone', 'screen'])
+def test_us_identity_check_requires_complete_matching_realms(fault):
+    row = clean_warning_record()
+    row['us_profile'] = {'surfaces': ['navigator', 'screen']}
+    identity = {'cpu': 8, 'ram': 8, 'languages': ['en-US'], 'timezone': 'America/Chicago'}
+    row['identity_probe'] = {realm: dict(identity) for realm in ('main', 'worker', 'iframe')}
+    row['identity_probe']['screen'] = {'width': 1920, 'height': 1080, 'innerWidth': 1920,
+        'innerHeight': 960, 'cssDpr': True, 'cssWidth': True, 'cssScreen': True}
+    if fault == 'missing':
+        del row['identity_probe']
+    elif fault == 'languages':
+        row['identity_probe']['worker']['languages'] = ['en-US', 'en']
+    elif fault == 'timezone':
+        row['identity_probe']['iframe']['timezone'] = 'America/New_York'
+    elif fault == 'screen':
+        row['identity_probe']['screen']['cssDpr'] = False
+    assert bool(zero_warning_failures([row], 1)) == (fault != 'none')
