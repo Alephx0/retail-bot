@@ -73,6 +73,25 @@ Sounds require an open dashboard and user interaction to unlock browser audio. B
 
 Tests cover parsing, filtering, persistence, request protection, secret redaction, references, scheduling, cancellation, TOTP reference vectors, OTP scoping/replay prevention, provider/proxy adapters, checkout-layout validation and uncertain submission responses.
 
+For a live differential fingerprint audit on Windows with Google Chrome installed:
+
+```powershell
+.\.venv\Scripts\python scripts/fingerprint_differential.py --output artifacts/fingerprint-audit-1
+.\.venv\Scripts\python scripts/summarize_fingerprint_differential.py artifacts/fingerprint-audit-1
+```
+
+Use a fresh output directory for each audit. The audit visits CreepJS, BrowserLeaks, and AmIUnique in three fresh sessions per configuration, using an isolated synthetic account and fixed seed. It compares direct Chrome headed/headless launches, the bot with all transformations off, each transformation independently, everything enabled, and a final disabled run. Direct Chrome baselines are inspected over CDP, not uninstrumented manual browsing. It saves JSON exports, screenshots, and a differential report; these contain browser/device fingerprints. No retailer account or production settings are used. Audio metadata may legitimately remain unchanged; workers-only tests interception without enabling other transformations. Results measure browser consistency, not retailer acceptance.
+
+Add `--sites creepjs --all-configurations --require-zero-warnings` for the strict CreepJS regression check. It requires zero lies, warning-bin entries and captured errors, matching main/worker renderers, and successful worker initialization; missing captures fail. Results are saved in `zero-warnings-check.json`. The narrower `--require-zero-lies` checks only capture validity and lies. Neither check suppresses findings. Canvas uses seeded gradient/Bezier drawing offsets, preserving exact pixel writes and native read/copy/export behavior. Callable proxies use a local invalid-receiver adapter while the global Function.prototype.toString remains native.
+
+See [JavaScript fingerprint backend behavior and limits](docs/javascript-fingerprint-backend.md) for the drawing algorithm, callable receiver adapter, and cross-realm coverage.
+
+Graphics compatibility: WebGPU adapters, devices, metadata, limits and feature sets retain native object identities. `GPU.requestAdapter` and Object/Reflect intrinsics stay native. Device-request iterables are consumed once in native dictionary-conversion order. JavaScript graphics profiles automatically initialize dedicated/shared/service/nested workers before startup, including service-worker restarts. They use a separate stock browser process per account context and require app-managed browsers. These repairs do not make the hooks undetectable: saved native accessors and inspection of drawing hooks can still expose differences. The bootstrap's idempotency symbol remains visible through normal reflection.
+
+An optional [native fingerprint backend](docs/native-fingerprint-backend.md) moves graphics transformations into a pinned Chromium fork and gives each active graphics profile its own process. Install it with `scripts/install_native_browser.py`, then select Native Chromium profiles in Settings → Browser → Fingerprint profiles. The build disables Safe Browsing; review the linked tradeoffs before selecting it. Add `--backend native --all-configurations` to the audit command to test all 32 flag combinations. The JavaScript backend remains the default until explicitly changed.
+
+WebGL profiles retain seeded model aliases within the real hardware family and pixel transformations. Vendor, capabilities, extensions and precision remain native. Either GPU flag applies coherent identity policy across both APIs; WebGPU vendor/architecture remain genuine and model fields are redacted. Unknown/mobile GPU families keep native renderer identity. Equivalent enum arguments use the same transformed path with one native conversion. This changes earlier profile values and avoids arbitrary cross-vendor claims; it does not emulate another GPU or alter the network stack.
+
 For dashboard tests, start an isolated workspace:
 
 ```powershell
@@ -119,7 +138,7 @@ Monitor delay can be changed while tasks run. Access-denied responses pause for 
 
 ## Headless workers and intervention
 
-Configured accounts do not keep browser contexts open while idle. Live tasks use isolated account contexts in a shared headless Chromium process, with encrypted cookies, local storage and bounded account-scoped session-storage snapshots restored on the next task. A configurable worker limit queues excess tasks before they open contexts; one live task per account holds the account lock. Account sign-in sessions are capped and expire after 30 minutes if unfinished.
+Configured accounts do not keep browser contexts open while idle. Live tasks use isolated account contexts in a shared headless Chromium process, or separate processes when graphics profiles are enabled, with encrypted cookies, local storage and bounded account-scoped session-storage snapshots restored on the next task. A configurable worker limit queues excess tasks before they open contexts; one live task per account holds the account lock. Account sign-in sessions are capped and expire after 30 minutes if unfinished.
 
 When a task pauses for authentication or verification, open **Take Control** on that task. Click the screenshot and type, paste or use the key controls; the input goes to the same paused Playwright page. Then press **Resume**. The app verifies sign-in and re-inspects the product and cart before retrying the interrupted pre-submission step. Input is rejected while automation is running, so the user and bot cannot click the page concurrently. Order submissions with an existing attempt record are never replayed. Closing Take Control returns to headless operation because no GUI browser was launched.
 
@@ -146,7 +165,7 @@ Home analytics derive spending/checkouts/savings from order records and failures
 
 Proxy endpoints are normalized and deduplicated beneath the existing pools. Resource folders organize those pools; the Connections table shows individual host, port, protocol, health, latency and test time. New routes prefer a healthy tested connection. Existing account routes stay sticky; a health test does not silently move a logged-in session. HTTP proxies are supported; SOCKS and per-endpoint editing are not implemented.
 
-Account Manager provides explicit open/verify actions, group/profile/network assignment, and saved session state. Refresh Status refreshes stored state; Verify Login makes the browser check. Address/payment health audits and scheduled account browsing are not implemented. Sessions preserve encrypted cookies/storage; hardware identities and fingerprints are not fabricated.
+Account Manager provides explicit open/verify actions, group/profile/network assignment, and saved session state. Refresh Status refreshes stored state; Verify Login makes the browser check. Address/payment health audits and scheduled account browsing are not implemented. Sessions preserve encrypted cookies/storage; optional fingerprint profiles apply the transformations documented above.
 
 Diagnostics store masked screenshots, semantic control snapshots, accessibility output, stage and previous locator encrypted locally. Optional browser traces are also stored encrypted and downloaded from Settings. Traces can contain account details. The app connects its local MCP tools to the Playwright task page, using CDP for accessibility inspection. Attaching to an existing Chrome or Edge debugging session is optional under Settings > Browser > Advanced.
 
@@ -184,6 +203,6 @@ Account editors offer an optional 2–7 day purchase cooldown (default Off for c
 
 The 0.4 acceptance script is `scripts/smoke_redesign.py` against an isolated server on port 8766. The contextual integration smoke check is `scripts/smoke_features.py`. Neither places purchases.
 
-A read-only public Amazon check on 2026-09-25 received a Continue shopping interstitial before product content. That condition now produces an explicit manual-action handoff instead of an unsupported-layout error. Live signed-in monitoring, carting and checkout remain unverified. This release does not implement fingerprint spoofing, fabricated trust activity, disguised bulk account registration, or detection evasion.
+A read-only public Amazon check on 2026-09-25 received a Continue shopping interstitial before product content. That condition now produces an explicit manual-action handoff instead of an unsupported-layout error. Live signed-in monitoring, carting and checkout remain unverified. Optional fingerprint profiles do not establish retailer acceptance; fabricated trust activity and bulk account registration are not implemented.
 
 References for the architecture: [Playwright locators](https://playwright.dev/python/docs/locators), [CDP connection limitations](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp), and [trace capture](https://playwright.dev/python/docs/trace-viewer). The linked Reddit discussion and browser signal demonstration pages were reviewed; they do not establish that an automation stack is undetectable.

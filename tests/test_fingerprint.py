@@ -10,6 +10,93 @@ from retail.store import Store
 TEST_PAGE = '<body><canvas id="c" width="200" height="100"></canvas></body>'
 
 
+@pytest.mark.parametrize('flags', [
+    {'perturb_canvas': True}, {'spoof_webgl': True}, {'spoof_webgpu': True},
+    {'spoof_audio': True}, {'intercept_workers': True},
+    dict(perturb_canvas=True, spoof_webgl=True, spoof_webgpu=True,
+         spoof_audio=True, intercept_workers=True),
+])
+def test_wrappers_preserve_intrinsics_prototype_cycles_and_audio_receivers(tmp_path, flags):
+    async def scenario():
+        store = Store(tmp_path)
+        adapter = Amazon(store)
+        try:
+            await adapter.ready()
+            context = await adapter.browser.new_context()
+            # One init script fixes the capture/bootstrap order explicitly.
+            await context.add_init_script(
+                'globalThis.originalToString = Function.prototype.toString;\n'
+                'globalThis.originalReflection = [Object.getOwnPropertyDescriptor, '
+                'Object.getOwnPropertyDescriptors, Object.getOwnPropertySymbols, '
+                'Reflect.getOwnPropertyDescriptor, Reflect.ownKeys];\n'
+                + '\n'.join(build_scripts(123, **flags)))
+            page = await context.new_page()
+            await page.goto('about:blank')
+            result = await page.evaluate(r'''() => {
+                const methods = [HTMLCanvasElement.prototype.toDataURL,
+                    CanvasRenderingContext2D.prototype.getImageData,
+                    CanvasRenderingContext2D.prototype.createLinearGradient,
+                    CanvasRenderingContext2D.prototype.quadraticCurveTo,
+                    WebGLRenderingContext.prototype.getParameter,
+                    WebGL2RenderingContext.prototype.readPixels, Worker];
+                if (globalThis.GPU) methods.push(GPU.prototype.requestAdapter);
+                const cycles = methods.map(fn => {
+                    const proto = Object.getPrototypeOf(fn);
+                    try {
+                        const reflected = Reflect.setPrototypeOf(fn, Object.create(fn));
+                        let error;
+                        try { Object.setPrototypeOf(fn, Object.create(fn)); }
+                        catch (e) { error = e.name; }
+                        return {reflected, error, unchanged: Object.getPrototypeOf(fn) === proto};
+                    } finally { Object.setPrototypeOf(fn, proto); }
+                });
+                const receiverErrors = methods.map(fn => {
+                    const object = Object.create(fn);
+                    const firstFrame = f => {try {f(); return '';} catch(e) {
+                        return e.name === 'TypeError' ? e.stack.split('\n')[1] : e.name;
+                    }};
+                    return {
+                        stable: object.toString === object.toString,
+                        callableToString: fn.toString === Function.prototype.toString,
+                        primitiveReceiver: Reflect.get(fn, 'toString', 1) === Function.prototype.toString,
+                        direct: /at Function\.toString /.test(firstFrame(() => object.toString())),
+                        outer: /at Object\.toString /.test(firstFrame(() => Object.create(new Proxy(fn, {})).toString())),
+                        borrowed: object.toString.call(Math.abs) === Function.prototype.toString.call(Math.abs),
+                        objectTag: Object.prototype.toString.call(object),
+                    };
+                });
+                // __lookupGetter__ reads the installed getter itself.
+                const getter = BaseAudioContext.prototype.__lookupGetter__('sampleRate');
+                let receiverError;
+                try { getter.call({}); } catch (e) { receiverError = e.name; }
+                return {sameToString: Function.prototype.toString === originalToString,
+                        sameReflection: [Object.getOwnPropertyDescriptor,
+                            Object.getOwnPropertyDescriptors, Object.getOwnPropertySymbols,
+                            Reflect.getOwnPropertyDescriptor, Reflect.ownKeys]
+                            .every((fn,i)=>fn===originalReflection[i]),
+                        descriptorMatches: [HTMLCanvasElement.prototype,
+                            CanvasRenderingContext2D.prototype, WebGLRenderingContext.prototype]
+                            .every(p=>Object.entries(Object.getOwnPropertyDescriptors(p))
+                                .every(([k,d])=>!('value' in d) || d.value===p[k])),
+                        cycles, receiverErrors, receiverError, getterName: getter.name, getterLength: getter.length};
+            }''', isolated_context=False)
+            assert result['sameToString']
+            assert result['sameReflection']
+            assert result['descriptorMatches']
+            assert all(row == dict(stable=True, callableToString=True, direct=True,
+                                   outer=True, borrowed=True, primitiveReceiver=True, objectTag='[object Object]')
+                       for row in result['receiverErrors'])
+            assert all(row == {'reflected': False, 'error': 'TypeError', 'unchanged': True}
+                       for row in result['cycles'])
+            assert result['receiverError'] == 'TypeError'
+            assert result['getterName'] == 'get sampleRate'
+            assert result['getterLength'] == 0
+        finally:
+            await adapter.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
 async def open_page(adapter, account, *, perturb_canvas=True):
     if perturb_canvas:
         # Canvas perturbation is now a Settings opt-in rather than a
@@ -220,6 +307,8 @@ def test_webgl_and_general_runtime_remain_native(tmp_path, perturb_canvas):
                     return Reflect.ownKeys(before[i]).every(key => before[i][key] === after[key]);
                 });
                 const addedKeys = Reflect.ownKeys(window).filter(k => !ownKeys.includes(k));
+                const honestMarker = addedKeys.length === 1 && typeof addedKeys[0] === 'symbol'
+                    && Object.getOwnPropertyDescriptor(window, addedKeys[0]).value === true;
                 const unused = document.createElement('canvas');
                 unused.toDataURL();
                 const exportDoesNotLockContext = !!unused.getContext('webgl2');
@@ -252,13 +341,16 @@ def test_webgl_and_general_runtime_remain_native(tmp_path, perturb_canvas):
                     worker.terminate();
                     URL.revokeObjectURL(url);
                 }
-                return {unchanged, addedKeys, exportDoesNotLockContext,
+                return {unchanged, addedKeyCount:addedKeys.length, honestMarker, exportDoesNotLockContext,
                         exportUnchanged: exportBefore === canvas.toDataURL(),
                         main: identity(gl), worker: workerIdentity, error: gl.getError()};
             }''', {'scripts': build_scripts(123, perturb_canvas=perturb_canvas),
                    'perturbCanvas': perturb_canvas}, isolated_context=False)
             assert result['unchanged']
-            assert result['addedKeys'] == []
+            # The idempotency marker is reflected honestly; global reflection
+            # must not be patched to conceal state or restore old descriptors.
+            assert result['addedKeyCount'] == int(perturb_canvas)
+            assert result['honestMarker'] == perturb_canvas
             assert result['exportUnchanged']
             assert result['exportDoesNotLockContext']
             assert result['main'] == result['worker']
@@ -397,6 +489,7 @@ def test_transparent_perturbation_and_native_readback_semantics(tmp_path):
             page = await context.new_page()
             result = await page.evaluate('''script => {
                 const nativeRead = CanvasRenderingContext2D.prototype.getImageData;
+                const nativeGradient = CanvasRenderingContext2D.prototype.createLinearGradient;
                 (0, eval)(script);
                 const canvas = document.createElement('canvas');
                 canvas.width = 128; canvas.height = 64;
@@ -406,11 +499,20 @@ def test_transparent_perturbation_and_native_readback_semantics(tmp_path):
                 gradient.addColorStop(1, 'rgba(30, 50, 90, 0.8)');
                 ctx.fillStyle = gradient;
                 ctx.fillRect(8, 8, 112, 48);
+                const reference = document.createElement('canvas');
+                reference.width = 128; reference.height = 64;
+                const referenceContext = reference.getContext('2d');
+                const referenceGradient = nativeGradient.call(referenceContext, 0, 0, 128, 64);
+                referenceGradient.addColorStop(0, 'rgba(230, 180, 140, 0.3)');
+                referenceGradient.addColorStop(1, 'rgba(30, 50, 90, 0.8)');
+                referenceContext.fillStyle = referenceGradient;
+                referenceContext.fillRect(8, 8, 112, 48);
+                const original = nativeRead.call(referenceContext, 0, 0, 128, 64).data;
                 const native = nativeRead.call(ctx, 0, 0, 128, 64).data;
                 const patched = ctx.getImageData(0, 0, 128, 64).data;
                 let changes = 0, alphaChanges = 0, transparentChanges = 0;
                 for (let i = 0; i < patched.length; i++) {
-                    if (patched[i] !== native[i]) {
+                    if (patched[i] !== original[i]) {
                         changes++;
                         if (i % 4 === 3) alphaChanges++;
                         if (native[(i & ~3) + 3] === 0) transparentChanges++;
@@ -436,10 +538,12 @@ def test_transparent_perturbation_and_native_readback_semantics(tmp_path):
                 const zeroNative = outcome(() => nativeRead.call(ctx, 0, 0, 0, 1));
                 const zeroPatched = outcome(() => ctx.getImageData(0, 0, 0, 1));
                 return {changes, alphaChanges, transparentChanges, cropAgrees, conversions, optionReads,
+                        readbackAgrees: patched.every((v,i) => v === native[i]),
                         floatNative, floatPatched, zeroNative, zeroPatched};
             }''', build_scripts(123, perturb_canvas=True)[0], isolated_context=False)
             assert result['changes'] > 0
-            assert result['alphaChanges'] == result['transparentChanges'] == 0
+            assert result['transparentChanges'] == 0
+            assert result['readbackAgrees']
             assert result['cropAgrees']
             assert result['conversions'] == result['optionReads'] == 1
             assert result['floatNative'] == result['floatPatched']

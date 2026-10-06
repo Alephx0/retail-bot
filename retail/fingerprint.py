@@ -6,25 +6,32 @@ Both must run before application code touches canvas, WebGL, WebGPU, or audio.
 
 Design rules:
 
-  - Every surface is an explicit ``bool`` opt-in. There is no implicit coupling
-    between options and no derivation from browser launch mode. Callers select
-    exactly what they want applied; a visible window does not change which
-    hooks are installed.
-  - Pixel perturbation is content-keyed, never position- or read-size-keyed.
-    Only blended/edge pixels move. The byte, half-float, and float paths use
+  - Transformations are explicit opt-ins, independent of browser launch mode.
+    Either GPU flag enables coherent identity policy across both GPU APIs.
+    WebGL readback and WebGPU feature/limit policies retain separate flags.
+  - Canvas perturbation changes gradient coordinates and Bezier control
+    points during drawing. Readback, copying and export methods stay native
+    and observe one bitmap. Exact pixel writes, analytic primitives, path
+    endpoints, text metrics and non-primitive argument coercions stay native.
+    Seeded drawing offsets replace the legacy canvas readback algorithm.
+  - WebGL pixel perturbation is content-keyed, never read-size-keyed.
+    A neighbour-based heuristic selects candidate blended/edge pixels; it
+    cannot distinguish every explicitly painted pixel from rasterized output.
+    The byte, half-float, and float paths use
     the same eligibility predicate: neighbour-inequality on the full RGBA
     tuple, alpha range check, premultiplied colour range check, and
     horizontal-or-vertical boundary handling.
-  - WebGL identity, capability limits, per-extension set, per-stage shader
-    precision, and RGBA/RGBA_INTEGER readback are clamped to one coherent
-    per-seed GPU profile.
-  - WebGPU adapter info, adapter/device limits, and features are keyed on the
-    same seed/profile as WebGL. Fabricated adapterInfo objects are Proxies
-    over the native GPUAdapterInfo instance so WebIDL brand checks succeed.
+  - WebGL renderer aliases stay within the observed hardware family. Vendor,
+    capabilities, extensions and shader precision remain native. Unknown and
+    mobile families retain native identity. This does not emulate another GPU.
+  - WebGPU vendor/architecture remain genuine; device/description are redacted
+    when either GPU flag is enabled. Adapters, devices, info, limits, and feature
+    sets remain genuine platform objects; their prototype accessors apply
+    the selected policy without replacing native receiver identities.
     Subgroup sizes and isFallbackAdapter read through to the native object,
     keeping them consistent with the exposed feature set. requiredLimits and
-    requiredFeatures are validated against the advertised profile before
-    native dispatch. Unsupported limits reject with OperationError;
+    requiredFeatures are validated against the advertised profile during
+    native argument conversion. Unsupported limits reject with OperationError;
     unsupported features reject with TypeError.
   - Audio metadata fallbacks are keyed on the same seed as the GPU profile,
     but semantically valid native values are preserved. Positive sample
@@ -32,35 +39,38 @@ Design rules:
     OfflineAudioContext maxChannelCount values are left untouched. Rendered
     audio buffers and DynamicsCompressorNode.reduction remain fully native;
     this layer does not alter DSP output.
-  - Native adapter/device methods are returned bound to the real target with
-    name/length restored. Bound method identity relative to the prototype
-    differs from a native object; this is a fundamental limitation of JS
-    proxies around WebIDL interfaces.
-  - WebGL extension lists are fabricated from a per-profile allow-list.
-    Extensions whose objects carry only constants, and ASTC, get a stub that
-    is internally consistent. Extensions with real state-mutating methods
-    route to native; they are returned only if available.
+  - Unmodified adapter/device methods retain prototype identity and dynamic
+    receivers. requestAdapter remains native. Modified prototype accessors
+    remain JavaScript wrappers and do not establish native equivalence.
+  - WebGL extensions enable the real implementation and are not filtered.
+    WebGPU advertised features are restricted to natively supported features.
   - Full-frame and (0,0) reads are perturbed. The padded region is clipped
     to the framebuffer; missing neighbours simply do not enter the hash.
   - WebGL2 readPixels dstOffset is supported via a subarray view.
-  - OffscreenCanvas.transferToImageBitmap() routes the canvas through the
-    same noisify core before handing back the bitmap.
-  - 2D getImageData handles both rgba-unorm8 (Uint8ClampedArray) and
-    rgba-float16 (Float16Array) results.
+  - OffscreenCanvas transfers and both byte/float 2D readbacks use the
+    unmodified platform implementation on the transformed bitmap.
   - The readPixels pack-state guard reads native getParameter (captured
     before hooking) and fails closed.
   - Same-origin classic, module, and data: workers created through the
     wrapped constructors receive the bootstrap before their own entrypoint.
-  - Runtime-hook concealment covers Function.prototype.toString, descriptor
-    reads (Object/Reflect), and symbol enumeration of the idempotency marker.
+    The application instead uses WorkerProfiles for graphics contexts, covering
+    dedicated/shared/service/nested workers and service-worker restarts without
+    rewriting worker URLs. Standalone init scripts do not provide that coverage.
+  - Function.prototype.toString stays native. Callable wrappers reject direct
+    prototype cycles instead of creating recursive prototype chains. Object
+    and Reflect remain native; descriptors expose the actual installed hooks.
+    The idempotency symbol is reflected honestly, without concealment.
+    A local toString receiver bridge preserves native TypeError formatting
+    for non-callable objects directly inheriting a wrapper. It does not
+    rewrite stacks and does not make the proxy universally indistinguishable.
 
-Out of scope, by design and by platform limit: service-worker interception
-(blob:/data: script URLs are rejected by the SW registrar), cross-origin
-worker injection, native-level (non-JS) hook concealment, deep emulation of
+Not implemented by this script alone: service-worker interception and workers
+outside wrapped constructors. Not implemented by either integration:
+native-level (non-JS) hook concealment, deep emulation of
 native GPU rasterization/shader semantics, depth/stencil readback
 perturbation, PBO-offset readback perturbation, non-tight pack-state
-emulation, WebGPU device-level readback perturbation, WebIDL prototype
-method identity, and timing side channels.
+emulation, WebGPU device-level readback perturbation, native callable
+identity for modified methods/accessors, and timing side channels.
 """
 from __future__ import annotations
 
@@ -328,15 +338,45 @@ CANVAS_JS_TEMPLATE = r"""
      * Hook infrastructure
      * ------------------------------------------------------------------ */
 
-    const realSources = new WeakMap();
-    const hiddenDescriptors = new WeakMap();
-    function markHidden(owner, name, desc) {
-      let m = hiddenDescriptors.get(owner);
-      if (!m) { m = new Map(); hiddenDescriptors.set(owner, m); }
-      m.set(name, desc);
-    }
-
     const hookedOwners = new WeakMap();
+    const nativeFunctionToString = Function.prototype.toString;
+    function callableProxy(orig, traps) {
+      let inheritedToString;
+      const proxy = new Proxy(orig, {
+        ...traps,
+        get(target, key, receiver) {
+          const value = Reflect.get(target, key, receiver);
+          if (key !== 'toString' || value !== nativeFunctionToString ||
+              !receiver || (typeof receiver !== 'object' && typeof receiver !== 'function') ||
+              receiver === proxy || Reflect.getPrototypeOf(receiver) !== proxy) return value;
+          // Objects inheriting a callable are not callable themselves. Bridge
+          // that invalid receiver to an equivalent native-function prototype
+          // for TypeError construction, without rewriting Error.stack or the
+          // shared Function.prototype.toString intrinsic. Keep repeated
+          // property reads stable and honor explicitly supplied call receivers.
+          if (!inheritedToString) inheritedToString = new Proxy(value, {
+            apply(method, self, args) {
+              if (self && typeof self === 'object' && Reflect.getPrototypeOf(self) === proxy) {
+                self = Object.create(target, Object.getOwnPropertyDescriptors(self));
+              }
+              return Reflect.apply(method, self, args);
+            }
+          });
+          return inheritedToString;
+        },
+        setPrototypeOf(target, next) {
+          // Proxy forwarding otherwise tests for cycles against the target,
+          // not the public callable, and can introduce a recursive chain.
+          const seen = new Set();
+          for (let cursor = next; cursor !== null; cursor = Reflect.getPrototypeOf(cursor)) {
+            if (cursor === proxy || cursor === target || seen.has(cursor)) return false;
+            seen.add(cursor);
+          }
+          return Reflect.setPrototypeOf(target, next);
+        }
+      });
+      return proxy;
+    }
     function hook(proto, name, handler) {
       if (!proto) return false;
       let owner = proto, desc = null;
@@ -349,10 +389,9 @@ CANVAS_JS_TEMPLATE = r"""
       let seen = hookedOwners.get(owner);
       if (seen && seen.has(name)) return true;
       const orig  = desc.value;
-      const proxy = new Proxy(orig, {
+      const proxy = callableProxy(orig, {
         apply: (t, self, args) => handler(t, self, args, orig)
       });
-      realSources.set(proxy, orig);
       try {
         Object.defineProperty(owner, name, {
           value: proxy,
@@ -361,28 +400,29 @@ CANVAS_JS_TEMPLATE = r"""
           configurable: !!desc.configurable
         });
       } catch (e) { return false; }
-      markHidden(owner, name, desc);
       if (!seen) { seen = new Set(); hookedOwners.set(owner, seen); }
       seen.add(name);
       return true;
     }
 
-    hook(Function.prototype, 'toString', (t, self, args) => {
-      const real = realSources.get(self);
-      if (real !== undefined) return Reflect.apply(t, real, args);
-      return Reflect.apply(t, self, args);
-    });
+    function hookGetter(proto, name, transform) {
+      if (!proto) return;
+      const desc = _gopd(proto, name);
+      if (!desc || typeof desc.get !== 'function' || !desc.configurable) return;
+      Object.defineProperty(proto, name, {...desc, get: callableProxy(desc.get, {
+        apply(target, self, args) {
+          return transform(Reflect.apply(target, self, args), self);
+        }
+      })});
+    }
+
+    // Keep the engine's Function.prototype.toString intact. Callable proxies
+    // already have a native representation; overriding this shared intrinsic
+    // changes error behavior for every function in the realm.
 
     /* ------------------------------------------------------------------ *
      * Shared GPU profile table.
      * ------------------------------------------------------------------ */
-
-    const F = [127, 127, 23];
-    const I = [31, 30, 0];
-    const DESC_V = { 0x8DF0: F, 0x8DF1: F, 0x8DF2: F, 0x8DF3: I, 0x8DF4: I, 0x8DF5: I };
-    const DESC_F = { 0x8DF0: F, 0x8DF1: F, 0x8DF2: F, 0x8DF3: I, 0x8DF4: I, 0x8DF5: I };
-    const APPLE_V = DESC_V;
-    const APPLE_F = Object.assign({}, DESC_F, { 0x8DF0: [15, 15, 10] });
 
     const GPU_LIMITS = {
       maxTextureDimension1D: 8192, maxTextureDimension2D: 8192,
@@ -432,96 +472,36 @@ CANVAS_JS_TEMPLATE = r"""
       Apple:  ['texture-compression-astc', 'texture-compression-etc2']
     };
 
-    const PROFILES = [
-      { vendorTag: 'NVIDIA',
-        vendor: 'Google Inc. (NVIDIA)',
-        renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-        gpu: { vendor: 'nvidia', architecture: 'turing', device: '', description: '' },
-        precision: { vertex: DESC_V, fragment: DESC_F },
-        limits: {
-          0x0D33: 16384, 0x851C: 16384, 0x84E8: 16384,
-          0x8869: 16, 0x8872: 16, 0x8B4C: 16, 0x8B4D: 32,
-          0x8DFB: 4096, 0x8DFC: 31, 0x8DFD: 4096,
-          0x8073: 2048, 0x88FF: 2048,
-          0x8824: 8, 0x8CDF: 8, 0x8D57: 8,
-          0x8A2F: 72, 0x8D6B: 4294967295,
-          0x8A2D: 16, 0x8A2B: 16, 0x8A2E: 32, 0x8A30: 65536,
-          0x8B4A: 16384, 0x8B49: 16384,
-          0x9122: 256, 0x9125: 256,
-          0x84FF: 16,
-          0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4, 0x8E70: 4,
-          0x84FD: 15, 0x9111: 0,
-          0x8A31: 16384, 0x8A33: 16384
-        },
-        viewport: [32767, 32767], pointSize: [1, 1024], lineWidth: [1, 1] },
-
-      { vendorTag: 'Intel',
-        vendor: 'Google Inc. (Intel)',
-        renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-        gpu: { vendor: 'intel', architecture: 'gen-9', device: '', description: '' },
-        precision: { vertex: DESC_V, fragment: DESC_F },
-        limits: {
-          0x0D33: 16384, 0x851C: 16384, 0x84E8: 16384,
-          0x8869: 16, 0x8872: 16, 0x8B4C: 16, 0x8B4D: 32,
-          0x8DFB: 4096, 0x8DFC: 30, 0x8DFD: 1024,
-          0x8073: 2048, 0x88FF: 2048,
-          0x8824: 8, 0x8CDF: 8, 0x8D57: 4,
-          0x8A2F: 72, 0x8D6B: 4294967295,
-          0x8A2D: 16, 0x8A2B: 16, 0x8A2E: 32, 0x8A30: 65536,
-          0x8B4A: 16384, 0x8B49: 4096,
-          0x9122: 128, 0x9125: 128,
-          0x84FF: 16,
-          0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4, 0x8E70: 4,
-          0x84FD: 15, 0x9111: 0,
-          0x8A31: 16384, 0x8A33: 4096
-        },
-        viewport: [32767, 32767], pointSize: [1, 255], lineWidth: [1, 1] },
-
-      { vendorTag: 'AMD',
-        vendor: 'Google Inc. (AMD)',
-        renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-        gpu: { vendor: 'amd', architecture: 'gcn-4', device: '', description: '' },
-        precision: { vertex: DESC_V, fragment: DESC_F },
-        limits: {
-          0x0D33: 16384, 0x851C: 16384, 0x84E8: 16384,
-          0x8869: 16, 0x8872: 16, 0x8B4C: 16, 0x8B4D: 32,
-          0x8DFB: 4096, 0x8DFC: 32, 0x8DFD: 4096,
-          0x8073: 2048, 0x88FF: 2048,
-          0x8824: 8, 0x8CDF: 8, 0x8D57: 8,
-          0x8A2F: 72, 0x8D6B: 4294967295,
-          0x8A2D: 16, 0x8A2B: 16, 0x8A2E: 32, 0x8A30: 65536,
-          0x8B4A: 16384, 0x8B49: 16384,
-          0x9122: 256, 0x9125: 256,
-          0x84FF: 16,
-          0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4, 0x8E70: 4,
-          0x84FD: 15, 0x9111: 0,
-          0x8A31: 16384, 0x8A33: 16384
-        },
-        viewport: [32767, 32767], pointSize: [1, 2047], lineWidth: [1, 1] },
-
-      { vendorTag: 'Apple',
-        vendor: 'Google Inc. (Apple)',
-        renderer: 'ANGLE (Apple, Apple M1, OpenGL 4.1)',
-        gpu: { vendor: 'apple', architecture: 'apple-m1', device: '', description: '' },
-        precision: { vertex: APPLE_V, fragment: APPLE_F },
-        limits: {
-          0x0D33: 16384, 0x851C: 16384, 0x84E8: 16384,
-          0x8869: 16, 0x8872: 16, 0x8B4C: 16, 0x8B4D: 32,
-          0x8DFB: 4096, 0x8DFC: 31, 0x8DFD: 1024,
-          0x8073: 2048, 0x88FF: 2048,
-          0x8824: 8, 0x8CDF: 8, 0x8D57: 4,
-          0x8A2F: 72, 0x8D6B: 4294967295,
-          0x8A2D: 16, 0x8A2B: 16, 0x8A2E: 32, 0x8A30: 65536,
-          0x8B4A: 16384, 0x8B49: 4096,
-          0x9122: 128, 0x9125: 128,
-          0x84FF: 16,
-          0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4, 0x8E70: 4,
-          0x84FD: 15, 0x9111: 0,
-          0x8A31: 16384, 0x8A33: 4096
-        },
-        viewport: [32767, 32767], pointSize: [1, 511], lineWidth: [1, 1] }
+    // Alias a model within its observed hardware family. Keep the actual
+    // vendor, graphics backend, and capability tuple; a different vendor's
+    // name cannot turn this device into that vendor's implementation.
+    const RENDERER_FAMILIES = [
+      [/NVIDIA GeForce RTX 30\d{2}(?: Ti)?/i, ['NVIDIA GeForce RTX 3060 Ti', 'NVIDIA GeForce RTX 3070', 'NVIDIA GeForce RTX 3070 Ti', 'NVIDIA GeForce RTX 3080', 'NVIDIA GeForce RTX 3080 Ti']],
+      [/NVIDIA GeForce RTX 40\d{2}(?: Ti| SUPER)?/i, ['NVIDIA GeForce RTX 4060', 'NVIDIA GeForce RTX 4060 Ti', 'NVIDIA GeForce RTX 4070', 'NVIDIA GeForce RTX 4080']],
+      [/NVIDIA GeForce RTX 20\d{2}(?: Ti| SUPER)?/i, ['NVIDIA GeForce RTX 2060', 'NVIDIA GeForce RTX 2060 SUPER', 'NVIDIA GeForce RTX 2070', 'NVIDIA GeForce RTX 2080']],
+      [/NVIDIA GeForce GTX 16\d{2}(?: Ti| SUPER)?/i, ['NVIDIA GeForce GTX 1650', 'NVIDIA GeForce GTX 1660', 'NVIDIA GeForce GTX 1660 Ti', 'NVIDIA GeForce GTX 1660 SUPER']],
+      [/AMD Radeon RX 6\d{3}(?: XT)?/i, ['AMD Radeon RX 6600', 'AMD Radeon RX 6600 XT', 'AMD Radeon RX 6700 XT', 'AMD Radeon RX 6800']],
+      [/AMD Radeon RX 7\d{3}(?: XT| XTX)?/i, ['AMD Radeon RX 7600', 'AMD Radeon RX 7700 XT', 'AMD Radeon RX 7800 XT', 'AMD Radeon RX 7900 XT']],
+      [/AMD Radeon RX 5\d{2}/i, ['AMD Radeon RX 550', 'AMD Radeon RX 560', 'AMD Radeon RX 570', 'AMD Radeon RX 580']],
+      [/Intel\(R\) UHD Graphics 6[23]0/i, ['Intel(R) UHD Graphics 620', 'Intel(R) UHD Graphics 630']],
+      [/Apple M1(?: Pro| Max)?/i, ['Apple M1', 'Apple M1 Pro', 'Apple M1 Max']],
     ];
-    const P = PROFILES[(fin(SEED) >>> 0) % PROFILES.length];
+    function rendererAlias(native) {
+      if (typeof native !== 'string' || /laptop|mobile|max-q/i.test(native)) return native;
+      for (const [pattern, models] of RENDERER_FAMILIES) {
+        const match = native.match(pattern);
+        if (!match) continue;
+        const choices = models.filter(model => model.toLowerCase() !== match[0].toLowerCase());
+        const model = choices[(fin(SEED) >>> 0) % choices.length];
+        // A PCI device ID belongs to the original model, so do not pair it
+        // with the alias. Preserve ANGLE/backend and shader-model suffixes.
+        return native.replace(pattern, model).replace(/\s*\(0x[0-9a-f]+\)/ig, '');
+      }
+      // Unknown families retain genuine identity rather than an invented
+      // platform/vendor combination. Other enabled transforms still apply.
+      return native;
+    }
+
 
     /* ------------------------------------------------------------------ *
      * Audio profile table. Selected from the same seed hash as the GPU
@@ -544,7 +524,7 @@ CANVAS_JS_TEMPLATE = r"""
     const A = AUDIO_PROFILES[(fin(SEED ^ 0x5A17) >>> 0) % AUDIO_PROFILES.length];
 
     const PROFILE_GPU_FEATURES = new Set(
-      GPU_FEATURES_COMMON.concat(GPU_FEATURES_BY_VENDOR[P.vendorTag] || [])
+      GPU_FEATURES_COMMON.concat(...Object.values(GPU_FEATURES_BY_VENDOR))
     );
 
     /* ------------------------------------------------------------------ *
@@ -552,131 +532,43 @@ CANVAS_JS_TEMPLATE = r"""
      * ------------------------------------------------------------------ */
 
     function install2D() {
-      const ctx2d  = win.CanvasRenderingContext2D;
-      const offCtx = win.OffscreenCanvasRenderingContext2D;
-      const OC     = win.OffscreenCanvas;
-      const HCE    = win.HTMLCanvasElement;
-      const canvases2D = new WeakSet();
-
-      const rememberContext = (t, self, args) => {
-        const context = Reflect.apply(t, self, args);
-        if (context && (
-            (ctx2d  && context instanceof ctx2d) ||
-            (offCtx && context instanceof offCtx))) {
-          canvases2D.add(self);
-        }
-        return context;
-      };
-
-      function makeImageDataHandler(getOrig) {
-        return (t, self, args) => {
-          const result = Reflect.apply(t, self, args);
-          if (!result || !result.data) return result;
-          if (args.length < 4) return result;
-          for (let n = 0; n < 4; n++) {
-            if (typeof args[n] !== 'number' || !Number.isFinite(args[n])) return result;
-          }
-          let x = args[0] | 0, y = args[1] | 0, w = args[2] | 0, h = args[3] | 0;
-          if (!w || !h) return result;
-          if (w < 0) { x += w; w = -w; }
-          if (h < 0) { y += h; h = -h; }
-          const cv = self.canvas;
-          if (!cv) return result;
-          const isU8  = result.data instanceof win.Uint8ClampedArray;
-          const isF16 = (typeof win.Float16Array !== 'undefined') &&
-                        (result.data instanceof win.Float16Array);
-          if (!isU8 && !isF16) return result;
-          const pxFmt = isF16 ? 'rgba-float16' : 'rgba-unorm8';
-          try {
-            const img = Reflect.apply(getOrig, self,
-              [x - 1, y - 1, w + 2, h + 2,
-               {colorSpace: result.colorSpace, pixelFormat: pxFmt}]);
-            if (!img || !img.data) return result;
-            if (isU8) {
-              if (!(img.data instanceof win.Uint8ClampedArray)) return result;
-              noisify(img.data, (w + 2) * 4, w + 2, h + 2,
-                      x - 1, y - 1, 1, 1, w, h, cv.width, cv.height, NOISE_RATE);
-            } else {
-              if (!(img.data instanceof win.Float16Array)) return result;
-              const u16 = new win.Uint16Array(img.data.buffer, img.data.byteOffset, img.data.length);
-              noisifyF16(u16, (w + 2) * 4, w + 2, h + 2,
-                         x - 1, y - 1, 1, 1, w, h, cv.width, cv.height, NOISE_RATE);
-            }
-            const src = img.data, sw = w + 2, out = result.data;
-            for (let r = 0; r < h; r++) {
-              const s = ((r + 1) * sw + 1) * 4;
-              out.set(src.subarray(s, s + w * 4), r * w * 4);
-            }
-            return result;
-          } catch (e) { return result; }
-        };
-      }
-
-      if (ctx2d && HCE) {
-        const orig2DGet = ctx2d.prototype.getImageData;
-        const noisyCopy = (canvas) => {
-          try {
-            const w = canvas.width, h = canvas.height;
-            if (!w || !h || !canvases2D.has(canvas)) return canvas;
-            const c = win.document.createElement('canvas');
-            c.width = w; c.height = h;
-            const cx = c.getContext('2d');
-            cx.drawImage(canvas, 0, 0);
-            const img = orig2DGet.call(cx, 0, 0, w, h);
-            noisify(img.data, w * 4, w, h, 0, 0, 0, 0, w, h, w, h, NOISE_RATE);
-            cx.putImageData(img, 0, 0);
-            return c;
-          } catch (e) { return canvas; }
-        };
-        hook(HCE.prototype, 'getContext', rememberContext);
-        hook(ctx2d.prototype, 'getImageData', makeImageDataHandler(orig2DGet));
-        hook(HCE.prototype, 'toDataURL',
-             (t, self, args) => Reflect.apply(t, noisyCopy(self), args));
-        hook(HCE.prototype, 'toBlob',
-             (t, self, args) => Reflect.apply(t, noisyCopy(self), args));
-      }
-
-      if (OC && offCtx) {
-        const origOffGet = offCtx.prototype.getImageData;
-        hook(OC.prototype, 'getContext', rememberContext);
-        hook(offCtx.prototype, 'getImageData', makeImageDataHandler(origOffGet));
-        hook(OC.prototype, 'convertToBlob', (t, self, args) => {
-          try {
-            if (!canvases2D.has(self)) return Reflect.apply(t, self, args);
-            const w = self.width, h = self.height;
-            const c  = new OC(w, h);
-            const cx = c.getContext('2d');
-            cx.drawImage(self, 0, 0);
-            const img = origOffGet.call(cx, 0, 0, w, h);
-            noisify(img.data, w * 4, w, h, 0, 0, 0, 0, w, h, w, h, NOISE_RATE);
-            cx.putImageData(img, 0, 0);
-            return Reflect.apply(t, c, args);
-          } catch (e) { return Reflect.apply(t, self, args); }
+      // Change the drawing inputs, not the bytes returned by reads. This
+      // leaves exact pixel writes, crops, copies, exports and float reads
+      // observing the same rendered bitmap, including transparent pixels.
+      const offset = (salt) => (((fin(SEED ^ salt) >>> 0) / 4294967296) - 0.5) * NOISE_RATE / 2;
+      const dx = offset(0x6A09E667), dy = offset(0xBB67AE85);
+      const numeric = (args, count) => args.length >= count &&
+        args.slice(0, count).every(v => typeof v === 'number' && Number.isFinite(v));
+      function coordinates(proto, name, count, indices, valid = () => true) {
+        hook(proto, name, (t, self, args) => {
+          // Delegate non-primitive inputs untouched: native WebIDL must own
+          // coercion, exception order, and one-time consumption of getters.
+          if (!numeric(args, count) || !valid(args)) return Reflect.apply(t, self, args);
+          const changed = args.slice();
+          for (const [index, delta] of indices) changed[index] += delta;
+          return Reflect.apply(t, self, changed);
         });
-        hook(OC.prototype, 'transferToImageBitmap', (t, self, args) => {
-          try {
-            if (!canvases2D.has(self)) return Reflect.apply(t, self, args);
-            const w = self.width, h = self.height;
-            if (!w || !h) return Reflect.apply(t, self, args);
-            const cx = self.getContext('2d');
-            if (!cx) return Reflect.apply(t, self, args);
-            const img = origOffGet.call(cx, 0, 0, w, h);
-            if (!img || !img.data) return Reflect.apply(t, self, args);
-            if (img.data instanceof win.Uint8ClampedArray) {
-              noisify(img.data, w * 4, w, h, 0, 0, 0, 0, w, h, w, h, NOISE_RATE);
-            } else if (typeof win.Float16Array !== 'undefined' &&
-                       img.data instanceof win.Float16Array) {
-              const u16 = new win.Uint16Array(img.data.buffer, img.data.byteOffset, img.data.length);
-              noisifyF16(u16, w * 4, w, h, 0, 0, 0, 0, w, h, w, h, NOISE_RATE);
-            } else {
-              return Reflect.apply(t, self, args);
-            }
-            cx.putImageData(img, 0, 0);
-            return Reflect.apply(t, self, args);
-          } catch (e) { return Reflect.apply(t, self, args); }
-        });
+      }
+      for (const ctor of [win.CanvasRenderingContext2D, win.OffscreenCanvasRenderingContext2D]) {
+        const proto = ctor && ctor.prototype;
+        if (!proto) continue;
+        coordinates(proto, 'createLinearGradient', 4, [[0, dx], [1, dy], [2, dx], [3, dy]],
+          a => a[0] !== a[2] || a[1] !== a[3]);
+        coordinates(proto, 'createRadialGradient', 6, [[0, dx], [1, dy], [3, dx], [4, dy]],
+          a => a[2] >= 0 && a[5] >= 0 && (a[0] !== a[3] || a[1] !== a[4] || a[2] !== a[5]));
+        coordinates(proto, 'createConicGradient', 3, [[1, dx], [2, dy]]);
+      }
+      for (const ctor of [win.CanvasRenderingContext2D, win.OffscreenCanvasRenderingContext2D, win.Path2D]) {
+        const proto = ctor && ctor.prototype;
+        if (!proto) continue;
+        coordinates(proto, 'bezierCurveTo', 6, [[0, dx], [1, dy], [2, dx], [3, dy]]);
+        coordinates(proto, 'quadraticCurveTo', 4, [[0, dx], [1, dy]]);
+        // Preserve analytic primitives (arc/ellipse/rect), endpoints, exact
+        // pixel writes, and text metrics. Only gradient coordinates and
+        // Bezier control points receive the seeded drawing offset.
       }
     }
+
 
     /* ------------------------------------------------------------------ *
      * WebGL
@@ -689,208 +581,15 @@ CANVAS_JS_TEMPLATE = r"""
 
       const nativeGetParam1 = gl1 ? gl1.prototype.getParameter : null;
       const nativeGetParam2 = gl2 ? gl2.prototype.getParameter : null;
-      const NONE = Symbol('native');
+      const nativeExtensions1 = gl1 ? gl1.prototype.getSupportedExtensions : null;
+      const nativeExtensions2 = gl2 ? gl2.prototype.getSupportedExtensions : null;
 
-      const CONST_ONLY = {
-        'WEBGL_compressed_texture_s3tc': {
-          COMPRESSED_RGB_S3TC_DXT1_EXT: 0x83F0, COMPRESSED_RGBA_S3TC_DXT1_EXT: 0x83F1,
-          COMPRESSED_RGBA_S3TC_DXT3_EXT: 0x83F2, COMPRESSED_RGBA_S3TC_DXT5_EXT: 0x83F3
-        },
-        'WEBGL_compressed_texture_s3tc_srgb': {
-          COMPRESSED_SRGB_S3TC_DXT1_EXT: 0x8C4C, COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT: 0x8C4D,
-          COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT: 0x8C4E, COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT: 0x8C4F
-        },
-        'WEBGL_compressed_texture_etc': {
-          COMPRESSED_R11_EAC: 0x9270, COMPRESSED_SIGNED_R11_EAC: 0x9271,
-          COMPRESSED_RG11_EAC: 0x9272, COMPRESSED_SIGNED_RG11_EAC: 0x9273,
-          COMPRESSED_RGB8_ETC2: 0x9274, COMPRESSED_SRGB8_ETC2: 0x9275,
-          COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9276,
-          COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9277,
-          COMPRESSED_RGBA8_ETC2_EAC: 0x9278, COMPRESSED_SRGB8_ALPHA8_ETC2_EAC: 0x9279
-        },
-        'WEBGL_compressed_texture_etc1': { COMPRESSED_RGB_ETC1_WEBGL: 0x8D64 },
-        'EXT_texture_compression_rgtc': {
-          COMPRESSED_RED_RGTC1_EXT: 0x8DBB, COMPRESSED_SIGNED_RED_RGTC1_EXT: 0x8DBC,
-          COMPRESSED_RED_GREEN_RGTC2_EXT: 0x8DBD, COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT: 0x8DBE
-        },
-        'EXT_texture_compression_bptc': {
-          COMPRESSED_RGBA_BPTC_UNORM_EXT: 0x8E8C, COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT: 0x8E8D,
-          COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT: 0x8E8E, COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT: 0x8E8F
-        }
-      };
-
-      const CONST_PLUS_METHODS = {
-        'WEBGL_compressed_texture_astc': {
-          constants: {
-            COMPRESSED_RGBA_ASTC_4x4_KHR: 0x93B0, COMPRESSED_RGBA_ASTC_5x4_KHR: 0x93B1,
-            COMPRESSED_RGBA_ASTC_5x5_KHR: 0x93B2, COMPRESSED_RGBA_ASTC_6x5_KHR: 0x93B3,
-            COMPRESSED_RGBA_ASTC_6x6_KHR: 0x93B4, COMPRESSED_RGBA_ASTC_8x5_KHR: 0x93B5,
-            COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6, COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
-            COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8, COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
-            COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA, COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
-            COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC, COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR: 0x93D0, COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR: 0x93D1,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR: 0x93D2, COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR: 0x93D3,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR: 0x93D4, COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR: 0x93D5,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR: 0x93D6, COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR: 0x93D7,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR: 0x93D8, COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR: 0x93D9,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR: 0x93DA, COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR: 0x93DB,
-            COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR: 0x93DC, COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR: 0x93DD
-          },
-          methods: { getSupportedProfiles: function () { return ['ldr']; } }
-        }
-      };
-
-      const COMMON_FUNCTIONAL = [
-        'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_clip_control',
-        'EXT_color_buffer_half_float', 'EXT_depth_clamp', 'EXT_float_blend',
-        'EXT_frag_depth', 'EXT_polygon_offset_clamp', 'EXT_shader_texture_lod',
-        'EXT_texture_filter_anisotropic', 'EXT_texture_mirror_clamp_to_edge',
-        'EXT_sRGB', 'KHR_parallel_shader_compile', 'OES_element_index_uint',
-        'OES_fbo_render_mipmap', 'OES_standard_derivatives', 'OES_texture_float',
-        'OES_texture_float_linear', 'OES_texture_half_float',
-        'OES_texture_half_float_linear', 'OES_vertex_array_object',
-        'WEBGL_blend_func_extended', 'WEBGL_color_buffer_float',
-        'WEBGL_debug_renderer_info', 'WEBGL_depth_texture', 'WEBGL_draw_buffers',
-        'WEBGL_lose_context', 'WEBGL_multi_draw', 'WEBGL_polygon_mode',
-        'WEBGL_provoking_vertex'
-      ];
-
-      const COMPRESSED_BY_VENDOR = {
-        NVIDIA: ['WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb',
-                 'EXT_texture_compression_rgtc','EXT_texture_compression_bptc',
-                 'WEBGL_compressed_texture_astc','WEBGL_compressed_texture_etc'],
-        AMD:    ['WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb',
-                 'EXT_texture_compression_rgtc','EXT_texture_compression_bptc',
-                 'WEBGL_compressed_texture_astc','WEBGL_compressed_texture_etc'],
-        Intel:  ['WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb',
-                 'EXT_texture_compression_rgtc','EXT_texture_compression_bptc',
-                 'WEBGL_compressed_texture_astc','WEBGL_compressed_texture_etc',
-                 'WEBGL_compressed_texture_etc1'],
-        Apple:  ['WEBGL_compressed_texture_astc','WEBGL_compressed_texture_etc',
-                 'WEBGL_compressed_texture_etc1','EXT_texture_compression_bptc']
-      };
-
-      const WEBGL2_ONLY = [
-        'EXT_color_buffer_float','EXT_conservative_depth',
-        'EXT_disjoint_timer_query_webgl2','EXT_render_snorm','EXT_texture_norm16',
-        'NV_shader_noperspective_interpolation','OES_draw_buffers_indexed',
-        'OES_sample_variables','OES_shader_multisample_interpolation',
-        'OVR_multiview2','WEBGL_clip_cull_distance'
-      ];
-
-      const profileExtensionsCache = new WeakMap();
-      function profileExtensionsFor(self) {
-        let s = profileExtensionsCache.get(self);
-        if (s) return s;
-        const isGL2 = !!(gl2 && self instanceof gl2);
-        s = new Set(COMMON_FUNCTIONAL);
-        for (const e of (COMPRESSED_BY_VENDOR[P.vendorTag] || [])) s.add(e);
-        if (isGL2) for (const e of WEBGL2_ONLY) s.add(e);
-        profileExtensionsCache.set(self, s);
-        return s;
-      }
-
-      function spoof(pname) {
-        if (pname === 0x1F00) return 'WebKit';
-        if (pname === 0x1F01) return 'WebKit WebGL';
-        if (pname === 0x9245) return P.vendor;
-        if (pname === 0x9246) return P.renderer;
-        if (pname === 0x0D3A) return new win.Int32Array([P.viewport[0], P.viewport[1]]);
-        if (pname === 0x846D) return new win.Float32Array([P.pointSize[0], P.pointSize[1]]);
-        if (pname === 0x846E) return new win.Float32Array([P.lineWidth[0], P.lineWidth[1]]);
-        if (Object.prototype.hasOwnProperty.call(P.limits, pname)) return P.limits[pname];
-        return NONE;
-      }
-
-      const getParamHandler = (t, self, args, orig) => {
-        const native = Reflect.apply(t, self, args);
-        if (native === null || native === undefined) return native;
-        if (args[0] === 0x84FF && !profileExtensionsFor(self).has('EXT_texture_filter_anisotropic')) return null;
-        const s = spoof(args[0]);
-        return s === NONE ? native : s;
-      };
-
-      const gifpHandler = (t, self, args, orig) => {
-        const r = Reflect.apply(t, self, args);
-        if (!r || !(r instanceof win.Int32Array)) return r;
-        const cap = P.limits[0x8D57];
-        for (let i = 0; i < r.length; i++) if (r[i] > cap) r[i] = cap;
-        return r;
-      };
-
-      const stubCache = new WeakMap();
-      const getExtensionHandler = (t, self, args, orig) => {
-        const name = String(args[0]);
-        if (!profileExtensionsFor(self).has(name)) return null;
-        let m = stubCache.get(self);
-        if (!m) { m = new Map(); stubCache.set(self, m); }
-        if (Object.prototype.hasOwnProperty.call(CONST_ONLY, name)) {
-          let stub = m.get(name);
-          if (!stub) {
-            stub = Object.create(null);
-            const tbl = CONST_ONLY[name];
-            for (const k in tbl) {
-              Object.defineProperty(stub, k, { value: tbl[k], enumerable: true, configurable: false, writable: false });
-            }
-            m.set(name, stub);
-          }
-          return stub;
-        }
-        if (Object.prototype.hasOwnProperty.call(CONST_PLUS_METHODS, name)) {
-          let stub = m.get(name);
-          if (!stub) {
-            stub = Object.create(null);
-            const spec = CONST_PLUS_METHODS[name];
-            for (const k in spec.constants) {
-              Object.defineProperty(stub, k, { value: spec.constants[k], enumerable: true, configurable: false, writable: false });
-            }
-            for (const k in spec.methods) {
-              Object.defineProperty(stub, k, { value: spec.methods[k], enumerable: true, configurable: false, writable: false });
-            }
-            m.set(name, stub);
-          }
-          return stub;
-        }
-        return Reflect.apply(t, self, args);
-      };
-
-      const getSupportedExtensionsHandler = (t, self, args, orig) => {
-        const native = Reflect.apply(t, self, args);
-        const nativeSet = new Set(Array.isArray(native) ? native : []);
-        const allowed = profileExtensionsFor(self);
-        const out = [];
-        for (const e of allowed) {
-          if (Object.prototype.hasOwnProperty.call(CONST_ONLY, e) ||
-              Object.prototype.hasOwnProperty.call(CONST_PLUS_METHODS, e)) {
-            out.push(e);
-          } else if (nativeSet.has(e)) {
-            out.push(e);
-          }
-        }
-        return out;
-      };
-
-      const precisionHandler = (t, self, args, orig) => {
-        const native = Reflect.apply(t, self, args);
-        if (!native) return native;
-        const shaderType = args[0];
-        const precType   = args[1];
-        let table = null;
-        if (shaderType === 0x8B31) table = P.precision.vertex;
-        else if (shaderType === 0x8B30) table = P.precision.fragment;
-        if (!table) return native;
-        const v = table[precType];
-        if (!v) return native;
-        try {
-          const fake = Object.create(Object.getPrototypeOf(native));
-          Object.defineProperties(fake, {
-            rangeMin:  {value: v[0], enumerable: true, configurable: true},
-            rangeMax:  {value: v[1], enumerable: true, configurable: true},
-            precision: {value: v[2], enumerable: true, configurable: true}
-          });
-          return fake;
-        } catch (e) { return native; }
+      const getParamHandler = (query) => (t, self, args) => {
+        if (!args.length) return Reflect.apply(t, self, args);
+        Reflect.apply(query, self, []);
+        const pname = (+args[0]) >>> 0;
+        const native = Reflect.apply(t, self, [pname]);
+        return pname === 0x9246 ? rendererAlias(native) : native;
       };
 
       const readPixelsHandler = (t, self, args) => {
@@ -977,19 +676,12 @@ CANVAS_JS_TEMPLATE = r"""
       };
 
       if (gl1) {
-        hook(gl1.prototype, 'getParameter', getParamHandler);
-        hook(gl1.prototype, 'getExtension', getExtensionHandler);
-        hook(gl1.prototype, 'getSupportedExtensions', getSupportedExtensionsHandler);
-        hook(gl1.prototype, 'getShaderPrecisionFormat', precisionHandler);
-        hook(gl1.prototype, 'readPixels', readPixelsHandler);
+        hook(gl1.prototype, 'getParameter', getParamHandler(nativeExtensions1));
+        if (ENABLE_WEBGL) hook(gl1.prototype, 'readPixels', readPixelsHandler);
       }
       if (gl2) {
-        hook(gl2.prototype, 'getParameter', getParamHandler);
-        hook(gl2.prototype, 'getExtension', getExtensionHandler);
-        hook(gl2.prototype, 'getSupportedExtensions', getSupportedExtensionsHandler);
-        hook(gl2.prototype, 'getShaderPrecisionFormat', precisionHandler);
-        hook(gl2.prototype, 'getInternalformatParameter', gifpHandler);
-        hook(gl2.prototype, 'readPixels', readPixelsHandler);
+        hook(gl2.prototype, 'getParameter', getParamHandler(nativeExtensions2));
+        if (ENABLE_WEBGL) hook(gl2.prototype, 'readPixels', readPixelsHandler);
       }
     }
 
@@ -1023,227 +715,115 @@ CANVAS_JS_TEMPLATE = r"""
         }
       }
 
-      const boundMethodCache = new WeakMap();
-      function bindToTarget(fn, target) {
-        if (typeof fn !== 'function') return fn;
-        let m = boundMethodCache.get(target);
-        if (!m) { m = new WeakMap(); boundMethodCache.set(target, m); }
-        let bound = m.get(fn);
-        if (!bound) {
-          bound = fn.bind(target);
-          try { Object.defineProperty(bound, 'name', { value: fn.name, configurable: true }); } catch (e) {}
-          try { Object.defineProperty(bound, 'length', { value: fn.length, configurable: true }); } catch (e) {}
-          realSources.set(bound, fn);
-          m.set(fn, bound);
+      // Retain genuine platform objects. Replacing adapters, devices, or
+      // their metadata with Proxies loses the receiver's WebIDL brand.
+      const infoProto = win.GPUAdapterInfo && win.GPUAdapterInfo.prototype;
+      for (const key of ['device', 'description']) {
+        hookGetter(infoProto, key, () => '');
+      }
+      if (!ENABLE_WEBGPU) return;
+      const limitsProto = win.GPUSupportedLimits && win.GPUSupportedLimits.prototype;
+      for (const key of Object.keys(GPU_LIMITS)) {
+        hookGetter(limitsProto, key, native => clampLimit(key, native, GPU_LIMITS[key]));
+      }
+
+      const featureProto = win.GPUSupportedFeatures && win.GPUSupportedFeatures.prototype;
+      if (featureProto) {
+        const nativeValues = featureProto.values;
+        const nativeSize = _gopd(featureProto, 'size').get;
+        const keptCache = new WeakMap();
+        function kept(self) {
+          // Validate every receiver even if a cached view exists. The native
+          // set is immutable; cached membership is safe for its lifetime.
+          Reflect.apply(nativeSize, self, []);
+          if (!keptCache.has(self)) {
+            keptCache.set(self, new Set(Array.from(Reflect.apply(nativeValues, self, []))
+              .filter(value => PROFILE_GPU_FEATURES.has(value))));
+          }
+          return keptCache.get(self);
         }
-        return bound;
-      }
-
-      // GPUAdapterInfo view: wrap the native branded object. Only the four
-      // identity fields are shadowed. subgroupMinSize / subgroupMaxSize /
-      // isFallbackAdapter read through to the native object so they stay
-      // consistent with the exposed feature set.
-      const infoViewCache = new WeakMap();
-      function makeAdapterInfo(nativeInfo) {
-        if (!nativeInfo || typeof nativeInfo !== 'object') return nativeInfo;
-        if (infoViewCache.has(nativeInfo)) return infoViewCache.get(nativeInfo);
-        const view = new Proxy(nativeInfo, {
-          get(target, prop, receiver) {
-            if (prop === 'vendor')       return P.gpu.vendor;
-            if (prop === 'architecture') return P.gpu.architecture;
-            if (prop === 'device')       return P.gpu.device;
-            if (prop === 'description')  return P.gpu.description;
-            const value = Reflect.get(target, prop, target);
-            if (typeof value === 'function') return bindToTarget(value, target);
-            return value;
-          }
+        hookGetter(featureProto, 'size', (native, self) => kept(self).size);
+        hook(featureProto, 'has', (t, self, args) => {
+          const features = kept(self);
+          if (!args.length) return Reflect.apply(t, self, args);
+          // DOMString conversion once, including Symbol rejection.
+          const key = `${args[0]}`;
+          return Reflect.apply(t, self, [key]) && features.has(key);
         });
-        infoViewCache.set(nativeInfo, view);
-        return view;
-      }
-
-      const limitsViewCache = new WeakMap();
-      function makeLimitsView(nativeLimits) {
-        if (!nativeLimits || typeof nativeLimits !== 'object') return nativeLimits;
-        if (limitsViewCache.has(nativeLimits)) return limitsViewCache.get(nativeLimits);
-        const view = new Proxy(nativeLimits, {
-          get(target, prop, receiver) {
-            const native = Reflect.get(target, prop, target);
-            if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(GPU_LIMITS, prop)) {
-              return clampLimit(prop, native, GPU_LIMITS[prop]);
-            }
-            return native;
-          }
-        });
-        limitsViewCache.set(nativeLimits, view);
-        return view;
-      }
-
-      const featuresViewCache = new WeakMap();
-      function makeFeaturesView(nativeFeatures) {
-        if (!nativeFeatures || typeof nativeFeatures !== 'object') return nativeFeatures;
-        if (featuresViewCache.has(nativeFeatures)) return featuresViewCache.get(nativeFeatures);
-        const kept = new Set();
-        try {
-          for (const f of nativeFeatures) if (PROFILE_GPU_FEATURES.has(f)) kept.add(f);
-        } catch (e) {
-          try {
-            const arr = Array.from(nativeFeatures);
-            for (const f of arr) if (PROFILE_GPU_FEATURES.has(f)) kept.add(f);
-          } catch (e2) {}
+        for (const key of ['keys', 'values', 'entries', Symbol.iterator]) {
+          hook(featureProto, key, (t, self, args) => {
+            const features = kept(self);
+            return key === 'entries' ? features.entries() : features.values();
+          });
         }
-        let view = null;
-        const api = {
-          get size() { return kept.size; },
-          has(name) { return kept.has(name); },
-          forEach(fn, thisArg) { for (const v of kept) fn.call(thisArg, v, v, view); },
-          keys() { return kept.keys(); },
-          values() { return kept.values(); },
-          entries() { return kept.entries(); },
-          [Symbol.iterator]() { return kept[Symbol.iterator](); }
-        };
-        view = new Proxy(nativeFeatures, {
-          get(target, prop, receiver) {
-            if (prop === 'size') return api.size;
-            if (prop === 'has') return api.has;
-            if (prop === 'forEach') return api.forEach;
-            if (prop === 'keys') return api.keys;
-            if (prop === 'values') return api.values;
-            if (prop === 'entries') return api.entries;
-            if (prop === Symbol.iterator) return api[Symbol.iterator];
-            const value = Reflect.get(target, prop, target);
-            if (typeof value === 'function') return bindToTarget(value, target);
-            return value;
-          }
+        hook(featureProto, 'forEach', (t, self, args) => {
+          kept(self);
+          const callback = args[0], thisArg = args[1];
+          if (typeof callback !== 'function') return Reflect.apply(t, self, args);
+          return Reflect.apply(t, self, [function(value, key) {
+            if (PROFILE_GPU_FEATURES.has(value)) Reflect.apply(callback, thisArg, [value, key, self]);
+          }]);
         });
-        featuresViewCache.set(nativeFeatures, view);
-        return view;
       }
 
-      function validateDeviceRequest(desc) {
-        if (!desc || typeof desc !== 'object') return null;
-        if (desc.requiredLimits && typeof desc.requiredLimits === 'object') {
-          for (const key of Object.keys(desc.requiredLimits)) {
-            const requested = desc.requiredLimits[key];
-            if (typeof requested !== 'number') continue;
-            const profileValue = GPU_LIMITS[key];
-            if (typeof profileValue === 'number') {
-              if (MIN_LIMITS.has(key)) {
-                if (requested < profileValue) {
-                  return makeOperationError('requiredLimits.' + key + ' (' + requested + ') is below the advertised minimum (' + profileValue + ')');
-                }
-              } else {
-                if (requested > profileValue) {
-                  return makeOperationError('requiredLimits.' + key + ' (' + requested + ') exceeds the advertised limit (' + profileValue + ')');
-                }
+      if (GPUAdapter && GPUAdapter.prototype) {
+        hook(GPUAdapter.prototype, 'requestDevice', (t, self, args) => {
+          const input = args[0];
+          if (input == null || (typeof input !== 'object' && typeof input !== 'function')) {
+            return Reflect.apply(t, self, args);
+          }
+          // Let native WebIDL conversion determine dictionary access order,
+          // receiver errors, defaults, enum conversion, and iterator closing.
+          // These temporary argument views never replace returned platform objects.
+          const desc = new Proxy(Object.create(null), {
+            get(_, key) {
+              const value = Reflect.get(input, key, input);
+              if (key === 'requiredFeatures' && value != null &&
+                  (typeof value === 'object' || typeof value === 'function')) {
+                return {
+                  *[Symbol.iterator]() {
+                    for (const feature of value) {
+                      const name = `${feature}`;
+                      if (!self.features.has(name)) throw new TypeError('Unsupported required feature: ' + name);
+                      yield name;
+                    }
+                  }
+                };
               }
+              if (key === 'requiredLimits' && value != null &&
+                  (typeof value === 'object' || typeof value === 'function')) {
+                return new Proxy(Object.create(null), {
+                  ownKeys() { return Reflect.ownKeys(value); },
+                  getOwnPropertyDescriptor(_, name) {
+                    const d = Reflect.getOwnPropertyDescriptor(value, name);
+                    return d ? {configurable: true, enumerable: d.enumerable} : undefined;
+                  },
+                  get(_, name) {
+                    const raw = Reflect.get(value, name, value);
+                    if (raw === undefined) return undefined;
+                    const number = +raw;
+                    // Invalid GPUSize64 values are rejected by native conversion.
+                    const requested = Math.trunc(number);
+                    if (Number.isFinite(number) && requested >= 0 && requested < 2 ** 64 &&
+                        Object.prototype.hasOwnProperty.call(GPU_LIMITS, name)) {
+                      const limit = self.limits[name];
+                      if (MIN_LIMITS.has(name) ? requested < limit : requested > limit) {
+                        throw makeOperationError('requiredLimits.' + name + ' exceeds the advertised limit');
+                      }
+                    }
+                    return number;
+                  }
+                });
+              }
+              return value;
             }
-          }
-        }
-        if (desc.requiredFeatures) {
-          const feats = desc.requiredFeatures;
-          const list = (typeof feats[Symbol.iterator] === 'function') ? Array.from(feats) : [];
-          for (const f of list) {
-            if (!PROFILE_GPU_FEATURES.has(f)) {
-              return new TypeError('requiredFeatures contains unsupported feature: ' + f);
-            }
-          }
-        }
-        return null;
-      }
-
-      const adapterViewCache = new WeakMap();
-      const deviceViewCache = new WeakMap();
-
-      function wrapAdapter(adapter) {
-        if (!adapter) return adapter;
-        if (adapterViewCache.has(adapter)) return adapterViewCache.get(adapter);
-        let requestDeviceWrap = null;
-        const view = new Proxy(adapter, {
-          get(target, prop, receiver) {
-            if (prop === 'info') {
-              let native = null;
-              try { native = Reflect.get(target, prop, target); } catch (e) {}
-              return makeAdapterInfo(native);
-            }
-            if (prop === 'limits') {
-              let native;
-              try { native = Reflect.get(target, prop, target); } catch (e) { return undefined; }
-              return makeLimitsView(native);
-            }
-            if (prop === 'features') {
-              let native;
-              try { native = Reflect.get(target, prop, target); } catch (e) { return undefined; }
-              return makeFeaturesView(native);
-            }
-            if (prop === 'requestDevice') {
-              if (requestDeviceWrap) return requestDeviceWrap;
-              const orig = Reflect.get(target, prop, target);
-              if (typeof orig !== 'function') return orig;
-              requestDeviceWrap = function (...args) {
-                const error = validateDeviceRequest(args[0]);
-                if (error) return Promise.reject(error);
-                const p = Reflect.apply(orig, target, args);
-                if (!p || typeof p.then !== 'function') return p;
-                return p.then(device => wrapDevice(device));
-              };
-              try { Object.defineProperty(requestDeviceWrap, 'name', { value: orig.name, configurable: true }); } catch (e) {}
-              try { Object.defineProperty(requestDeviceWrap, 'length', { value: orig.length, configurable: true }); } catch (e) {}
-              realSources.set(requestDeviceWrap, orig);
-              return requestDeviceWrap;
-            }
-            const value = Reflect.get(target, prop, target);
-            if (typeof value === 'function') return bindToTarget(value, target);
-            return value;
-          }
-        });
-        adapterViewCache.set(adapter, view);
-        return view;
-      }
-
-      function wrapDevice(device) {
-        if (!device) return device;
-        if (deviceViewCache.has(device)) return deviceViewCache.get(device);
-        const view = new Proxy(device, {
-          get(target, prop, receiver) {
-            if (prop === 'adapterInfo') {
-              let native = null;
-              try { native = Reflect.get(target, prop, target); } catch (e) {}
-              return makeAdapterInfo(native);
-            }
-            if (prop === 'limits') {
-              let native;
-              try { native = Reflect.get(target, prop, target); } catch (e) { return undefined; }
-              return makeLimitsView(native);
-            }
-            if (prop === 'features') {
-              let native;
-              try { native = Reflect.get(target, prop, target); } catch (e) { return undefined; }
-              return makeFeaturesView(native);
-            }
-            const value = Reflect.get(target, prop, target);
-            if (typeof value === 'function') return bindToTarget(value, target);
-            return value;
-          }
-        });
-        deviceViewCache.set(device, view);
-        return view;
-      }
-
-      hook(GPU.prototype, 'requestAdapter', (t, self, args) => {
-        const p = Reflect.apply(t, self, args);
-        if (!p || typeof p.then !== 'function') return p;
-        return p.then(adapter => wrapAdapter(adapter));
-      });
-
-      if (GPUAdapter && GPUAdapter.prototype &&
-          typeof GPUAdapter.prototype.requestAdapterInfo === 'function') {
-        hook(GPUAdapter.prototype, 'requestAdapterInfo', (t, self, args) => {
-          const p = Reflect.apply(t, self, args);
-          if (!p || typeof p.then !== 'function') return p;
-          return p.then(nativeInfo => makeAdapterInfo(nativeInfo));
+          });
+          return Reflect.apply(t, self, [desc]);
         });
       }
+
+      // requestAdapter and all adapter/device object getters stay native.
+      // Prototype policy also applies to legacy requestAdapterInfo results.
     }
 
     /* ------------------------------------------------------------------ *
@@ -1252,8 +832,7 @@ CANVAS_JS_TEMPLATE = r"""
 
     // Locate a getter on the prototype chain and wrap it. The wrapper
     // returns the native value when it is usable and the profile value
-    // otherwise. The original getter is preserved via the concealment map
-    // so descriptor reads continue to look native.
+    // otherwise. Reflection exposes the actual installed getter.
     function replaceIfDegenerate(proto, name, fallback, isValid) {
       let owner = proto, desc = null;
       while (owner) {
@@ -1265,21 +844,22 @@ CANVAS_JS_TEMPLATE = r"""
       const orig = desc.get;
       let wrapped;
       try {
-        wrapped = function () {
-          let native;
-          try { native = orig.call(this); } catch (e) { native = undefined; }
-          return isValid(native) ? native : fallback;
-        };
+        wrapped = callableProxy(orig, {
+          apply(target, self, args) {
+            // Invalid receivers must retain the native WebIDL TypeError.
+            // Fallbacks apply only to successfully read degenerate values.
+            const native = Reflect.apply(target, self, args);
+            return isValid(native) ? native : fallback;
+          }
+        });
       } catch (e) { return false; }
       try {
         Object.defineProperty(owner, name, {
           get: wrapped,
-          configurable: true,
+          configurable: desc.configurable,
           enumerable: desc.enumerable
         });
       } catch (e) { return false; }
-      markHidden(owner, name, desc);
-      realSources.set(wrapped, orig);
       return true;
     }
 
@@ -1380,7 +960,7 @@ CANVAS_JS_TEMPLATE = r"""
       }
 
       function makeProxy(orig, getModuleFlag) {
-        const proxy = new Proxy(orig, {
+        const proxy = callableProxy(orig, {
           construct(t, args, newTarget) {
             try {
               const isModule = getModuleFlag(args);
@@ -1394,7 +974,6 @@ CANVAS_JS_TEMPLATE = r"""
             return Reflect.construct(t, args, newTarget);
           }
         });
-        realSources.set(proxy, orig);
         return proxy;
       }
 
@@ -1403,47 +982,16 @@ CANVAS_JS_TEMPLATE = r"""
     }
 
     /* ------------------------------------------------------------------ *
-     * Concealment
+     * Install selected surfaces
      * ------------------------------------------------------------------ */
-
-    function installConcealment() {
-      const gopdHandler = (t, self, args) => {
-        const owner = args[0], key = args[1];
-        if (owner === win && key === MARKER) return undefined;
-        const hid = hiddenDescriptors.get(owner);
-        if (hid && hid.has(key)) return hid.get(key);
-        return Reflect.apply(t, self, args);
-      };
-      hook(Object, 'getOwnPropertyDescriptor', gopdHandler);
-      hook(Reflect, 'getOwnPropertyDescriptor', gopdHandler);
-      hook(Object, 'getOwnPropertyDescriptors', (t, self, args) => {
-        const owner = args[0];
-        const r = Reflect.apply(t, self, args);
-        if (owner === win) { try { delete r[MARKER]; } catch (e) {} }
-        const hid = hiddenDescriptors.get(owner);
-        if (hid) for (const kv of hid) r[kv[0]] = kv[1];
-        return r;
-      });
-      hook(Object, 'getOwnPropertySymbols', (t, self, args) => {
-        const r = Reflect.apply(t, self, args);
-        if (args[0] === win) return r.filter(k => k !== MARKER);
-        return r;
-      });
-      hook(Reflect, 'ownKeys', (t, self, args) => {
-        const r = Reflect.apply(t, self, args);
-        if (args[0] === win) return r.filter(k => k !== MARKER);
-        return r;
-      });
-    }
 
     /* ------------------------------------------------------------------ */
 
     if (ENABLE_2D)      install2D();
-    if (ENABLE_WEBGL)   installWebGL();
-    if (ENABLE_WEBGPU)  installWebGPU();
+    if (ENABLE_WEBGL || ENABLE_WEBGPU) installWebGL();
+    if (ENABLE_WEBGL || ENABLE_WEBGPU) installWebGPU();
     if (ENABLE_AUDIO)   installAudio();
     if (ENABLE_WORKERS) installWorkers();
-    installConcealment();
   }
 
   AFP_BOOTSTRAP();
@@ -1463,18 +1011,16 @@ def build_scripts(
 ) -> list[str]:
     """Return graphics/audio init scripts for one account seed.
 
-    Every surface is an explicit opt-in. There is no implicit coupling
-    between options and no derivation from browser launch mode; callers
-    select exactly what they want applied. This keeps headed/headless
-    execution mode and privacy/testing transformations independent, so a
-    visible window does not silently change which hooks are installed.
+    Transformations are opt-in and independent of browser launch mode.
+    Either GPU flag enables shared GPU identity policy; rendering/readback
+    and WebGPU capability policies remain separately selectable.
 
-    ``perturb_canvas``        2D pipeline (rgba-unorm8 and rgba-float16).
-    ``spoof_webgl``           Identity, capability limits, per-extension
-                              set, per-stage shader precision, RGBA and
-                              RGBA_INTEGER readback.
-    ``spoof_webgpu``          Adapter info, adapter/device limits, and
-                              features, keyed on the same seed as WebGL.
+    ``perturb_canvas``        Gradient/Bezier drawing offsets; native bitmap
+                              reads and exports, including float16 data.
+    ``spoof_webgl``           Hardware-family renderer alias, WebGPU model
+                              redaction, RGBA/RGBA_INTEGER readback.
+    ``spoof_webgpu``          Same identity policy plus adapter/device
+                              limit and feature restrictions.
     ``spoof_audio``           Conservative AudioContext metadata fallback.
                               Positive sample rates and all finite
                               non-negative latency/channel-count values are
@@ -1486,9 +1032,10 @@ def build_scripts(
     ``perturb_float_readback`` Perturb RGBA FLOAT and HALF_FLOAT
                               readPixels destinations in WebGL.
 
-    Register once with ``BrowserContext.add_init_script``. Cross-origin
+    Register once with ``BrowserContext.add_init_script``. By itself, cross-origin
     workers, service workers, and any worker started outside the wrapped
-    constructors are not covered. Depth and stencil readbacks are never
+    constructors are not covered. The application supplies WorkerProfiles
+    separately for complete graphics-worker startup. Depth and stencil readbacks are never
     perturbed. Integer non-edge pixels are bit-identical to native.
     PBO-offset and non-default pack-state reads fall through to native.
     WebGPU device-level readback is not perturbed.

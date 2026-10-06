@@ -229,15 +229,25 @@ class Settings(BaseModel):
     agent_max_steps: int = Field(default=4, ge=1, le=8)
     agent_timeout_seconds: int = Field(default=60, ge=10, le=180)
 
-    # Fingerprint transformations are explicit per-surface opt-ins, kept
-    # independent of headed/headless launch mode. Enable only when the
-    # runtime cannot be trusted to expose a coherent native profile.
-    # Each flag turns on the corresponding surface in build_scripts().
+    # Fingerprint transformations are explicit opt-ins, independent of launch
+    # mode. Both backends share GPU identity policy across APIs and initialize
+    # workers automatically for graphics profiles. JS profiles require an
+    # app-owned browser so worker startup can be initialized before page code.
     fingerprint_canvas: bool = False
     fingerprint_webgl: bool = False
     fingerprint_webgpu: bool = False
     fingerprint_audio: bool = False
     fingerprint_workers: bool = False
+    fingerprint_backend: Literal['javascript', 'native'] = 'javascript'
+    native_browser_executable: str = ''
+
+    @model_validator(mode='after')
+    def profile_browser_connection(self):
+        if self.fingerprint_backend == 'native' and self.cdp_attach:
+            raise ValueError('Native profiles require an app-managed browser; disable external CDP attachment')
+        if self.cdp_attach and any((self.fingerprint_canvas, self.fingerprint_webgl, self.fingerprint_webgpu)):
+            raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment')
+        return self
 
     @field_validator("diagnosis_endpoint", "cdp_endpoint")
     @classmethod

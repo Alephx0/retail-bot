@@ -11,6 +11,17 @@ settingsView = function () {
   browser.innerHTML = '<p class="help">Tasks run in truly headless Chromium by default. View live shows the page; Take Control sends your clicks and typing to that same account page when a task is paused. Native OS passkey dialogs may require a separate visible session.</p>' +
     check('show_browser_window', 'Use a visible Chrome window from the start (special cases)', s.show_browser_window ?? false) +
     '<p class="help">Changing browser mode requires no running tasks. External CDP browsers follow their own window setting. Headless mode uses less desktop rendering resources and does not open a Chrome window.</p>' +
+    '<details><summary>Fingerprint profiles</summary>' +
+    select('fingerprint_backend', 'Profile implementation', [['javascript','JavaScript compatibility mode'],['native','Native Chromium profiles']], s.fingerprint_backend || 'javascript') +
+    input('native_browser_executable', 'Native browser executable (blank uses installed build)', s.native_browser_executable || '') +
+    '<p class="help">JavaScript graphics profiles keep GPU aliases within the hardware family and retain real WebGL capabilities. Workers initialize automatically. Each account uses a separate browser process, which uses more memory and requires an app-managed browser.</p>' +
+    '<p class="help">Native profiles require the separately installed browser build. GPU identity is shared across WebGL, WebGPU and workers when either GPU option is enabled. Each active graphics profile uses its own browser process. This third-party build disables Safe Browsing.</p>' +
+    check('fingerprint_canvas', 'Vary canvas rendering by account', s.fingerprint_canvas ?? false) +
+    check('fingerprint_webgl', 'Vary WebGL identity and rendering', s.fingerprint_webgl ?? false) +
+    check('fingerprint_webgpu', 'Vary WebGPU features and GPU identity', s.fingerprint_webgpu ?? false) +
+    check('fingerprint_audio', 'Repair invalid audio metadata', s.fingerprint_audio ?? false) +
+    check('fingerprint_workers', 'Initialize workers (automatic with graphics profiles)', s.fingerprint_workers ?? false) +
+    '</details>' +
     '<details><summary>Advanced: use an existing Chrome or Edge window</summary>' + browser.innerHTML +
     check('cdp_attach', 'Use existing Chromium debugging connection', s.cdp_attach ?? false) +
     '<p class="help">Only use this if you already start a dedicated browser with remote debugging enabled. The app creates separate task tabs and does not use your personal tabs.</p></details>';
@@ -37,6 +48,10 @@ serializeSettings = function (data, form) {
   originalAISerialize(data, form);
   data.cdp_attach = form.elements.cdp_attach.checked;
   data.show_browser_window = form.elements.show_browser_window.checked;
+  for (const surface of ['canvas','webgl','webgpu','audio','workers']) {
+    const key = 'fingerprint_' + surface;
+    data[key] = form.elements[key].checked;
+  }
   for (const key of ['agent_max_steps', 'agent_timeout_seconds']) data[key] = Number(data[key]);
 };
 

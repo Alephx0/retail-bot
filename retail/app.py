@@ -161,7 +161,7 @@ def create_app(data_dir=None):
                 require('ai_connections', merged['ai_connection_id'])
             if merged.get('agent_mode', 'off') != 'off' and not merged.get('ai_connection_id'):
                 raise HTTPException(422, 'Select an AI connection before enabling the browser agent')
-            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('cdp_attach','cdp_endpoint','show_browser_window','agent_mode','ai_connection_id','max_running_tasks')):
+            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('cdp_attach','cdp_endpoint','browser_channel','show_browser_window','fingerprint_backend','native_browser_executable','agent_mode','ai_connection_id','max_running_tasks')):
                 raise HTTPException(409, 'Stop running tasks before changing browser or AI connections')
         if kind == "groups" and not id and "delay_ms" not in data:
             merged["delay_ms"] = (store().get("settings", "settings") or {}).get("default_monitor_delay", 4500)
@@ -220,7 +220,7 @@ def create_app(data_dir=None):
         if folder_id:
             app.state.resources.add(folder_id, [result["id"]])
         if kind=="proxies": app.state.proxy_pool.sync()
-        if kind == 'settings' and any(result.get(k) != old.get(k) for k in ('cdp_attach', 'cdp_endpoint', 'browser_channel', 'show_browser_window')):
+        if kind == 'settings' and any(result.get(k) != old.get(k) for k in ('cdp_attach', 'cdp_endpoint', 'browser_channel', 'show_browser_window', 'fingerprint_backend', 'native_browser_executable')):
             if not app.state.engine.jobs:
                 await app.state.engine.amazon.close()
         return public(kind, result)

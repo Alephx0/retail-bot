@@ -7,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from .fingerprint import build_scripts
+from .native_fingerprint import launch_options as native_launch_options, needs_profile_browser
+from .worker_profiles import WorkerProfiles, debugging_port
 from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
@@ -67,6 +69,8 @@ class Amazon:
         self.launch_lock = asyncio.Lock()
         self.identities = IdentityService(store)
         self.context_accounts = {}
+        self.profile_browsers = set()
+        self.profile_close_tasks = set()
         self.cdp_attached = False
         self.browser_visible = False
         self.browser_initially_visible = False
@@ -114,6 +118,9 @@ class Amazon:
     async def navigate(self, page, url: str, **kwargs):
         response = await page.goto(url, **kwargs)
         self._raise_for_response(response)
+        bridge = getattr(page.context, '_retail_worker_profiles', None)
+        if bridge and bridge.errors:
+            raise Attention('Worker fingerprint initialization failed: ' + bridge.errors[0])
         return response
 
     async def resolve_action(self, page, action):
@@ -158,7 +165,9 @@ class Amazon:
                 # controls the same page via Playwright during intervention;
                 # headless Chromium cannot become a native GUI in place.
                 options = {"headless": not self.browser_initially_visible}
-                if settings.get("browser_channel", "chromium") != "chromium":
+                if settings.get('fingerprint_backend') == 'native':
+                    options = native_launch_options(settings)
+                elif settings.get("browser_channel", "chromium") != "chromium":
                     options["channel"] = settings["browser_channel"]
                 if settings.get("cdp_attach"):
                     endpoint = settings.get("cdp_endpoint", "http://127.0.0.1:9222")
@@ -202,42 +211,100 @@ class Amazon:
             proxy = self.account_proxy(account)
         if proxy:
             options["proxy"] = proxy_config(proxy)
-        context = await self.browser.new_context(**options)
-        # Fingerprint transformations are explicit Settings opt-ins, not
-        # derived from the headed/headless launch mode. Each surface is
-        # selected independently. Site-created workers remain native unless
-        # `fingerprint_workers` is enabled; when it is, the wrapped
-        # constructors inject the same bootstrap the page already runs.
-        if self.profiles:
-            profile = self.profiles.get(account)
-            seed_int = int(profile['seed'], 16) & 0xFFFFFFFF
-            for script in build_scripts(
-                seed_int,
-                perturb_canvas=settings.get('fingerprint_canvas', False),
-                spoof_webgl=settings.get('fingerprint_webgl', False),
-                spoof_webgpu=settings.get('fingerprint_webgpu', False),
-                spoof_audio=settings.get('fingerprint_audio', False),
-                intercept_workers=settings.get('fingerprint_workers', False),
-            ):
-                await context.add_init_script(script)
-        saved_storage = account.get('session_storage', {})
-        domain = DOMAINS[account['region']]
-        values = saved_storage.get(domain, {}) if isinstance(saved_storage, dict) else {}
-        if isinstance(values, dict) and values:
-            safe = {key: value for key, value in values.items() if isinstance(key, str) and isinstance(value, str)}
-            if len(json.dumps(safe)) <= 65536:
-                await context.add_init_script('''(() => {
-                    if (location.hostname !== %s || sessionStorage.getItem('__retail_restored_v1')) return;
-                    for (const [key, value] of Object.entries(%s)) sessionStorage.setItem(key, value);
-                    sessionStorage.setItem('__retail_restored_v1', '1');
-                })()''' % (json.dumps(domain), json.dumps(safe)))
-        context.set_default_timeout(settings.get("browser_timeout_ms", 30000))
-        if settings.get("trace_enabled"):
-            await context.tracing.start(screenshots=True,snapshots=True,sources=False)
-            context._retail_tracing=True
-        self.context_accounts[context] = {**account, "solver_id": solver_id or account.get("solver_id", ""), "otp_since": time.time() - 10}
-        context.on("close", lambda _: self.context_accounts.pop(context, None))
-        return context
+        native = settings.get('fingerprint_backend') == 'native'
+        managed_workers = not native and needs_profile_browser(settings)
+        if managed_workers and self.cdp_attached:
+            raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment.')
+        owned_browser = None
+        worker_profiles = None
+        worker_port = None
+        if native and needs_profile_browser(settings):
+            # Launch switches apply process-wide: never share a seeded browser
+            # between accounts or retrofit it onto an already-running context.
+            seed = int(self.profiles.get(account)['seed'], 16) & 0xffffffff
+            owned_browser = await self.driver.chromium.launch(**native_launch_options(settings, seed))
+            self.profile_browsers.add(owned_browser)
+        elif managed_workers:
+            # The DevTools subscription belongs only to this account's process.
+            # It cannot initialize workers from another account or browser.
+            worker_port = debugging_port()
+            launch = {'headless': not settings.get('show_browser_window', False),
+                      'args': [f'--remote-debugging-port={worker_port}',
+                               '--remote-debugging-address=127.0.0.1']}
+            if settings.get('browser_channel', 'chromium') != 'chromium':
+                launch['channel'] = settings['browser_channel']
+            owned_browser = await self.driver.chromium.launch(**launch)
+            self.profile_browsers.add(owned_browser)
+        try:
+            context = await (owned_browser or self.browser).new_context(**options)
+        except BaseException:
+            if owned_browser:
+                await owned_browser.close()
+                self.profile_browsers.discard(owned_browser)
+            raise
+
+        def release_context(_):
+            self.context_accounts.pop(context, None)
+            if owned_browser:
+                async def close_owned():
+                    try:
+                        if worker_profiles:
+                            await worker_profiles.close()
+                    finally:
+                        try:
+                            await owned_browser.close()
+                        finally:
+                            self.profile_browsers.discard(owned_browser)
+                task = asyncio.create_task(close_owned())
+                self.profile_close_tasks.add(task)
+                def finished(done):
+                    self.profile_close_tasks.discard(done)
+                    if not done.cancelled():
+                        done.exception()  # Observe teardown errors; close() also drains owners.
+                task.add_done_callback(finished)
+        context.on('close', release_context)
+        try:
+            # Fingerprint transformations are explicit Settings opt-ins, not
+            # derived from the headed/headless launch mode. GPU identity spans
+            # both APIs; JS graphics contexts initialize workers automatically.
+            # Native graphics are configured at process launch; only audio
+            # fallbacks need an init script in that backend.
+            if self.profiles:
+                profile = self.profiles.get(account)
+                seed_int = int(profile['seed'], 16) & 0xFFFFFFFF
+                scripts = build_scripts(
+                    seed_int,
+                    perturb_canvas=not native and settings.get('fingerprint_canvas', False),
+                    spoof_webgl=not native and settings.get('fingerprint_webgl', False),
+                    spoof_webgpu=not native and settings.get('fingerprint_webgpu', False),
+                    spoof_audio=settings.get('fingerprint_audio', False),
+                    intercept_workers=not native and not managed_workers and settings.get('fingerprint_workers', False),
+                )
+                for script in scripts:
+                    await context.add_init_script(script)
+                if managed_workers:
+                    worker_profiles = await WorkerProfiles.start(owned_browser, worker_port, '\n'.join(scripts))
+                    context._retail_worker_profiles = worker_profiles
+            saved_storage = account.get('session_storage', {})
+            domain = DOMAINS[account['region']]
+            values = saved_storage.get(domain, {}) if isinstance(saved_storage, dict) else {}
+            if isinstance(values, dict) and values:
+                safe = {key: value for key, value in values.items() if isinstance(key, str) and isinstance(value, str)}
+                if len(json.dumps(safe)) <= 65536:
+                    await context.add_init_script('''(() => {
+                        if (location.hostname !== %s || sessionStorage.getItem('__retail_restored_v1')) return;
+                        for (const [key, value] of Object.entries(%s)) sessionStorage.setItem(key, value);
+                        sessionStorage.setItem('__retail_restored_v1', '1');
+                    })()''' % (json.dumps(domain), json.dumps(safe)))
+            context.set_default_timeout(settings.get("browser_timeout_ms", 30000))
+            if settings.get("trace_enabled"):
+                await context.tracing.start(screenshots=True,snapshots=True,sources=False)
+                context._retail_tracing=True
+            self.context_accounts[context] = {**account, "solver_id": solver_id or account.get("solver_id", ""), "otp_since": time.time() - 10}
+            return context
+        except BaseException:
+            await context.close()
+            raise
 
     async def login(self, account):
         if account["id"] in self.logins:
@@ -1017,6 +1084,11 @@ class Amazon:
             self.login_watchers.clear()
             for context in list(self.context_accounts):
                 await context.close()
+            if self.profile_close_tasks:
+                await asyncio.gather(*self.profile_close_tasks, return_exceptions=True)
+            for browser in list(self.profile_browsers):
+                await browser.close()
+            self.profile_browsers.clear()
             if self.browser and not self.cdp_attached:
                 await self.browser.close()
         finally:

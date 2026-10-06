@@ -6,8 +6,8 @@ AccountBrowserProfiles class stores and restores locale, viewport, screen
 and device scale factor only.
 
 Fingerprint transformations (canvas, WebGL, WebGPU, audio, worker
-interception) live in ``retail.fingerprint`` and are applied by the caller
-from explicit Settings flags. They are independent of headed/headless
+interception) live in ``retail.fingerprint`` and ``retail.native_fingerprint``
+and are applied by the caller from explicit Settings flags. They are independent of headed/headless
 launch mode. That module fabricates device identity values when enabled;
 this module does not.
 """
