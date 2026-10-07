@@ -62,6 +62,47 @@ def proxy_config(value: str) -> dict | None:
     return result
 
 
+class FingerprintOverrides(BaseModel):
+    """None inherits the current global value; False is an explicit override."""
+    model_config = {'extra': 'forbid'}
+    fingerprint_backend: Literal['javascript', 'native', 'fingerprint-suite'] | None = None
+    fingerprint_canvas: bool | None = None
+    fingerprint_webgl: bool | None = None
+    fingerprint_webgpu: bool | None = None
+    fingerprint_audio: bool | None = None
+    fingerprint_workers: bool | None = None
+    fingerprint_fonts: bool | None = None
+    fingerprint_navigator: bool | None = None
+    fingerprint_screen: bool | None = None
+    fingerprint_proxy_location: bool | None = None
+    fingerprint_timezone: Literal['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu'] | None = None
+
+
+class FingerprintTestSite(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=1, max_length=2048)
+
+    @field_validator('name', 'url', mode='before')
+    @classmethod
+    def trim(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator('url')
+    @classmethod
+    def website_url(cls, value):
+        parsed = urlparse(value)
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or any(char.isspace() or ord(char) < 32 for char in value)
+                or '\\' in value):
+            raise ValueError('Enter an HTTP or HTTPS website URL without credentials')
+        try:
+            parsed.port
+        except ValueError:
+            raise ValueError('Enter a valid website port')
+        return value
+
+
 class Account(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: str = Field(default="", max_length=200)
@@ -80,6 +121,7 @@ class Account(BaseModel):
     auto_otp: bool = True
     account_type: Literal["personal", "business"] = "personal"
     purchase_cooldown_days: Literal[0, 2, 3, 4, 5, 6, 7] = 0
+    fingerprint_overrides: FingerprintOverrides = Field(default_factory=FingerprintOverrides)
 
     _retailer = field_validator("retailer")(retailer_id)
 
@@ -213,8 +255,9 @@ class Settings(BaseModel):
     sound_style: Literal["chime", "bell", "pulse"] = "chime"
     max_running_tasks: int = Field(default=10, ge=1, le=50)
     browser_channel: Literal["chromium", "chrome", "msedge"] = "chromium"
-    show_browser_window: bool = False
+    show_browser_window: bool = True
     browser_timeout_ms: int = Field(default=30000, ge=5000, le=120000)
+    interaction_pacing: Literal['off', 'paced'] = 'off'
     proxy_timeout_seconds: int = Field(default=15, ge=3, le=60)
     proxy_concurrency: int = Field(default=5, ge=1, le=20)
     default_monitor_delay: int = Field(default=4500, ge=3500, le=3600000)
@@ -245,6 +288,10 @@ class Settings(BaseModel):
     fingerprint_timezone: Literal['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu'] = 'America/New_York'
     fingerprint_backend: Literal['javascript', 'native', 'fingerprint-suite'] = 'javascript'
     native_browser_executable: str = ''
+    fingerprint_test_sites: list[FingerprintTestSite] = Field(default_factory=lambda: [
+        FingerprintTestSite(name='CreepJS', url='https://abrahamjuliot.github.io/creepjs/'),
+        FingerprintTestSite(name='Google', url='https://www.google.com/'),
+    ], max_length=20)
 
     @model_validator(mode='after')
     def profile_browser_connection(self):
@@ -274,6 +321,11 @@ class Settings(BaseModel):
         if value and not re.fullmatch(r"https://(?:discord.com|discordapp.com)/api/webhooks/\d+/[A-Za-z0-9_\-]+", value):
             raise ValueError("Enter a Discord webhook URL")
         return value
+
+
+def account_fingerprint_settings(settings, account):
+    overrides = FingerprintOverrides.model_validate(account.get('fingerprint_overrides') or {})
+    return Settings.model_validate({**settings, **overrides.model_dump(exclude_none=True)}).model_dump()
 
 
 class Address(BaseModel):

@@ -3,6 +3,8 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Retail Desk · Automation workspace</title><link rel="stylesheet" href="/static/style.css"><script src="/static/features.js" defer></script><script src="/static/app.js" defer></script><script src="/static/workspace.js" defer></script><script src="/static/redesign.js" defer></script></head>
 <body>
 <script src="/static/ai-settings.js" defer></script>
+<script src="/static/settings.js" defer></script>
+<script src="/static/account-fingerprints.js" defer></script>
 <aside class="sidebar">
   <a class="brand" href="/"><span class="logo">r<span>↗</span></span> retail<span class="brand-light">desk</span></a>
   <div class="workspace"><span class="workspace-icon">J</span><div>Local workspace<small>Personal · on this device</small></div><span class="dot"></span></div>
@@ -23,6 +25,7 @@
   <div class="content">
     <div class="page-heading"><div><div class="eyebrow">YOUR AUTOMATION WORKSPACE</div><h1 id="title">Task groups</h1><p id="subtitle">Every product. Every task. One place to stay in control.</p></div><button id="primary" class="primary">＋ Create group</button></div>
     <section class="stats" aria-label="Workspace statistics"><div><span>Total tasks</span><strong id="stat-tasks">0</strong><small>Across your task groups</small></div><div><span>Running now <i class="dot"></i></span><strong id="stat-running">0</strong><small>Monitoring and processing</small></div><div><span>Live confirmations</span><strong id="stat-orders">0</strong><small>Verified retailer responses</small></div><div><span>Accounts ready</span><strong id="stat-accounts">0</strong><small>Saved account sessions</small></div></section>
+    <p id="trace-recording" class="notice amber" hidden>Browser trace recording is enabled. Traces can contain account details. Manage recording in Settings → Data &amp; privacy.</p>
     <section id="screen"></section>
     <footer><span><i class="dot"></i> Runs on your device</span><span>Retail automation <b>•</b> Your accounts, your controls</span></footer>
   </div>

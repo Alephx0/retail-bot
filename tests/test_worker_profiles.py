@@ -34,7 +34,8 @@ def worker_origin():
         const g=new OffscreenCanvas(1,1).getContext('webgl');
         const renderer=g.getParameter(g.getExtension('WEBGL_debug_renderer_info').UNMASKED_RENDERER_WEBGL);
         return {renderer,pixels:[...ctx.getImageData(0,0,32,16).data],
-            identity:{cpu:navigator.hardwareConcurrency,memory:navigator.deviceMemory,
+            identity:{ua:navigator.userAgent,hints:navigator.userAgentData?.toJSON(),
+                cpu:navigator.hardwareConcurrency,memory:navigator.deviceMemory,
                 language:navigator.language,languages:[...navigator.languages],
                 timezone:Intl.DateTimeFormat().resolvedOptions().timeZone}};
     };'''
@@ -108,6 +109,9 @@ def test_worker_startup_imports_restart_and_account_isolation(tmp_path, worker_o
                 page = await context.new_page()
                 await page.goto(origin)
                 main = await page.evaluate('() => {' + capture + 'return capture();}', isolated_context=False)
+                if us_profile:
+                    assert 'HeadlessChrome/' not in main['identity']['ua']
+                    assert main['identity']['hints']['brands']
                 result = await page.evaluate('''async kind => {
                     const suffix=kind==='module'?'-module':'';
                     const options={type:kind};

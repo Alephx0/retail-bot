@@ -12,6 +12,7 @@ from retail.store import Store
 def test_headless_account_session_storage_is_isolated_and_restored(tmp_path):
     async def scenario():
         store = Store(tmp_path)
+        store.put('settings', {'show_browser_window': False}, 'settings')
         adapter = Amazon(store)
         account = store.put('accounts', {'name': 'First', 'region': 'US', 'session': {'cookies': []}})
         second = store.put('accounts', {'name': 'Second', 'region': 'US', 'session': {'cookies': []}})

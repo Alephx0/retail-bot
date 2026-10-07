@@ -22,7 +22,7 @@ from .models import ResourceFolder
 from .recovery import diagnose, validate_candidate
 from .browser_bridge import inspect_session
 from .proxy_pool import ProxyPool
-from .models import AIConnection
+from .models import AIConnection, account_fingerprint_settings
 from .ai_provider import AIProvider, ProviderError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -102,6 +102,7 @@ def create_app(data_dir=None):
         value = dict(value)
         if kind == "accounts":
             value.pop("session", None)
+            value['fingerprint_overrides'] = {k: v for k, v in value.get('fingerprint_overrides', {}).items() if v is not None}
             value.pop("session_storage", None)
             value["has_proxy"] = bool(value.pop("proxy", ""))
             value["has_password"] = bool(value.pop("password", ""))
@@ -125,6 +126,8 @@ def create_app(data_dir=None):
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
         result["events"] = store().all("events")[-150:][::-1]
         result["active"] = list(app.state.engine.jobs)
+        result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
+        result['settings'] = [public('settings', {**Settings().model_dump(), **(store().get('settings', 'settings') or {})})]
         result["retailers"] = catalog()
         result["memberships"] = [{"folder_id":f["id"],"resource_id":i} for f in store().all("folders") for i in app.state.resources.members(f["id"])]
         result["account_profiles"] = app.state.resources.links()
@@ -148,7 +151,12 @@ def create_app(data_dir=None):
         old = require(kind, id) if id else {}
         if kind == "settings":
             id = "settings"
-            old = store().get(kind, id) or {}
+            old = {**Settings().model_dump(), **(store().get(kind, id) or {})}
+            expected = data.pop('_expected', {})
+            if not isinstance(expected, dict):
+                raise HTTPException(422, 'Invalid settings revision')
+            if any(key in data and old.get(key) != value for key, value in expected.items()):
+                raise HTTPException(409, 'These settings changed in another window. Discard your draft to reload the saved values, then try again.')
         # Redacted secrets are preserved when omitted from edits.
         merged = {**old, **data}
         if kind == 'ai_connections':
@@ -171,6 +179,11 @@ def create_app(data_dir=None):
             raise HTTPException(409, "Close or save this account's open browser before editing")
         try:
             valid = MODELS[kind].model_validate(merged).model_dump(mode="json")
+            if kind == 'accounts':
+                account_fingerprint_settings(store().get('settings', 'settings') or {}, valid)
+            elif kind == 'settings':
+                for account in store().all('accounts'):
+                    account_fingerprint_settings(valid, account)
         except ValidationError as exc:
             raise HTTPException(422, "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in exc.errors()))
         if kind == "groups" and id:
@@ -214,6 +227,9 @@ def create_app(data_dir=None):
             folder = require("folders", folder_id)
             if folder["resource_kind"] != kind:
                 raise HTTPException(422, "Folder type does not match the item")
+        if kind == 'ai_connections' and any(valid.get(key) != old.get(key) for key in ('api_key', 'model', 'provider', 'protocol', 'base_url')):
+            old.pop('health', None)
+            old.pop('browser_health', None)
         result = store().put(kind, {**old, **valid}, id)
         if kind == 'settings' and result.get('max_running_tasks') != old.get('max_running_tasks'):
             app.state.engine.browser_slots = asyncio.Semaphore(result['max_running_tasks'])
@@ -248,6 +264,8 @@ def create_app(data_dir=None):
             raise HTTPException(409, "Wait for the proxy check to finish")
         if kind == "accounts" and id in app.state.engine.amazon.logins:
             await app.state.engine.amazon.logins.pop(id).close()
+        if kind == 'accounts':
+            await app.state.engine.amazon.close_fingerprint_test(id)
         app.state.resources.cleanup(kind, id)
         store().delete(kind, id)
         return {"ok": True}
@@ -314,10 +332,14 @@ def create_app(data_dir=None):
         account = require("accounts", id)
         if action in ("login", "register", "save-session") and any(t.get("account_id") == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
             raise HTTPException(409, "Stop this account's running tasks before changing its session")
-        if account.get("retailer", "amazon") != "amazon":
+        if account.get("retailer", "amazon") != "amazon" and action not in ('test-fingerprint', 'close-fingerprint-test'):
             raise HTTPException(409, "Account browser automation for this retailer is planned")
         try:
-            if action == "login":
+            if action == 'test-fingerprint':
+                return await app.state.engine.amazon.test_fingerprint(account)
+            elif action == 'close-fingerprint-test':
+                await app.state.engine.amazon.close_fingerprint_test(id)
+            elif action == "login":
                 await app.state.engine.amazon.login(account)
             elif action == "save-session":
                 await app.state.engine.amazon.save_login(account)
@@ -592,6 +614,8 @@ def create_app(data_dir=None):
             except Exception:
                 result = {'ok': False, 'message': 'Browser recovery test failed. Check browser installation and API connection.'}
             current = require('ai_connections', id)
+            if any(current.get(key) != connection.get(key) for key in ('api_key', 'model', 'provider', 'protocol', 'base_url')):
+                raise HTTPException(409, 'Connection changed during the test. Test the saved connection again.')
             store().put('ai_connections', {**current, 'browser_health': {**result, 'at': now()}})
             return result
 
@@ -604,8 +628,48 @@ def create_app(data_dir=None):
             result = {'ok': False, 'message': str(exc)}
         except Exception:
             result = {'ok': False, 'message': 'Provider did not return a supported tool response'}
-        store().put('ai_connections', {**connection, 'health': {**result, 'at': now()}})
+        current = require('ai_connections', id)
+        if any(current.get(key) != connection.get(key) for key in ('api_key', 'model', 'provider', 'protocol', 'base_url')):
+            raise HTTPException(409, 'Connection changed during the test. Test the saved connection again.')
+        store().put('ai_connections', {**current, 'health': {**result, 'at': now()}})
         return result
+
+    @app.get('/api/settings/browser-options')
+    async def browser_options():
+        from patchright.async_api import async_playwright
+        import shutil
+        async with async_playwright() as driver:
+            bundled = Path(driver.chromium.executable_path).is_file()
+        def installed(relative, commands):
+            if os.name == 'nt':
+                return any((Path(os.environ[root]) / relative).is_file()
+                           for root in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA') if os.environ.get(root))
+            return any(shutil.which(command) for command in commands)
+        return [
+            {'id': 'chromium', 'label': 'Bundled Chromium', 'available': bundled},
+            {'id': 'chrome', 'label': 'Chrome', 'available': installed('Google/Chrome/Application/chrome.exe', ['google-chrome', 'google-chrome-stable'])},
+            {'id': 'msedge', 'label': 'Edge', 'available': installed('Microsoft/Edge/Application/msedge.exe', ['microsoft-edge', 'microsoft-edge-stable'])},
+        ]
+
+    @app.post('/api/settings/test-discord')
+    async def test_discord():
+        import httpx
+        saved = store().get('settings', 'settings') or {}
+        webhook = saved.get('webhook', '')
+        if not webhook:
+            raise HTTPException(422, 'Save a Discord webhook before sending a test.')
+        try:
+            Settings.valid_webhook(webhook)
+        except ValueError:
+            raise HTTPException(422, 'Replace the saved webhook with a valid Discord webhook URL.')
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(webhook, json={'content': 'Retail Desk: notification connection test.'}, follow_redirects=False)
+            if response.status_code not in (200, 204):
+                raise HTTPException(502, f'Discord rejected the test (HTTP {response.status_code}). Check your saved webhook.')
+        except httpx.HTTPError:
+            raise HTTPException(502, 'Could not reach Discord. Check your connection and try again.')
+        return {'message': 'Test message sent to the saved Discord webhook.'}
 
     @app.get("/api/data/backup")
     async def backup():

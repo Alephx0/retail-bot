@@ -10,12 +10,12 @@ from .fingerprint import build_scripts
 from .native_fingerprint import launch_options as native_launch_options, needs_profile_browser
 from .worker_profiles import WorkerProfiles, debugging_port
 from .fingerprint_suite import build_profile as build_suite_profile
-from . import us_fingerprint, proxy_location
+from . import us_fingerprint, proxy_location, behavior
 from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
-from .models import DOMAINS, proxy_config
+from .models import DOMAINS, proxy_config, Settings, account_fingerprint_settings
 from .identity import IdentityService
 from .store import now
 from .interactions import resolve, InteractionError
@@ -67,6 +67,8 @@ class Amazon:
         self.driver = None
         self.browser = None
         self.logins = {}
+        self.fingerprint_tests = {}
+        self.fingerprint_test_lock = asyncio.Lock()
         self.login_watchers = {}
         self.launch_lock = asyncio.Lock()
         self.identities = IdentityService(store)
@@ -156,20 +158,21 @@ class Amazon:
         page._retail_agent_attempts = attempts
         return await self.agent.resolve(page, action, set(DOMAINS.values()), AMAZON_ACTIONS)
 
-    async def ready(self):
+    async def ready(self, settings=None):
         async with self.launch_lock:
             if not self.driver:
                 self.driver = await async_playwright().start()
             if not self.browser or not self.browser.is_connected():
-                settings = self.store.get("settings", "settings") or {}
-                self.browser_initially_visible = bool(settings.get('show_browser_window', False))
-                # Routine work uses real headless Chromium. The dashboard
-                # controls the same page via Playwright during intervention;
-                # headless Chromium cannot become a native GUI in place.
+                settings = settings if settings is not None else (self.store.get("settings", "settings") or {})
+                self.browser_initially_visible = bool(settings.get('show_browser_window', True))
+                # Window mode is explicit. The dashboard controls the same page
+                # during intervention; a headless process cannot become a GUI
+                # in place.
                 options = {"headless": not self.browser_initially_visible}
-                if settings.get('fingerprint_backend') == 'native':
-                    options = native_launch_options(settings)
-                elif settings.get("browser_channel", "chromium") != "chromium":
+                # Keep the shared browser on the configured standard channel.
+                # Native profiles always own their process, so accounts can mix
+                # implementations without borrowing another backend's identity.
+                if settings.get("browser_channel", "chromium") != "chromium":
                     options["channel"] = settings["browser_channel"]
                 if settings.get("cdp_attach"):
                     endpoint = settings.get("cdp_endpoint", "http://127.0.0.1:9222")
@@ -185,6 +188,9 @@ class Amazon:
     async def expose(self, page):
         if self.cdp_attached:
             await page.bring_to_front()
+        elif getattr(page.context, '_retail_interactive_window', False):
+            await set_visible(page, True)
+            return
         elif not self.browser_initially_visible:
             return  # The interactive dashboard shares this headless page.
         else:
@@ -203,12 +209,18 @@ class Amazon:
         from .proxy_pool import ProxyPool
         return ProxyPool(self.store).choose(account.get("proxy_list_id", ""), account["id"])
 
-    async def context(self, account, proxy=None, solver_id=""):
-        await self.ready()
-        settings = self.store.get("settings", "settings") or {}
+    async def context(self, account, proxy=None, solver_id="", *, interactive=False):
+        settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
+        await self.ready(settings)
+        if interactive:
+            # Account sign-in is a desktop interaction, independent of task
+            # window mode. Do not mutate saved settings or the task browser.
+            settings = {**settings, 'show_browser_window': True}
         options = self.profiles.options(account)
         us_options = us_fingerprint.context_options(self.profiles.get(account), settings, account['region'])
         options.update(us_options)
+        browser_identity = (await us_fingerprint.browser_identity_user_agent(self.browser)
+                            if us_options and settings.get('fingerprint_navigator') else None)
         if account.get("session"):
             options["storage_state"] = account["session"]
         if proxy is None:
@@ -237,7 +249,7 @@ class Amazon:
         owned_browser = None
         worker_profiles = None
         worker_port = None
-        if native and needs_profile_browser(settings):
+        if native:
             # Launch switches apply process-wide: never share a seeded browser
             # between accounts or retrofit it onto an already-running context.
             seed = int(self.profiles.get(account)['seed'], 16) & 0xffffffff
@@ -247,13 +259,23 @@ class Amazon:
             # The DevTools subscription belongs only to this account's process.
             # It cannot initialize workers from another account or browser.
             worker_port = debugging_port()
-            launch = {'headless': not settings.get('show_browser_window', False),
+            launch = {'headless': not settings.get('show_browser_window', True),
                       'args': [f'--remote-debugging-port={worker_port}',
                                '--remote-debugging-address=127.0.0.1']}
             if us_options:
                 # WorkerNavigator uses process languages, while context locale
                 # affects documents. Set both natively for US profiles.
                 launch['args'] += ['--lang=en-US', '--accept-lang=en-US']
+            if browser_identity:
+                # A process switch covers service workers as well as page and
+                # dedicated-worker headers, without context UA emulation.
+                launch['args'].append('--user-agent=' + browser_identity)
+            if settings.get('browser_channel', 'chromium') != 'chromium':
+                launch['channel'] = settings['browser_channel']
+            owned_browser = await self.driver.chromium.launch(**launch)
+            self.profile_browsers.add(owned_browser)
+        elif interactive and not self.cdp_attached:
+            launch = {'headless': False}
             if settings.get('browser_channel', 'chromium') != 'chromium':
                 launch['channel'] = settings['browser_channel']
             owned_browser = await self.driver.chromium.launch(**launch)
@@ -286,6 +308,8 @@ class Amazon:
                         done.exception()  # Observe teardown errors; close() also drains owners.
                 task.add_done_callback(finished)
         context.on('close', release_context)
+        context._retail_interactive_window = interactive and not self.cdp_attached
+        context._retail_paced_input = settings.get('interaction_pacing') == 'paced'
         if us_options:
             context._retail_us_profile_options = {key: options[key] for key in ('locale', 'viewport', 'screen', 'device_scale_factor', 'timezone_id')}
             context._retail_us_profile_options['surfaces'] = [key for key in us_fingerprint.SURFACES if settings.get('fingerprint_' + key)]
@@ -342,6 +366,44 @@ class Amazon:
             await context.close()
             raise
 
+    async def test_fingerprint(self, account):
+        # Tests share the account seed and proxy, but never load or save login cookies.
+        async with self.fingerprint_test_lock:
+            settings = Settings.model_validate(self.store.get('settings', 'settings') or {})
+            if settings.cdp_attach:
+                raise ValueError('Disable external CDP attachment in Settings to open a separate fingerprint test browser.')
+            if account['id'] not in self.fingerprint_tests and len(self.fingerprint_tests) >= 5:
+                raise ValueError('Close a fingerprint test browser before opening another (maximum 5).')
+            await self.close_fingerprint_test(account['id'])
+            clean_account = {key: value for key, value in account.items() if key not in ('session', 'session_storage')}
+            context = await self.context(clean_account, interactive=True)
+            self.fingerprint_tests[account['id']] = context
+
+            def forget(_):
+                if self.fingerprint_tests.get(account['id']) is context:
+                    self.fingerprint_tests.pop(account['id'], None)
+
+            context.on('close', forget)
+            try:
+                sites = settings.fingerprint_test_sites
+                pages = [await context.new_page() for _ in (sites or [None])]
+                # A failed website should not prevent the other tabs from opening.
+                results = await asyncio.gather(*[
+                    page.goto(site.url, wait_until='domcontentloaded')
+                    for page, site in zip(pages, sites)
+                ], return_exceptions=True)
+                await self.expose(pages[0])
+                return {'ok': True, 'failed_sites': [site.name for site, result in zip(sites, results)
+                                                    if isinstance(result, BaseException)]}
+            except BaseException:
+                await context.close()
+                raise
+
+    async def close_fingerprint_test(self, account_id):
+        context = self.fingerprint_tests.pop(account_id, None)
+        if context:
+            await context.close()
+
     async def login(self, account):
         if account["id"] in self.logins:
             await self.expose(self.logins[account["id"]].pages[0])
@@ -349,7 +411,7 @@ class Amazon:
         limit = min(5, (self.store.get('settings', 'settings') or {}).get('max_running_tasks', 10))
         if len(self.logins) >= limit:
             raise ValueError('Too many account sign-ins are open. Finish or close another account session first.')
-        context = await self.context(account)
+        context = await self.context(account, interactive=True)
         try:
             page = await context.new_page()
             await self.expose(page)
@@ -406,11 +468,11 @@ class Amazon:
             if urlparse(page.url).hostname not in DOMAINS.values():
                 return
             if await page.locator("#ap_email:visible").count() and account.get("email"):
-                await page.locator("#ap_email").fill(account["email"])
-                await page.locator("#continue").click()
+                await behavior.fill(page, page.locator("#ap_email"), account["email"])
+                await behavior.click(page, page.locator("#continue"))
             elif await page.locator("#ap_password:visible").count() and account.get("password"):
-                await page.locator("#ap_password").fill(account["password"])
-                await page.locator("#signInSubmit").click()
+                await behavior.fill(page, page.locator("#ap_password"), account["password"])
+                await behavior.click(page, page.locator("#signInSubmit"))
             elif await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
                 try:
                     await self.fill_otp(page, account)
@@ -427,10 +489,10 @@ class Amazon:
         if not await field.count():
             raise ValueError("No supported verification field is visible")
         result = await self.identities.code(account, since=self.context_accounts.get(page.context, {}).get("otp_since"))
-        await field.fill(result["code"])
+        await behavior.fill(page, field, result["code"])
         submit = page.locator("#auth-signin-button:visible, input[aria-labelledby='cvf-submit-otp-button-announce']:visible, #cvf-submit-otp-button input:visible").first
         if await submit.count():
-            await submit.click()
+            await behavior.click(page, submit)
             await page.wait_for_timeout(800)
 
     async def register(self, account):
@@ -441,14 +503,14 @@ class Amazon:
         limit = min(5, (self.store.get('settings', 'settings') or {}).get('max_running_tasks', 10))
         if len(self.logins) >= limit:
             raise ValueError('Too many account sign-ins are open. Finish or close another account session first.')
-        context = await self.context({**account, "session": None})
+        context = await self.context({**account, "session": None}, interactive=True)
         self.logins[account["id"]] = context
         page = await context.new_page()
         await self.expose(page)
         await self.navigate(page, f"https://{DOMAINS[account['region']]}/ap/register", wait_until="domcontentloaded")
         for selector, value in [("#ap_customer_name", account["name"]), ("#ap_email", account["email"]), ("#ap_password", account["password"]), ("#ap_password_check", account["password"])]:
             if await page.locator(selector).count():
-                await page.locator(selector).fill(value)
+                await behavior.fill(page, page.locator(selector), value)
         # Registration terms and any phone verification remain visible to the user.
         await page.bring_to_front()
         self.login_watchers[account['id']] = asyncio.create_task(self.watch_login(account['id'], context, page))
@@ -725,7 +787,7 @@ class Amazon:
                     control = row.get_by_role('button', name=re.compile(rf'^{direction} (?:item quantity$|quantity by one, Quantity is \d+)', re.I))
                     if await control.count() != 1 or not await control.is_visible() or not await control.is_enabled():
                         break
-                    await control.click()
+                    await behavior.click(page, control)
                     try:
                         await page.wait_for_function("([asin, qty]) => {const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.getAttribute('data-asin')===asin); return rows.length===1 && rows[0].getAttribute('data-quantity')===String(qty)}", arg=[asin, expected], timeout=3000)
                     except Exception:
@@ -749,7 +811,7 @@ class Amazon:
         elif quantity!=1:
             raise CartRejected("Requested item quantity could not be selected")
         try:
-            await (await self.resolve_action(page,"ADD_TO_CART")).click()
+            await behavior.click(page, await self.resolve_action(page,"ADD_TO_CART"))
         except InteractionError as exc:
             raise Attention(str(exc)) from exc
         await page.wait_for_timeout(1500)
@@ -785,7 +847,7 @@ class Amazon:
         page._retail_cart_title = title.splitlines()[0].strip()
         page._retail_cart_asin = asin
         try:
-            await (await self.resolve_action(page, 'BUY_NOW')).click()
+            await behavior.click(page, await self.resolve_action(page, 'BUY_NOW'))
         except InteractionError as exc:
             raise Attention(str(exc)) from exc
         await self.advance_checkout(page)
@@ -821,7 +883,7 @@ class Amazon:
                 row.get_by_role('link', name=re.compile(r'^save for later$', re.I)))
             if await action.count() != 1 or not await action.is_visible() or not await action.is_enabled():
                 raise CartRejected('Save for Later is unavailable for an unrelated cart item; cart was not cleared')
-            await action.click()
+            await behavior.click(page, action)
             try:
                 await page.wait_for_function("asin => ![...document.querySelectorAll('#sc-active-cart [data-asin]')].some(e => e.getAttribute('data-asin') === asin)", arg=asin, timeout=3000)
             except Exception:
@@ -865,7 +927,7 @@ class Amazon:
             button = await self.resolve_action(page,"BEGIN_CHECKOUT")
         except InteractionError as exc:
             raise Attention(str(exc)) from exc
-        await button.click()
+        await behavior.click(page, button)
         await self.advance_checkout(page)
 
     async def advance_checkout(self, page):
@@ -899,7 +961,7 @@ class Amazon:
                 href = await control.evaluate("e => e.closest('a[href]')?.href || ''")
                 if href and (urlparse(href).scheme != 'https' or urlparse(href).hostname not in set(DOMAINS.values())):
                     raise InteractionError('Checkout continuation leaves the permitted retailer')
-                await control.click(timeout=5000)
+                await behavior.click(page, control, timeout=5000)
                 await page.wait_for_timeout(250)
             except InteractionError as exc:
                 # AI is a bounded fallback after deterministic semantics. Keep
@@ -1028,6 +1090,11 @@ class Amazon:
         review = getattr(page, '_retail_review', None)
         if not review or review['url'] != page.url or time.monotonic() - review['at'] > 60:
             raise Attention('Checkout review expired or changed; submission stopped')
+        control = getattr(page, '_retail_submit_control', None)
+        if control is not None:
+            await behavior.prepare(page, control)
+        if review['url'] != page.url or time.monotonic() - review['at'] > 60:
+            raise Attention('Checkout review expired or changed during input preparation; submission stopped')
         # Check financial facts again after any agent round trips, using the
         # already validated control. There is no model call after journaling.
         await self.checkout_snapshot(page, *review['args'], **review['limits'])
@@ -1102,8 +1169,8 @@ class Amazon:
         button = form.get_by_role("button", name=re.compile(r"^(?:verify(?: card| payment)?|confirm card)$", re.I))
         if await button.count() != 1:
             return False
-        await field.fill(cvv)
-        await button.click()
+        await behavior.fill(page, field, cvv)
+        await behavior.click(page, button)
         await page.wait_for_timeout(800)
         return True
 
@@ -1133,6 +1200,7 @@ class Amazon:
                 await self.driver.stop()
             self.driver = self.browser = None
             self.logins.clear()
+            self.fingerprint_tests.clear()
             self.context_accounts.clear()
 
 

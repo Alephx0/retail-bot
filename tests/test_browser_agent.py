@@ -47,13 +47,13 @@ def test_browser_window_setting_controls_launch(tmp_path, monkeypatch):
         monkeypatch.setattr('retail.amazon.async_playwright', lambda: FakePlaywright(driver))
         adapter = Amazon(store)
         await adapter.ready()
-        assert driver.chromium.options == [{'headless': True}]
-        assert not adapter.browser_visible
-        store.put('settings', {'show_browser_window': True}, 'settings')
+        assert driver.chromium.options == [{'headless': False}]
+        assert adapter.browser_visible
+        store.put('settings', {'show_browser_window': False}, 'settings')
         adapter.browser = None
         await adapter.ready()
-        assert driver.chromium.options[-1] == {'headless': False}
-        assert adapter.browser_visible
+        assert driver.chromium.options[-1] == {'headless': True}
+        assert not adapter.browser_visible
         store.db.close()
 
     asyncio.run(scenario())
@@ -439,24 +439,26 @@ def test_agent_settings_browser_flow(tmp_path, monkeypatch):
             await page.goto(f'http://127.0.0.1:{port}')
             await page.locator('[data-view=settings]').click()
             await page.locator('[data-settings-tab=integrations]').click()
-            await page.get_by_role('button', name='Add OpenAI API key', exact=True).click()
+            await page.get_by_role('button', name='Add API connection', exact=True).click()
             await page.get_by_label('Connection name', exact=True).fill('Test OpenAI')
             await page.get_by_label('API key', exact=True).fill('UI-SECRET-KEY')
             await page.get_by_role('button', name='Save connection', exact=True).click()
             await page.locator('[data-ai-test]').click()
             await page.get_by_text('Fixture connection verified', exact=True).first.wait_for()
+            await page.locator('[data-context-view=troubleshooting]').click()
             await page.locator('[data-ai-recovery]').click()
             await page.get_by_text('Fixture browser recovery verified', exact=True).first.wait_for()
-            await page.get_by_label('Active AI connection', exact=True).select_option(label='Test OpenAI · gpt-6-sol')
-            await page.get_by_label('When should AI help?', exact=True).select_option('agent')
-            await page.get_by_role('button', name='Save settings', exact=True).click()
+            await page.locator('[data-view=settings]').last.click()
+            await page.locator('[data-settings-tab=integrations]').click()
+            await page.get_by_label('Connection', exact=True).select_option(label='Test OpenAI · gpt-6-sol')
+            await page.get_by_label('When AI may assist', exact=True).select_option('agent')
+            await page.get_by_role('button', name='Save changes', exact=True).click()
             from patchright.async_api import expect
-            await expect(page.get_by_label('When should AI help?', exact=True)).to_have_value('agent')
+            await expect(page.get_by_label('When AI may assist', exact=True)).to_have_value('agent')
             await page.locator('[data-settings-tab=browser]').click()
-            await page.get_by_text('Advanced: use an existing Chrome or Edge window', exact=True).click()
-            await page.get_by_label('Use existing Chromium debugging connection', exact=True).check()
-            await page.get_by_role('button', name='Save settings', exact=True).click()
-            await expect(page.get_by_label('Use existing Chromium debugging connection', exact=True)).to_be_checked()
+            await page.get_by_label('Browser connection', exact=True).select_option('true')
+            await page.get_by_role('button', name='Save changes', exact=True).click()
+            await expect(page.get_by_label('Browser connection', exact=True)).to_have_value('true')
             await page.reload()
             await page.locator('[data-view=settings]').click()
             await page.locator('[data-settings-tab=integrations]').click()

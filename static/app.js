@@ -64,7 +64,7 @@ document.addEventListener('click',async event=>{
     if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);toast('Monitor input copied');return;}
     if(b.dataset.filter){historyFilter=b.dataset.filter;render();return;}
     if(b.dataset.task){b.disabled=true;await api(`tasks/${b.dataset.task}/${b.dataset.op}`,'POST');await refresh();return;}
-    if(b.dataset.account){b.disabled=true;await api(`accounts/${b.dataset.account}/${b.dataset.op}`,'POST');await refresh();if(b.dataset.op==='login'){openBrowserView('accounts',b.dataset.account,true);toast('Complete sign-in in Take Control. Your session saves automatically once verified.');}else toast('Session saved');return;}
+    if(b.dataset.account){b.disabled=true;await api(`accounts/${b.dataset.account}/${b.dataset.op}`,'POST');await refresh();if(b.dataset.op==='login'){toast('Complete sign-in in the browser window. Your session saves automatically once verified.');}else toast('Session saved');return;}
     const action=b.dataset.action;
     if(action==='back'){groupId=null;selected.clear();render();}
     if(action==='create-group')openEditor('groups');
@@ -88,10 +88,6 @@ document.addEventListener('input',event=>{if(event.target.id==='search'){search=
 document.addEventListener('change',event=>{
   if(event.target.dataset.select){event.target.checked?selected.add(event.target.dataset.select):selected.delete(event.target.dataset.select);render();}
   if(event.target.id==='select-all'){state.tasks.filter(t=>t.group_id===groupId).forEach(t=>event.target.checked?selected.add(t.id):selected.delete(t.id));event.target.blur();render();}
-});
-document.addEventListener('submit',async event=>{
-  if(event.target.id!=='settings-form')return;event.preventDefault();const data=Object.fromEntries(new FormData(event.target));data.notifications=event.target.elements.notifications.checked;serializeSettings(data,event.target);if(!data.webhook&&state.settings[0]?.has_webhook)delete data.webhook;
-  try{await api('settings','POST',data);toast('Settings saved');await refresh();}catch(e){toast(e.message);}
 });
 function exportCSV(){const columns=['at','asin','title','quantity','total','currency','status','simulation','order_id'];const cell=v=>'"'+String(v??'').replace(/^[=+@\-]/,"'"+'$&').replaceAll('"','""')+'"';const csv=[columns.join(','),...state.checkouts.map(row=>columns.map(c=>cell(row[c])).join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='retail-desk-checkouts.csv';a.click();URL.revokeObjectURL(url);}
 refresh();setInterval(refresh,1800);

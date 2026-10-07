@@ -19,7 +19,7 @@ function accountFields(v={}){
   const policy=select('purchase_cooldown_days','Minimum days between orders',[[0,'Off'],...[2,3,4,5,6,7].map(n=>[n,`${n} days`])],v.purchase_cooldown_days||0)
     +'<p class="help">Applies to recorded live orders across this account. Tasks stop before opening a browser during cooldown; start again after the displayed time. Does not include purchases made outside this app.</p>'
     +(health?`<p class="help">Browser health: ${esc(health.status)}${health.drift?.length?' — '+esc(health.drift.join(', ')):''}</p>`:'');
-  return baseAccountFields(v).replace('<div id="single-account">','<div id="single-account">'+policy);
+  return baseAccountFields(v).replace('<div id="single-account">','<div id="single-account">'+policy+accountFingerprintFields(v));
 }
 function baseAccountFields(v={}){
   const amazon=(v.retailer||'amazon')==='amazon';
@@ -54,6 +54,7 @@ taskDetail = function(){
   return html.replace('<div class="task-foot">', panel+'<div class="task-foot">');
 };
 function openBrowserView(scope,id,control=false){
+  if(control && (scope!=='tasks' || !state.active.includes(id))){toast('Take Control is available for running tasks.');return;}
   const d=document.createElement('dialog');
   d.className='live-view-dialog';
   d.innerHTML=`<h2>${control?'Take Control':'Live view'} · ${scope==='accounts'?'account':'task'}</h2><p data-live-status>Connecting to the headless browser…</p><img data-live-image tabindex="0" alt="Current browser page">${control?'<p class="help">Click the page, then type on your keyboard. For pasted passwords or codes, use the private field below; it clears after sending. Native passkey or OS dialogs may require a separate visible browser and cannot be transferred without losing in-memory page state.</p><div class="browser-input"><input type="password" data-browser-text autocomplete="off" aria-label="Text to type into the focused website field" placeholder="Paste text for focused field"><button type="button" data-browser-send>Send text</button><button type="button" data-browser-tab>Tab</button><button type="button" data-browser-enter>Enter</button></div>':''}<div class="modal-actions"><button type="button" data-live-close>${control?'Return to task':'Close'}</button></div>`;
@@ -102,6 +103,7 @@ openEditor = function(kind,id){
   $('#modal-title').textContent=(id?'Edit ':'Create ')+({groups:'task group',accounts:'account',tasks:'tasks'}[kind]);$('#form-error').textContent='';
   $('#fields').innerHTML=kind==='groups'?input('name','Group name','','text','required maxlength="100"')+select('retailer','Group site',retailerOptions(),'amazon'):kind==='accounts'?accountFields(v):taskFields(v);
   $('#editor [type=submit]').textContent=kind==='groups'?'Create task group':kind==='accounts'?(id?'Save account':'Create Account'):(id?'Save task':'Create 1 task');
+  if(kind==='accounts')syncAccountFingerprintFields($('#editor'));
   $('#modal').showModal();if(kind==='tasks')$('#f-proxy_id').disabled=!!v.use_account_proxy;
 };
 function formData(form){const data=Object.fromEntries(new FormData(form));form.querySelectorAll('input[type=checkbox]:not(:disabled)').forEach(x=>data[x.name]=x.checked);return data;}
@@ -117,6 +119,8 @@ document.addEventListener('submit',async event=>{
     if(kind==='accounts'&&accountMode==='mass'){await api('account-batches/create','POST',{retailer:data.retailer,text:data.mass_text,folder_id:data.folder_id});}
     else {
       if(kind==='accounts'){
+        data.fingerprint_overrides=collectAccountFingerprint(form);
+        for(const [key] of accountFingerprintOptions)delete data['account_'+key];
         data.purchase_cooldown_days=Number(data.purchase_cooldown_days||0);
         data.name=data.email;data.account_type=data.business?'business':'personal';delete data.business;delete data.mass_text;
         if(data.proxy_mode==='direct'){data.proxy='';data.proxy_list_id='';}else if(data.proxy_mode==='list'){data.proxy='';if(!data.proxy_list_id)throw new Error('Choose a proxy list');}else {data.proxy_list_id='';if(id&&!data.proxy)delete data.proxy;}
@@ -141,7 +145,7 @@ document.addEventListener('click',event=>{
   if(b.hasAttribute('data-stat')){taskFilter=b.dataset.stat;selected.clear();render();}
   if(b.dataset.accountMode){accountMode=b.dataset.accountMode;const mass=accountMode==='mass';$('#single-account').hidden=mass;$('#mass-account').hidden=!mass;$('#single-account').querySelectorAll('input,select').forEach(x=>x.disabled=mass);$('#mass-lines').disabled=!mass;$('#mass-lines').required=mass;document.querySelectorAll('[data-account-mode]').forEach(x=>x.classList.toggle('selected',x===b));}
   if(b.dataset.schedule)openSchedule(b.dataset.schedule);
-  if(b.dataset.taskDetails){const t=state.tasks.find(x=>x.id===b.dataset.taskDetails);const d=document.createElement('dialog');d.innerHTML=`<h2>Task details</h2><p>${esc(t.message)}</p><p>Account: ${esc(name('accounts',t.account_id))}<br>Profile: ${esc(name('profiles',t.profile_id))}</p><p>Stage: ${esc(t.state||t.status)}</p><div class="task-evidence">${(state.diagnostics||[]).filter(d=>d.task_id===t.id).map(d=>`<button data-diagnostic="${d.id}">View ${esc(d.action)}</button>`).join('')}</div><p>Retry: ${t.retry_delay_ms??3500} ms · Item quantity: ${t.quantity}</p><p class="full-input">${esc(groupProducts(state.groups.find(x=>x.id===t.group_id)))}</p><div class="actions"><button data-action="edit" data-kind="tasks" data-id="${t.id}">Edit</button><button data-live-view="${t.id}">View live</button><button data-take-control="${t.id}">Take Control</button>${state.settings?.[0]?.show_browser_window?`<button data-task="${t.id}" data-op="focus">Focus window</button>`:''}<button data-task="${t.id}" data-op="stop">Stop</button><button data-action="delete" data-kind="tasks" data-id="${t.id}">Delete</button><button data-dismiss>Close</button></div>`;document.body.append(d);d.addEventListener('click',e=>{if(e.target.closest('button')){d.close();d.remove();}});d.showModal();}
+  if(b.dataset.taskDetails){const t=state.tasks.find(x=>x.id===b.dataset.taskDetails);const d=document.createElement('dialog');d.innerHTML=`<h2>Task details</h2><p>${esc(t.message)}</p><p>Account: ${esc(name('accounts',t.account_id))}<br>Profile: ${esc(name('profiles',t.profile_id))}</p><p>Stage: ${esc(t.state||t.status)}</p><div class="task-evidence">${(state.diagnostics||[]).filter(d=>d.task_id===t.id).map(d=>`<button data-diagnostic="${d.id}">View ${esc(d.action)}</button>`).join('')}</div><p>Retry: ${t.retry_delay_ms??3500} ms · Item quantity: ${t.quantity}</p><p class="full-input">${esc(groupProducts(state.groups.find(x=>x.id===t.group_id)))}</p><div class="actions"><button data-action="edit" data-kind="tasks" data-id="${t.id}">Edit</button>${state.active.includes(t.id)?'<button data-live-view="'+t.id+'">View live</button><button data-take-control="'+t.id+'">Take Control</button>':''}${state.settings?.[0]?.show_browser_window?`<button data-task="${t.id}" data-op="focus">Focus window</button>`:''}<button data-task="${t.id}" data-op="stop">Stop</button><button data-action="delete" data-kind="tasks" data-id="${t.id}">Delete</button><button data-dismiss>Close</button></div>`;document.body.append(d);d.addEventListener('click',e=>{if(e.target.closest('button')){d.close();d.remove();}});d.showModal();}
 },true);
 document.addEventListener('change',async e=>{
   const el=e.target;

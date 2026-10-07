@@ -53,7 +53,6 @@ function serializeFeature(kind,id,data,form){
   if(kind==='solvers')data.timeout_seconds=Number(data.timeout_seconds);
   return true;
 }
-function serializeSettings(data,form){if(form.elements.trace_enabled)data.trace_enabled=form.elements.trace_enabled.checked;for(const key of ['checkout_sound','attention_sound','webhook_checkouts','webhook_attention'])data[key]=form.elements[key].checked;for(const key of ['sound_volume','max_running_tasks','browser_timeout_ms','proxy_timeout_seconds','proxy_concurrency','default_monitor_delay'])data[key]=Number(data[key]);}
 let audioContext, soundInitialized=false, seenOrders=new Set(), seenAttention=new Set();
 document.addEventListener('pointerdown',()=>{try{audioContext??=new (window.AudioContext||window.webkitAudioContext)();audioContext.resume();}catch{}},{once:true});
 function playSound(style='chime',volume=.4){if(!audioContext)return;const tones=style==='bell'?[880,1320]:style==='pulse'?[440,440,660]:[660,880,1100];tones.forEach((frequency,index)=>{const oscillator=audioContext.createOscillator(),gain=audioContext.createGain(),start=audioContext.currentTime+index*.14;oscillator.type='sine';oscillator.frequency.value=frequency;gain.gain.setValueAtTime(0,start);gain.gain.linearRampToValueAtTime(volume*.2,start+.02);gain.gain.exponentialRampToValueAtTime(.001,start+.32);oscillator.connect(gain);gain.connect(audioContext.destination);oscillator.start(start);oscillator.stop(start+.34);});}
@@ -74,8 +73,7 @@ document.addEventListener('click',async event=>{
     if(action==='account'){
       result=await api(`accounts/${b.dataset.id}/${b.dataset.op}`,'POST');
       if(result.code){toast(`${result.source}: ${result.code} · expires within ${result.expires_in}s`);return;}
-      if(b.dataset.op==='register')openBrowserView('accounts',b.dataset.id,true);
-      result.message=b.dataset.op==='register'?'Complete registration in Take Control. Session capture follows verified sign-in.':b.dataset.op==='fill-otp'?'Code filled in the account browser.':'Account browser closed.';
+      result.message=b.dataset.op==='register'?'Complete registration in the browser window. Session capture follows verified sign-in.':b.dataset.op==='fill-otp'?'Code filled in the account browser.':'Account browser closed.';
     }
     if(result)toast(result.message||'Completed');await refresh();
   }catch(error){toast(error.message);}finally{b.disabled=false;}

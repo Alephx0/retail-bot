@@ -55,6 +55,11 @@ def test_us_browser_screen_media_navigator_and_health(tmp_path):
                 response = await page.goto('https://identity.test/')
                 values = await page.evaluate(IDENTITY_PROBE, isolated_context=False)
                 assert values['main'] == values['worker'] == values['iframe']
+                assert 'HeadlessChrome/' not in values['main']['ua']
+                assert 'Chrome/' + adapter.browser.version.split('.')[0] + '.' in values['main']['ua']
+                assert (await response.request.all_headers())['user-agent'] == values['main']['ua']
+                hints = await page.evaluate('navigator.userAgentData.toJSON()')
+                assert hints['brands'] and hints['platform'] == 'Windows'
                 assert values['main']['timezone'] == 'America/Chicago'
                 assert values['main']['language'] == 'en-US'
                 assert (await response.request.all_headers())['accept-language'].startswith('en-US')
