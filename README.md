@@ -1,5 +1,11 @@
 # Retail Desk
 
+This branch adds the [task-group coordinator and workspace](docs/task-group-implementation.md):
+product goals, account assignments, aggregate spending reservations, timed
+preparation, outcome recovery and explicit legacy migration. Open **Task Groups**
+for the new workflow; **Legacy tasks** retains existing configurations. The
+[architecture proposal](docs/task-group-architecture.md) records the design.
+
 A local retail automation workspace inspired by the public Refract and Stellar workflows. Version 0.4 adds a Home dashboard, canonical resource folders, profile/account assignment previews, contextual tabs, account session management, structured task states, and independent monitoring/cart/checkout services. This is an independent implementation, **not full parity with either commercial bot**.
 
 ## Run

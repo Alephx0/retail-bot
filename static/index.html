@@ -6,13 +6,16 @@
 <script src="/static/settings.js" defer></script>
 <script src="/static/account-fingerprints.js" defer></script>
 <script src="/static/fingerprint-profile-editor.js" defer></script>
+<script src="/static/task-groups.js" defer></script>
+<link rel="stylesheet" href="/static/task-groups.css">
 <aside class="sidebar">
   <a class="brand" href="/"><span class="logo">r<span>↗</span></span> retail<span class="brand-light">desk</span></a>
   <div class="workspace"><span class="workspace-icon">J</span><div>Local workspace<small>Personal · on this device</small></div><span class="dot"></span></div>
   <div class="nav-label">WORKSPACE</div>
   <nav aria-label="Main navigation">
     <button data-view="home" class="nav active"><span>&#8962;</span> Home</button>
-    <button data-view="tasks" class="nav"><span>&#9638;</span> Task Groups <b id="nav-count">0</b></button>
+    <button data-view="task_groups" class="nav"><span>&#9638;</span> Task Groups</button>
+    <button data-view="tasks" class="nav"><span>&#9638;</span> Legacy tasks <b id="nav-count">0</b></button>
     <button data-view="accounts" class="nav"><span>&#9678;</span> Accounts</button>
     <button data-view="profiles" class="nav"><span>&#9635;</span> Profiles</button>
     <button data-view="proxies" class="nav"><span>&#8644;</span> Proxies</button>

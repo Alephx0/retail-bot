@@ -54,7 +54,7 @@ taskDetail = function(){
   return html.replace('<div class="task-foot">', panel+'<div class="task-foot">');
 };
 function openBrowserView(scope,id,control=false){
-  if(control && (scope!=='tasks' || !state.active.includes(id))){toast('Take Control is available for running tasks.');return;}
+  if(control && scope!=='group_attempts' && (scope!=='tasks' || !state.active.includes(id))){toast('Take Control is available for running tasks.');return;}
   const d=document.createElement('dialog');
   d.className='live-view-dialog';
   d.innerHTML=`<h2>${control?'Take Control':'Live view'} · ${scope==='accounts'?'account':'task'}</h2><p data-live-status>Connecting to the headless browser…</p><img data-live-image tabindex="0" alt="Current browser page">${control?'<p class="help">Click the page, then type on your keyboard. For pasted passwords or codes, use the private field below; it clears after sending. Native passkey or OS dialogs may require a separate visible browser and cannot be transferred without losing in-memory page state.</p><div class="browser-input"><input type="password" data-browser-text autocomplete="off" aria-label="Text to type into the focused website field" placeholder="Paste text for focused field"><button type="button" data-browser-send>Send text</button><button type="button" data-browser-tab>Tab</button><button type="button" data-browser-enter>Enter</button></div>':''}<div class="modal-actions"><button type="button" data-live-close>${control?'Return to task':'Close'}</button></div>`;
