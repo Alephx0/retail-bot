@@ -4,6 +4,9 @@ import profile
 import re
 import time
 import uuid
+import tempfile
+import hashlib
+from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from .fingerprint import build_scripts
@@ -23,6 +26,8 @@ from .browser_bridge import validate_endpoint
 from .browser_agent import BrowserAgent
 from .browser_mcp import AMAZON_ACTIONS
 from .browser_visibility import set_visible
+from .browser_runtime import browser_options, extension_paths
+from .fingerprint_profiles import generated, inspect_hardware
 from .account_consistency import AccountBrowserProfiles
 
 
@@ -66,6 +71,9 @@ class Amazon:
         self.store = store
         self.driver = None
         self.browser = None
+        self.hardware = None
+        self.identity_hardware = {}
+        self.browser_key = None
         self.logins = {}
         self.fingerprint_tests = {}
         self.fingerprint_test_lock = asyncio.Lock()
@@ -163,17 +171,19 @@ class Amazon:
             if not self.driver:
                 self.driver = await async_playwright().start()
             if not self.browser or not self.browser.is_connected():
+                self.hardware = None
+                self.identity_hardware.clear()
                 settings = settings if settings is not None else (self.store.get("settings", "settings") or {})
                 self.browser_initially_visible = bool(settings.get('show_browser_window', True))
                 # Window mode is explicit. The dashboard controls the same page
                 # during intervention; a headless process cannot become a GUI
                 # in place.
-                options = {"headless": not self.browser_initially_visible}
+                options = {"headless": not self.browser_initially_visible, "args": ["--enable-unsafe-extension-debugging"], "ignore_default_args": ["--disable-extensions"]}
                 # Keep the shared browser on the configured standard channel.
                 # Native profiles always own their process, so accounts can mix
                 # implementations without borrowing another backend's identity.
-                if settings.get("browser_channel", "chromium") != "chromium":
-                    options["channel"] = settings["browser_channel"]
+                options.update(browser_options({**settings, "fingerprint_backend": "javascript"}))
+                self.browser_key = (settings.get("browser_identity", "default"), settings.get("browser_channel", "chromium"))
                 if settings.get("cdp_attach"):
                     endpoint = settings.get("cdp_endpoint", "http://127.0.0.1:9222")
                     validate_endpoint(endpoint)
@@ -209,8 +219,30 @@ class Amazon:
         from .proxy_pool import ProxyPool
         return ProxyPool(self.store).choose(account.get("proxy_list_id", ""), account["id"])
 
+    async def hardware_profile(self, settings=None):
+        if settings is not None:
+            key = (settings.get('browser_identity', 'default'), settings.get('browser_channel', 'chromium'))
+            if settings.get('fingerprint_backend') != 'native' and key != self.browser_key:
+                if key not in self.identity_hardware:
+                    probe = await self.driver.chromium.launch(headless=True, **browser_options(settings))
+                    try:
+                        self.identity_hardware[key] = await inspect_hardware(probe)
+                    finally:
+                        await probe.close()
+                return self.identity_hardware[key]
+        if self.hardware is None:
+            self.hardware = await inspect_hardware(self.browser)
+        return self.hardware
+
     async def context(self, account, proxy=None, solver_id="", *, interactive=False):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
+        identity_launch = browser_options(settings)
+        extensions = extension_paths(self.store, settings.get('browser_extension_ids', []))
+        custom_extensions = bool(extensions)
+        if settings.get('cdp_attach') and (extensions or not settings.get('browser_incognito', True)):
+            raise ValueError('Normal profiles and managed extensions require an app-managed browser.')
+        if not settings.get('cdp_attach'):
+            extensions = [str(Path(__file__).resolve().parents[1] / 'browser-extensions' / 'runtime-bridge'), *extensions]
         await self.ready(settings)
         if interactive:
             # Account sign-in is a desktop interaction, independent of task
@@ -219,8 +251,17 @@ class Amazon:
         options = self.profiles.options(account)
         us_options = us_fingerprint.context_options(self.profiles.get(account), settings, account['region'])
         options.update(us_options)
-        browser_identity = (await us_fingerprint.browser_identity_user_agent(self.browser)
-                            if us_options and settings.get('fingerprint_navigator') else None)
+        profile = self.profiles.get(account)
+        hardware = await self.hardware_profile(settings)
+        values = (generated(profile, account.get('fingerprint_values', {}), hardware)
+                  if settings.get('fingerprint_backend') != 'fingerprint-suite' else {})
+        if settings.get('fingerprint_screen') and us_options:
+            options.update({key: values[key] for key in ('screen', 'viewport', 'device_scale_factor')})
+        # Headed browsers already supply their real identity. Even an identical
+        # --user-agent override discards detailed native UA client hints.
+        browser_identity = (hardware['user_agent'].replace('HeadlessChrome/', 'Chrome/')
+                            if settings.get('fingerprint_backend') == 'javascript' and settings.get('fingerprint_navigator')
+                            and not settings.get('show_browser_window', False) else None)
         if account.get("session"):
             options["storage_state"] = account["session"]
         if proxy is None:
@@ -243,53 +284,89 @@ class Amazon:
             profile = self.profiles.get(account)
             suite_profile = await build_suite_profile(int(profile['seed'], 16), profile['locale'], self.browser.version)
             options.update(suite_profile['options'])
-        managed_workers = not native and not suite and (needs_profile_browser(settings) or bool(us_options))
+        managed_workers = not native and not suite and (needs_profile_browser(settings) or us_fingerprint.enabled(settings))
         if managed_workers and self.cdp_attached:
             raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment.')
         owned_browser = None
         worker_profiles = None
         worker_port = None
+        profile_directory = None
+        temporary_profile = None
+        launch = None
+        persistent = not settings.get('browser_incognito', True)
+        different_browser = self.browser_key != (settings.get('browser_identity', 'default'), settings.get('browser_channel', 'chromium'))
         if native:
-            # Launch switches apply process-wide: never share a seeded browser
-            # between accounts or retrofit it onto an already-running context.
-            seed = int(self.profiles.get(account)['seed'], 16) & 0xffffffff
-            owned_browser = await self.driver.chromium.launch(**native_launch_options(settings, seed))
-            self.profile_browsers.add(owned_browser)
-        elif managed_workers:
-            # The DevTools subscription belongs only to this account's process.
-            # It cannot initialize workers from another account or browser.
-            worker_port = debugging_port()
-            launch = {'headless': not settings.get('show_browser_window', True),
-                      'args': [f'--remote-debugging-port={worker_port}',
-                               '--remote-debugging-address=127.0.0.1']}
+            seed = int(profile['seed'], 16) & 0xffffffff
+            launch = native_launch_options({**settings, 'fingerprint_timezone': options.get('timezone_id', settings['fingerprint_timezone'])}, seed, values)
+        elif managed_workers or persistent or interactive or different_browser or custom_extensions:
+            launch = {'headless': not settings.get('show_browser_window', True), **identity_launch}
+        if launch is not None:
+            if 'executable_path' not in launch:
+                launch.setdefault('channel', 'chromium')
+            args = launch.setdefault('args', [])
             if us_options:
-                # WorkerNavigator uses process languages, while context locale
-                # affects documents. Set both natively for US profiles.
-                launch['args'] += ['--lang=en-US', '--accept-lang=en-US']
+                args += ['--lang=en-US', '--accept-lang=en-US']
             if browser_identity:
-                # A process switch covers service workers as well as page and
-                # dedicated-worker headers, without context UA emulation.
-                launch['args'].append('--user-agent=' + browser_identity)
-            if settings.get('browser_channel', 'chromium') != 'chromium':
-                launch['channel'] = settings['browser_channel']
-            owned_browser = await self.driver.chromium.launch(**launch)
-            self.profile_browsers.add(owned_browser)
-        elif interactive and not self.cdp_attached:
-            launch = {'headless': False}
-            if settings.get('browser_channel', 'chromium') != 'chromium':
-                launch['channel'] = settings['browser_channel']
-            owned_browser = await self.driver.chromium.launch(**launch)
-            self.profile_browsers.add(owned_browser)
+                args.append('--user-agent=' + browser_identity)
+            if managed_workers:
+                worker_port = debugging_port()
+                args += [f'--remote-debugging-port={worker_port}', '--remote-debugging-address=127.0.0.1']
+            if extensions:
+                args += ['--enable-unsafe-extension-debugging']
+                launch['ignore_default_args'] = ['--disable-extensions']
         try:
-            context = await (owned_browser or self.browser).new_context(**options)
+            if persistent:
+                if account.get('_fingerprint_test'):
+                    temporary_profile = tempfile.TemporaryDirectory(prefix='retail-fingerprint-')
+                    profile_directory = temporary_profile.name
+                else:
+                    identity_key = [account['id'], settings['fingerprint_backend'], settings['browser_identity'],
+                                    launch.get('channel'), launch.get('executable_path')]
+                    key = hashlib.sha256(json.dumps(identity_key).encode()).hexdigest()
+                    profile_directory = str(self.store.folder / 'browser-profiles' / key)
+                initialized = Path(profile_directory) / '.retail-state-initialized'
+                saved_state = options.pop('storage_state', None)
+                context = await self.driver.chromium.launch_persistent_context(profile_directory, **launch, **options)
+                owned_browser = context.browser
+                # Import an existing app session once. Replacing storage on every
+                # launch would erase newer cookies/data saved by normal browsing.
+                if saved_state and not initialized.exists():
+                    await context.set_storage_state(saved_state)
+                initialized.touch()
+            else:
+                if launch is not None:
+                    owned_browser = await self.driver.chromium.launch(**launch)
+                context = await (owned_browser or self.browser).new_context(**options)
+            if owned_browser:
+                self.profile_browsers.add(owned_browser)
+            if extensions:
+                extension_session = await (owned_browser or self.browser).new_browser_cdp_session()
+                try:
+                    if persistent:
+                        installed = await extension_session.send('Extensions.getExtensions')
+                        allowed = {str(Path(path).resolve()).casefold() for path in extensions}
+                        for item in installed['extensions']:
+                            if str(Path(item['path']).resolve()).casefold() not in allowed:
+                                await extension_session.send('Extensions.uninstall', {'id': item['id']})
+                    for path in extensions:
+                        await extension_session.send('Extensions.loadUnpacked', {'path': path, 'enableInIncognito': settings.get('browser_incognito', True)})
+                finally:
+                    await extension_session.detach()
         except BaseException:
             if owned_browser:
                 await owned_browser.close()
                 self.profile_browsers.discard(owned_browser)
+            if temporary_profile:
+                temporary_profile.cleanup()
             raise
 
         def release_context(_):
             self.context_accounts.pop(context, None)
+            if self.logins.get(account['id']) is context:
+                self.logins.pop(account['id'], None)
+                watcher = self.login_watchers.pop(account['id'], None)
+                if watcher and watcher is not asyncio.current_task():
+                    watcher.cancel()
             if owned_browser:
                 async def close_owned():
                     try:
@@ -300,6 +377,8 @@ class Amazon:
                             await owned_browser.close()
                         finally:
                             self.profile_browsers.discard(owned_browser)
+                            if temporary_profile:
+                                temporary_profile.cleanup()
                 task = asyncio.create_task(close_owned())
                 self.profile_close_tasks.add(task)
                 def finished(done):
@@ -333,7 +412,8 @@ class Amazon:
                     spoof_webgpu=not native and settings.get('fingerprint_webgpu', False),
                     spoof_audio=settings.get('fingerprint_audio', False),
                     spoof_navigator=not native and settings.get('fingerprint_navigator', False),
-                    restrict_fonts=not native and settings.get('fingerprint_fonts', False),
+                    profile_values=values,
+                    restrict_fonts=settings.get('fingerprint_fonts', False),
                     intercept_workers=not native and not managed_workers and settings.get('fingerprint_workers', False),
                 )
                 for script in scripts:
@@ -376,7 +456,7 @@ class Amazon:
                 raise ValueError('Close a fingerprint test browser before opening another (maximum 5).')
             await self.close_fingerprint_test(account['id'])
             clean_account = {key: value for key, value in account.items() if key not in ('session', 'session_storage')}
-            context = await self.context(clean_account, interactive=True)
+            context = await self.context({**clean_account, '_fingerprint_test': True}, interactive=True)
             self.fingerprint_tests[account['id']] = context
 
             def forget(_):
@@ -406,8 +486,13 @@ class Amazon:
 
     async def login(self, account):
         if account["id"] in self.logins:
-            await self.expose(self.logins[account["id"]].pages[0])
-            return
+            existing = self.logins[account['id']]
+            pages = [page for page in existing.pages if not page.is_closed()]
+            if pages and (not existing.browser or existing.browser.is_connected()):
+                await self.expose(pages[0])
+                return
+            self.logins.pop(account['id'], None)
+            await existing.close()
         limit = min(5, (self.store.get('settings', 'settings') or {}).get('max_running_tasks', 10))
         if len(self.logins) >= limit:
             raise ValueError('Too many account sign-ins are open. Finish or close another account session first.')
@@ -1199,6 +1284,8 @@ class Amazon:
             if self.driver:
                 await self.driver.stop()
             self.driver = self.browser = None
+            self.hardware = None
+            self.identity_hardware.clear()
             self.logins.clear()
             self.fingerprint_tests.clear()
             self.context_accounts.clear()

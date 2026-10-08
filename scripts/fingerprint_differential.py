@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import httpx
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
@@ -171,7 +172,7 @@ def zero_warning_failures(records, expected_runs):
                              'worker_profile_errors': row.get('worker_profile_errors', [])})
     return failures
 
-async def native_context(driver, folder, headed, backend='javascript', executable=''):
+async def native_context(driver, folder, headed, backend='javascript', executable='', debugging_port=0):
     chrome = Path('C:/Program Files/Google/Chrome/Application/chrome.exe')
     extra_args = []
     if backend == 'native':
@@ -180,17 +181,25 @@ async def native_context(driver, folder, headed, backend='javascript', executabl
         extra_args = options['args']
     profile = folder / 'native-profile'
     profile.mkdir()
-    args = [str(chrome), f'--user-data-dir={profile.resolve()}', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', *extra_args]
+    args = [str(chrome), f'--user-data-dir={profile.resolve()}', f'--remote-debugging-port={debugging_port}', '--no-first-run', '--no-default-browser-check', *extra_args]
     if not headed:
         args.append('--headless=new')
     process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         port_file = profile / 'DevToolsActivePort'
         for _ in range(100):
+            if debugging_port:
+                try:
+                    async with httpx.AsyncClient(trust_env=False, timeout=1) as client:
+                        response = await client.get(f'http://127.0.0.1:{debugging_port}/json/version')
+                        if response.status_code == 200:
+                            break
+                except httpx.HTTPError:
+                    pass
             if port_file.exists():
                 break
             await asyncio.sleep(.1)
-        port = port_file.read_text().splitlines()[0]
+        port = debugging_port or port_file.read_text().splitlines()[0]
         browser = await driver.chromium.connect_over_cdp(f'http://127.0.0.1:{port}')
         return browser, browser.contexts[0], process
     except BaseException:

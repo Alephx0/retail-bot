@@ -65,4 +65,5 @@ body.settings-open #toast{top:85px;bottom:auto;pointer-events:none}
 .fingerprint-site-row input { width: 100%; min-width: 0; }
 .fingerprint-site-row label { min-width: 0; }
 .account-fingerprint-fields { margin: 16px 0; }
+.fingerprint-value { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 380px; }
 @media (max-width: 600px) { .fingerprint-site-row { grid-template-columns: 1fr; } }

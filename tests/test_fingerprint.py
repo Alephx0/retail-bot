@@ -488,12 +488,14 @@ def test_transparent_perturbation_and_native_readback_semantics(tmp_path):
             context = await adapter.browser.new_context()
             page = await context.new_page()
             result = await page.evaluate('''script => {
+                // Pin the raster backend: native Chromium can switch GPU -> CPU
+                // after its first read, changing rounding even with no hooks.
                 const nativeRead = CanvasRenderingContext2D.prototype.getImageData;
                 const nativeGradient = CanvasRenderingContext2D.prototype.createLinearGradient;
                 (0, eval)(script);
                 const canvas = document.createElement('canvas');
                 canvas.width = 128; canvas.height = 64;
-                const ctx = canvas.getContext('2d');
+                const ctx = canvas.getContext('2d', {willReadFrequently:true});
                 const gradient = ctx.createLinearGradient(0, 0, 128, 64);
                 gradient.addColorStop(0, 'rgba(230, 180, 140, 0.3)');
                 gradient.addColorStop(1, 'rgba(30, 50, 90, 0.8)');
@@ -501,7 +503,7 @@ def test_transparent_perturbation_and_native_readback_semantics(tmp_path):
                 ctx.fillRect(8, 8, 112, 48);
                 const reference = document.createElement('canvas');
                 reference.width = 128; reference.height = 64;
-                const referenceContext = reference.getContext('2d');
+                const referenceContext = reference.getContext('2d', {willReadFrequently:true});
                 const referenceGradient = nativeGradient.call(referenceContext, 0, 0, 128, 64);
                 referenceGradient.addColorStop(0, 'rgba(230, 180, 140, 0.3)');
                 referenceGradient.addColorStop(1, 'rgba(30, 50, 90, 0.8)');

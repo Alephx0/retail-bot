@@ -119,7 +119,7 @@ document.addEventListener('submit',async event=>{
     if(kind==='accounts'&&accountMode==='mass'){await api('account-batches/create','POST',{retailer:data.retailer,text:data.mass_text,folder_id:data.folder_id});}
     else {
       if(kind==='accounts'){
-        data.fingerprint_overrides=collectAccountFingerprint(form);
+        data.fingerprint_overrides=collectAccountFingerprint(form);Object.assign(data,collectGeneratedFingerprint(form));
         for(const [key] of accountFingerprintOptions)delete data['account_'+key];
         data.purchase_cooldown_days=Number(data.purchase_cooldown_days||0);
         data.name=data.email;data.account_type=data.business?'business':'personal';delete data.business;delete data.mass_text;

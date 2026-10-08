@@ -76,6 +76,28 @@ class FingerprintOverrides(BaseModel):
     fingerprint_screen: bool | None = None
     fingerprint_proxy_location: bool | None = None
     fingerprint_timezone: Literal['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu'] | None = None
+    browser_incognito: bool | None = None
+    browser_identity: Literal['default', 'chrome', 'msedge', 'brave', 'opera'] | None = None
+    browser_extension_ids: list[str] | None = Field(default=None, max_length=20)
+
+
+class FingerprintValues(BaseModel):
+    model_config = {'extra': 'forbid'}
+    cpu: Literal['auto', 'native', '2', '4', '8', '12', '16'] = 'auto'
+    memory: Literal['auto', 'native', '8', '16', '32'] = 'auto'
+    screen: Literal['auto', '1366x768@1', '1440x900@1', '1536x864@1.25', '1600x900@1', '1920x1080@1', '2048x1152@1.25', '2560x1440@1'] = 'auto'
+    gpu: Literal['auto', 'native', 'family-0', 'family-1', 'family-2', 'family-3'] = 'auto'
+    fonts: Literal['auto', 'native', 'core', 'office'] = 'auto'
+    canvas_noise: Literal['subtle', 'standard'] = 'standard'
+    webgl_noise: Literal['off', 'subtle', 'standard'] = 'standard'
+    webgpu_limits: Literal['native', 'compatible'] = 'compatible'
+
+
+class BrowserExtension(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    path: str = Field(min_length=1, max_length=2000)
+    catalog_id: str = ''
+    random_eligible: bool = True
 
 
 class FingerprintTestSite(BaseModel):
@@ -122,6 +144,8 @@ class Account(BaseModel):
     account_type: Literal["personal", "business"] = "personal"
     purchase_cooldown_days: Literal[0, 2, 3, 4, 5, 6, 7] = 0
     fingerprint_overrides: FingerprintOverrides = Field(default_factory=FingerprintOverrides)
+    fingerprint_values: FingerprintValues = Field(default_factory=FingerprintValues)
+    fingerprint_seed: str = Field(default='', pattern=r'^(?:[0-9a-f]{32}|[0-9a-f]{64})?$')
 
     _retailer = field_validator("retailer")(retailer_id)
 
@@ -288,6 +312,12 @@ class Settings(BaseModel):
     fingerprint_timezone: Literal['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu'] = 'America/New_York'
     fingerprint_backend: Literal['javascript', 'native', 'fingerprint-suite'] = 'javascript'
     native_browser_executable: str = ''
+    browser_incognito: bool = True
+    browser_identity: Literal['default', 'chrome', 'msedge', 'brave', 'opera'] = 'default'
+    browser_extension_ids: list[str] = Field(default_factory=list, max_length=20)
+    random_account_extensions: bool = True
+    brave_executable: str = ''
+    opera_executable: str = ''
     fingerprint_test_sites: list[FingerprintTestSite] = Field(default_factory=lambda: [
         FingerprintTestSite(name='CreepJS', url='https://abrahamjuliot.github.io/creepjs/'),
         FingerprintTestSite(name='Google', url='https://www.google.com/'),
@@ -295,6 +325,10 @@ class Settings(BaseModel):
 
     @model_validator(mode='after')
     def profile_browser_connection(self):
+        if self.cdp_attach and (not self.browser_incognito or self.browser_extension_ids):
+            raise ValueError('Normal profiles and managed extensions require an app-managed browser')
+        if self.fingerprint_backend == 'native' and self.browser_identity not in ('default', 'chrome'):
+            raise ValueError('Choose JavaScript compatibility mode for genuine Edge, Brave or Opera identities')
         if self.fingerprint_backend == 'fingerprint-suite':
             if self.cdp_attach:
                 raise ValueError('Fingerprint-suite requires an app-managed browser')

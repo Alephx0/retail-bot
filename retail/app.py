@@ -22,13 +22,15 @@ from .models import ResourceFolder
 from .recovery import diagnose, validate_candidate
 from .browser_bridge import inspect_session
 from .proxy_pool import ProxyPool
-from .models import AIConnection, account_fingerprint_settings
+from .models import AIConnection, account_fingerprint_settings, BrowserExtension
+from .browser_runtime import browser_options as identity_browser_options, extension_paths, validate_extension_path, CATALOG
+from .fingerprint_profiles import generated, inspect_hardware, gpu_choices, FONT_SETS
 from .ai_provider import AIProvider, ProviderError
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = {"accounts": Account, "groups": Group, "proxies": ProxyList, "tasks": Task, "settings": Settings,
           "folders": ResourceFolder, "profiles": Profile, "mailboxes": Mailbox, "solvers": Solver, "input_lists": InputList,
-          "ai_connections": AIConnection}
+          "ai_connections": AIConnection, "browser_extensions": BrowserExtension}
 
 
 def create_app(data_dir=None):
@@ -77,6 +79,17 @@ def create_app(data_dir=None):
         if result is None:
             raise HTTPException(404, "Record not found")
         return result
+
+    def assign_account_extensions(record):
+        import secrets
+        settings = store().get('settings', 'settings') or {}
+        overrides = record.get('fingerprint_overrides', {})
+        if (settings.get('random_account_extensions', True) and overrides.get('browser_extension_ids') is None):
+            candidates = [item['id'] for item in store().all('browser_extensions') if item.get('random_eligible', True)]
+            if candidates:
+                picked = secrets.SystemRandom().sample(candidates, secrets.randbelow(min(3, len(candidates)))+1)
+                record['fingerprint_overrides'] = {**overrides, 'browser_extension_ids': picked}
+        return record
 
     def validate_task(valid, id=None):
         group = require("groups", valid["group_id"])
@@ -127,6 +140,7 @@ def create_app(data_dir=None):
         result["events"] = store().all("events")[-150:][::-1]
         result["active"] = list(app.state.engine.jobs)
         result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
+        result['extension_catalog'] = CATALOG
         result['settings'] = [public('settings', {**Settings().model_dump(), **(store().get('settings', 'settings') or {})})]
         result["retailers"] = catalog()
         result["memberships"] = [{"folder_id":f["id"],"resource_id":i} for f in store().all("folders") for i in app.state.resources.members(f["id"])]
@@ -169,7 +183,7 @@ def create_app(data_dir=None):
                 require('ai_connections', merged['ai_connection_id'])
             if merged.get('agent_mode', 'off') != 'off' and not merged.get('ai_connection_id'):
                 raise HTTPException(422, 'Select an AI connection before enabling the browser agent')
-            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('cdp_attach','cdp_endpoint','browser_channel','show_browser_window','fingerprint_backend','native_browser_executable','agent_mode','ai_connection_id','max_running_tasks')):
+            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('cdp_attach','cdp_endpoint','browser_channel','show_browser_window','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id','max_running_tasks')):
                 raise HTTPException(409, 'Stop running tasks before changing browser or AI connections')
         if kind == "groups" and not id and "delay_ms" not in data:
             merged["delay_ms"] = (store().get("settings", "settings") or {}).get("default_monitor_delay", 4500)
@@ -198,6 +212,14 @@ def create_app(data_dir=None):
         if kind == "input_lists" and id and any(g.get("input_list_id") == id and any(t["group_id"] == g["id"] and t["id"] in app.state.engine.jobs for t in store().all("tasks")) for g in store().all("groups")):
             raise HTTPException(409, "Stop tasks using this input list before editing")
         if kind == "accounts":
+            if not id:
+                assign_account_extensions(valid)
+            effective = account_fingerprint_settings(store().get('settings', 'settings') or {}, valid)
+            try:
+                identity_browser_options(effective)
+                extension_paths(store(), effective['browser_extension_ids'])
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
             for field, target in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("proxy_list_id", "proxies")]:
                 if valid[field]:
                     require(target, valid[field])
@@ -230,13 +252,24 @@ def create_app(data_dir=None):
         if kind == 'ai_connections' and any(valid.get(key) != old.get(key) for key in ('api_key', 'model', 'provider', 'protocol', 'base_url')):
             old.pop('health', None)
             old.pop('browser_health', None)
+        if kind == 'settings':
+            try:
+                identity_browser_options(valid)
+                extension_paths(store(), valid['browser_extension_ids'])
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
+        if kind == 'browser_extensions':
+            try:
+                valid['path'] = str(validate_extension_path(valid['path']))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
         result = store().put(kind, {**old, **valid}, id)
         if kind == 'settings' and result.get('max_running_tasks') != old.get('max_running_tasks'):
             app.state.engine.browser_slots = asyncio.Semaphore(result['max_running_tasks'])
         if folder_id:
             app.state.resources.add(folder_id, [result["id"]])
         if kind=="proxies": app.state.proxy_pool.sync()
-        if kind == 'settings' and any(result.get(k) != old.get(k) for k in ('cdp_attach', 'cdp_endpoint', 'browser_channel', 'show_browser_window', 'fingerprint_backend', 'native_browser_executable')):
+        if kind == 'settings' and any(result.get(k) != old.get(k) for k in ('cdp_attach', 'cdp_endpoint', 'browser_channel', 'show_browser_window', 'fingerprint_backend', 'native_browser_executable', 'browser_incognito', 'browser_identity', 'brave_executable', 'opera_executable', 'browser_extension_ids')):
             if not app.state.engine.jobs:
                 await app.state.engine.amazon.close()
         return public(kind, result)
@@ -266,6 +299,14 @@ def create_app(data_dir=None):
             await app.state.engine.amazon.logins.pop(id).close()
         if kind == 'accounts':
             await app.state.engine.amazon.close_fingerprint_test(id)
+        if kind == 'browser_extensions':
+            settings = store().get('settings', 'settings') or {}
+            if id in settings.get('browser_extension_ids', []):
+                store().put('settings', {**settings, 'browser_extension_ids': [key for key in settings['browser_extension_ids'] if key != id]}, 'settings')
+            for account in store().all('accounts'):
+                overrides = account.get('fingerprint_overrides', {})
+                if id in (overrides.get('browser_extension_ids') or []):
+                    store().put('accounts', {**account, 'fingerprint_overrides': {**overrides, 'browser_extension_ids': [key for key in overrides['browser_extension_ids'] if key != id]}})
         app.state.resources.cleanup(kind, id)
         store().delete(kind, id)
         return {"ok": True}
@@ -427,6 +468,7 @@ def create_app(data_dir=None):
             raise HTTPException(422, "Import validation failed. No records were imported; check the required fields.")
         if kind == "accounts":
             for value in records:
+                assign_account_extensions(value)
                 for field, collection in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("proxy_list_id", "proxies")]:
                     if value.get(field):
                         require(collection, value[field])
@@ -453,7 +495,7 @@ def create_app(data_dir=None):
                                  totp_secret=parts[2] if len(parts)>2 else "", cvv=parts[3] if len(parts)>3 else "").model_dump(mode="json")
             except ValidationError:
                 raise HTTPException(422, f"Line {index}: invalid account, proxy, authenticator secret or CVV. Nothing imported.")
-            records.append(record)
+            records.append(assign_account_extensions(record))
         folder_id=body.get("folder_id")
         if folder_id and require("folders",folder_id)["resource_kind"]!="accounts": raise HTTPException(422,"Choose an account folder")
         created=store().put_many("accounts",records)
@@ -650,6 +692,56 @@ def create_app(data_dir=None):
             {'id': 'chrome', 'label': 'Chrome', 'available': installed('Google/Chrome/Application/chrome.exe', ['google-chrome', 'google-chrome-stable'])},
             {'id': 'msedge', 'label': 'Edge', 'available': installed('Microsoft/Edge/Application/msedge.exe', ['microsoft-edge', 'microsoft-edge-stable'])},
         ]
+
+    @app.post('/api/browser-extensions/install/{catalog_id}')
+    async def install_browser_extension(catalog_id: str):
+        from .extension_catalog import install
+        item = next((item for item in CATALOG if item['id'] == catalog_id), None)
+        if item is None:
+            raise HTTPException(404, 'Unknown extension')
+        existing = next((item for item in store().all('browser_extensions') if item.get('catalog_id') == catalog_id), None)
+        if existing:
+            return existing
+        try:
+            path = await install(store().folder, catalog_id)
+            return store().put('browser_extensions', BrowserExtension(name=item['name'], path=path, catalog_id=catalog_id).model_dump())
+        except Exception:
+            raise HTTPException(409, 'Could not download and verify this extension from the Chrome Web Store. You can add an unpacked copy instead.')
+
+    @app.post('/api/fingerprints/preview')
+    async def preview_fingerprint(request: Request):
+        import hashlib
+        from patchright.async_api import async_playwright
+        from .native_fingerprint import launch_options
+        try:
+            data = await request.json()
+            account = Account.model_validate({'name': 'Preview', **data}).model_dump()
+            settings = account_fingerprint_settings(store().get('settings', 'settings') or {}, account)
+            if settings['fingerprint_backend'] == 'fingerprint-suite':
+                raise ValueError('Fingerprint-suite manages its complete profile; custom presets apply to JavaScript and Native Chromium only.')
+            identity = identity_browser_options(settings)
+            async with async_playwright() as driver:
+                launch = launch_options(settings) if settings['fingerprint_backend'] == 'native' else identity
+                browser = await driver.chromium.launch(**{**launch, 'headless': True})
+                try:
+                    hardware = await inspect_hardware(browser)
+                    key = data.get('id', 'new-account')
+                    seed = account['fingerprint_seed'] or hashlib.sha256(('retail-profile-v1/'+key).encode()).hexdigest()
+                    values = generated({'seed': seed}, account['fingerprint_values'], hardware)
+                    if settings['fingerprint_backend'] == 'native':
+                        values['webgpu_limits'] = 'native'
+                    return {'seed': seed, 'generated': values, 'hardware': hardware,
+                            'gpu_choices': gpu_choices(hardware['renderer']), 'settings': {
+                                key: value for key, value in settings.items() if key.startswith('fingerprint_') or key in ('browser_identity','browser_incognito')},
+                            'font_sets': FONT_SETS}
+                finally:
+                    await browser.close()
+        except ValidationError as exc:
+            raise HTTPException(422, '; '.join(error['msg'] for error in exc.errors()))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        except Exception:
+            raise HTTPException(409, 'Could not inspect this browser. Check its installation and executable path.')
 
     @app.post('/api/settings/test-discord')
     async def test_discord():

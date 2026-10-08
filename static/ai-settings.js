@@ -2,6 +2,7 @@
 function legacyProfileSettings(s) {
   return '<details><summary>Fingerprint profiles</summary>' +
     select('fingerprint_backend', 'Profile implementation', [['javascript','JavaScript compatibility mode'],['native','Native Chromium profiles'],['fingerprint-suite','Apify fingerprint-suite (experimental)']], s.fingerprint_backend || 'javascript') +
+    browserProfileSettings(s) +
     input('native_browser_executable', 'Native browser executable (blank uses installed build)', s.native_browser_executable || '') +
     '<p class="help">JavaScript graphics profiles keep GPU aliases within the hardware family and retain real WebGL capabilities. Workers initialize automatically. Each account uses a separate browser process, which uses more memory and requires an app-managed browser.</p>' +
     '<p class="help">Native profiles require the separately installed browser build. GPU identity is shared across WebGL, WebGPU and workers when either GPU option is enabled. Each active graphics profile uses its own browser process. This third-party build disables Safe Browsing.</p>' +
@@ -16,7 +17,7 @@ function legacyProfileSettings(s) {
     check('fingerprint_screen', 'Vary desktop screen resolution and scaling by account', s.fingerprint_screen ?? false) +
     check('fingerprint_proxy_location', 'Match US profile location to the selected proxy', s.fingerprint_proxy_location ?? true) +
     select('fingerprint_timezone', 'US profile timezone', [['America/New_York','Eastern'],['America/Chicago','Central'],['America/Denver','Mountain'],['America/Los_Angeles','Pacific'],['America/Phoenix','Arizona'],['America/Anchorage','Alaska'],['Pacific/Honolulu','Hawaii']], s.fingerprint_timezone || 'America/New_York') +
-    '<p class="help">The font, navigator and screen options apply to JavaScript profiles for US accounts. They use en-US. Proxy matching checks ipwho.is through the selected proxy before opening the account browser, then verifies the exit again. It sets the reported timezone and approximate location without granting site location permission. Use a sticky US proxy session: lookup failures, non-US exits and changes during setup stop the session. Without a proxy, or with matching off, the selected timezone applies.</p>' +
+    '<p class="help">The font, navigator and screen options apply to JavaScript and Native profiles for US accounts. They use en-US. Proxy matching checks ipwho.is through the selected proxy before opening the account browser, then verifies the exit again. It sets the reported timezone and approximate location without granting site location permission. Use a sticky US proxy session: lookup failures, non-US exits and changes during setup stop the session. Without a proxy, or with matching off, the selected timezone applies.</p>' +
     '<p class="help">Values repeat for each account. Navigator profiles use the installed browser version and operating system, with Chrome identity in place of the HeadlessChrome marker across the account browser process; window mode is controlled separately. Font filtering respects site permission and does not hide fonts inferred from rendering. Screen and font choices are independent of the proxy city.</p>' +
     '</details>';
 }
@@ -25,12 +26,12 @@ function syncFingerprintBackendFields(root) {
   const mode = root.querySelector('[name="fingerprint_backend"]')?.value;
   for (const name of ['canvas','webgl','webgpu','audio','workers','fonts','navigator','screen']) {
     const input = root.querySelector(`[name="fingerprint_${name}"]`);
-    if (input) input.disabled = mode === 'fingerprint-suite' || (mode === 'native' && ['fonts','navigator','screen'].includes(name));
+    if (input) input.disabled = mode === 'fingerprint-suite';
   }
   const timezone = root.querySelector('[name="fingerprint_timezone"]');
-  if (timezone) timezone.disabled = mode !== 'javascript';
+  if (timezone) timezone.disabled = mode === 'fingerprint-suite';
   const proxyLocation = root.querySelector('[name="fingerprint_proxy_location"]');
-  if (proxyLocation) proxyLocation.disabled = mode !== 'javascript';
+  if (proxyLocation) proxyLocation.disabled = mode === 'fingerprint-suite';
 }
 function editAIConnection(id) {
   const value = (state.ai_connections || []).find(c => c.id === id) || {};

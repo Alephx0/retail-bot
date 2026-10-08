@@ -8,24 +8,24 @@ Design rules:
 
   - Transformations are explicit opt-ins, independent of browser launch mode.
     Either GPU flag enables coherent identity policy across both GPU APIs.
-    WebGL readback and WebGPU feature/limit policies retain separate flags.
+    WebGL drawing and WebGPU feature/limit policies retain separate flags.
   - Canvas perturbation changes gradient coordinates and Bezier control
     points during drawing. Readback, copying and export methods stay native
     and observe one bitmap. Exact pixel writes, analytic primitives, path
     endpoints, text metrics and non-primitive argument coercions stay native.
     Seeded drawing offsets replace the legacy canvas readback algorithm.
-  - WebGL pixel perturbation is content-keyed, never read-size-keyed.
-    A neighbour-based heuristic selects candidate blended/edge pixels; it
-    cannot distinguish every explicitly painted pixel from rasterized output.
-    The byte, half-float, and float paths use
-    the same eligibility predicate: neighbour-inequality on the full RGBA
-    tuple, alpha range check, premultiplied colour range check, and
-    horizontal-or-vertical boundary handling.
+  - WebGL varies interpolated fragment colors during rendering, preserving
+    native readPixels, PBO reads, texture copies and canvas exports. Analytic
+    shaders, texture samples, vertex shaders, integer outputs, multiple targets
+    and complex preprocessor programs are not rewritten. This is a limited
+    drawing policy, not arbitrary GPU or shader emulation.
   - WebGL renderer aliases stay within the observed hardware family. Vendor,
     capabilities, extensions and shader precision remain native. Unknown and
     mobile families retain native identity. This does not emulate another GPU.
   - WebGPU vendor/architecture remain genuine; device/description are redacted
-    when either GPU flag is enabled. Adapters, devices, info, limits, and feature
+    when either GPU flag is enabled, unless both GPU identity and capability
+    policy are native (in which case the API remains untouched).
+    Adapters, devices, info, limits, and feature
     sets remain genuine platform objects; their prototype accessors apply
     the selected policy without replacing native receiver identities.
     Subgroup sizes and isFallbackAdapter read through to the native object,
@@ -44,13 +44,9 @@ Design rules:
     remain JavaScript wrappers and do not establish native equivalence.
   - WebGL extensions enable the real implementation and are not filtered.
     WebGPU advertised features are restricted to natively supported features.
-  - Full-frame and (0,0) reads are perturbed. The padded region is clipped
-    to the framebuffer; missing neighbours simply do not enter the hash.
-  - WebGL2 readPixels dstOffset is supported via a subarray view.
-  - OffscreenCanvas transfers and both byte/float 2D readbacks use the
-    unmodified platform implementation on the transformed bitmap.
-  - The readPixels pack-state guard reads native getParameter (captured
-    before hooking) and fails closed.
+  - All pixel readback formats and pack states use the native implementation.
+    Shader-source queries retain the source the caller submitted, while the
+    engine compiles the drawing transform. Modified APIs still expose wrappers.
   - Same-origin classic, module, and data: workers created through the
     wrapped constructors receive the bootstrap before their own entrypoint.
     The application instead uses WorkerProfiles for graphics contexts, covering
@@ -67,12 +63,13 @@ Design rules:
 Not implemented by this script alone: service-worker interception and workers
 outside wrapped constructors. Not implemented by either integration:
 native-level (non-JS) hook concealment, deep emulation of
-native GPU rasterization/shader semantics, depth/stencil readback
-perturbation, PBO-offset readback perturbation, non-tight pack-state
-emulation, WebGPU device-level readback perturbation, native callable
+native GPU rasterization/shader semantics, WebGPU device-level readback perturbation, native callable
 identity for modified methods/accessors, and timing side channels.
 """
 from __future__ import annotations
+
+import json
+from .fingerprint_profiles import GPU_DEVICE_IDS
 
 
 CANVAS_JS_TEMPLATE = r"""
@@ -92,7 +89,8 @@ CANVAS_JS_TEMPLATE = r"""
     const ENABLE_WORKERS  = __ENABLE_WORKERS__;
     const ENABLE_NAVIGATOR = __ENABLE_NAVIGATOR__;
     const ENABLE_FONTS = __ENABLE_FONTS__;
-    const ENABLE_FLOATGL  = __ENABLE_FLOATGL__;
+    const PROFILE_VALUES = __PROFILE_VALUES__;
+    const GPU_DEVICE_IDS = __GPU_DEVICE_IDS__;
 
     const win = globalThis;
     const _gopd = Object.getOwnPropertyDescriptor;
@@ -114,227 +112,6 @@ CANVAS_JS_TEMPLATE = r"""
       h = Math.imul(h ^ (h >>> 15), 0x846ca68b);
       return (h ^ (h >>> 16)) | 0;
     };
-
-    const pack = (d, j) =>
-      (d[j] & 254) | ((d[j + 1] & 254) << 8) |
-      ((d[j + 2] & 254) << 16) | ((d[j + 3] & 254) << 24);
-
-    // U8 eligibility: neighbour pack differs from centre, alpha in range,
-    // premultiplied colour in range. Pack includes all four channels.
-    function blendedU8(d, i, a, b, me) {
-      if (pack(d, a) === me || pack(d, b) === me) return false;
-      const alpha = d[i + 3], pa = d[a + 3], qa = d[b + 3];
-      if (alpha < Math.min(pa, qa) || alpha > Math.max(pa, qa)) return false;
-      for (let c = 0; c < 3; c++) {
-        const v = (d[i + c] & 254) * alpha;
-        const p = (d[a + c] & 254) * pa, q = (d[b + c] & 254) * qa;
-        if (v < (p < q ? p : q) || v > (p > q ? p : q)) return false;
-      }
-      return true;
-    }
-
-    function noisify(d, stride, w, h, bx, by, tx, ty, tw, th, cw, ch, rate, flip) {
-      const thr = Math.max(0, Math.min(256, Math.floor(rate * 256)));
-      for (let y = ty; y < ty + th; y++) {
-        const Y = by + y;
-        if (Y < 0 || Y >= ch) continue;
-        for (let x = tx; x < tx + tw; x++) {
-          const X = bx + x;
-          if (X < 0 || X >= cw) continue;
-          const i = y * stride + x * 4;
-          if (d[i + 3] === 0) continue;
-          const me = pack(d, i);
-          const hasL = X > 0 && x > 0, hasR = X + 1 < cw && x + 1 < w;
-          const hasU = Y > 0 && y > 0, hasD = Y + 1 < ch && y + 1 < h;
-          if (!((hasL && hasR && blendedU8(d, i, i - 4, i + 4, me)) ||
-                (hasU && hasD && blendedU8(d, i, i - stride, i + stride, me)))) continue;
-          const hs = ((hasL ? pack(d, i - 4) : 0) + (hasR ? pack(d, i + 4) : 0)) | 0;
-          const vs = ((hasU ? pack(d, i - stride) : 0) + (hasD ? pack(d, i + stride) : 0)) | 0;
-          const k  = fin(fin(fin(SEED ^ me) ^ hs) ^ vs) >>> 0;
-          if ((k & 255) >= thr) continue;
-          const c   = ((k >>> 8) & 0xFFFF) % 3;
-          const bit = (k >>> 24) & 1;
-          d[i + c] = (d[i + c] & 254) | bit;
-          if (flip) flip(i + c, bit);
-        }
-      }
-    }
-
-    const F32B = new Float32Array(1);
-    const U32B = new Uint32Array(F32B.buffer);
-    const f2b = (v) => { F32B[0] = v; return U32B[0]; };
-    const b2f = (b) => { U32B[0] = b >>> 0; return F32B[0]; };
-    const f2q = (v) => { F32B[0] = v; return U32B[0] >>> 8; };
-    const maskF32Lsb = (v) => b2f(f2b(v) & 0xFFFFFFFE);
-
-    // F32 eligibility mirrors blendedU8. The neighbour-equals-centre test
-    // hashes RGBA (not just RGB), matching pack()'s four-channel inclusion.
-    function blendedF32(d, i, a, b, me) {
-      const qA = (f2q(d[a]) ^ Math.imul(f2q(d[a + 1]), 0x9E3779B1) ^
-                  Math.imul(f2q(d[a + 2]), 0x85EBCA6B) ^
-                  Math.imul(f2q(d[a + 3]), 0x27D4EB2F)) | 0;
-      const qB = (f2q(d[b]) ^ Math.imul(f2q(d[b + 1]), 0x9E3779B1) ^
-                  Math.imul(f2q(d[b + 2]), 0x85EBCA6B) ^
-                  Math.imul(f2q(d[b + 3]), 0x27D4EB2F)) | 0;
-      if (qA === me || qB === me) return false;
-      const alpha = d[i + 3], pa = d[a + 3], qa = d[b + 3];
-      if (alpha < Math.min(pa, qa) || alpha > Math.max(pa, qa)) return false;
-      for (let c = 0; c < 3; c++) {
-        const v = maskF32Lsb(d[i + c]) * alpha;
-        const p = maskF32Lsb(d[a + c]) * pa, q = maskF32Lsb(d[b + c]) * qa;
-        if (v < (p < q ? p : q) || v > (p > q ? p : q)) return false;
-      }
-      return true;
-    }
-
-    function noisifyF32(d, stride, w, h, bx, by, tx, ty, tw, th, cw, ch, rate, flip) {
-      const thr = Math.max(0, Math.min(256, Math.floor(rate * 256)));
-      for (let y = ty; y < ty + th; y++) {
-        const Y = by + y;
-        if (Y < 0 || Y >= ch) continue;
-        for (let x = tx; x < tx + tw; x++) {
-          const X = bx + x;
-          if (X < 0 || X >= cw) continue;
-          const i = y * stride + x * 4;
-          if (!(d[i + 3] > 0)) continue;
-          const hasL = X > 0 && x > 0, hasR = X + 1 < cw && x + 1 < w;
-          const hasU = Y > 0 && y > 0, hasD = Y + 1 < ch && y + 1 < h;
-          if (!((hasL && hasR) || (hasU && hasD))) continue;
-          const qR = f2q(d[i]), qG = f2q(d[i + 1]), qB = f2q(d[i + 2]), qA = f2q(d[i + 3]);
-          const me = (qR ^ Math.imul(qG, 0x9E3779B1) ^ Math.imul(qB, 0x85EBCA6B) ^
-                      Math.imul(qA, 0x27D4EB2F)) | 0;
-          let eligible = false;
-          if (hasL && hasR && blendedF32(d, i, i - 4, i + 4, me)) eligible = true;
-          if (!eligible && hasU && hasD && blendedF32(d, i, i - stride, i + stride, me)) eligible = true;
-          if (!eligible) continue;
-          const lR = hasL ? f2q(d[i - 4]) : 0;
-          const rR = hasR ? f2q(d[i + 4]) : 0;
-          const uR = hasU ? f2q(d[i - stride]) : 0;
-          const dR = hasD ? f2q(d[i + stride]) : 0;
-          const hs = (((lR + rR) | 0) ^ Math.imul((uR + dR) | 0, 0x27D4EB2F)) | 0;
-          const k  = fin(fin(fin(SEED ^ me) ^ hs) ^ 0) >>> 0;
-          if ((k & 255) >= thr) continue;
-          const c   = ((k >>> 8) & 0xFFFF) % 3;
-          const bit = (k >>> 24) & 1;
-          const j = i + c;
-          F32B[0] = d[j];
-          U32B[0] = U32B[0] ^ bit;
-          d[j] = F32B[0];
-          if (flip) flip(j, bit);
-        }
-      }
-    }
-
-    // Half-float unpack for the eligibility check.
-    function h2f(h) {
-      const s = (h & 0x8000) ? -1 : 1;
-      const e = (h & 0x7C00) >> 10;
-      const m = h & 0x03FF;
-      if (e === 0) return s * m * Math.pow(2, -24);
-      if (e === 31) return m ? NaN : s * Infinity;
-      return s * Math.pow(2, e - 15) * (1 + m / 1024);
-    }
-    const maskF16Lsb = (h) => h & 0xFFFE;
-
-    // F16 eligibility mirrors blendedU8. The neighbour-equals-centre test
-    // hashes RGBA, matching pack()'s four-channel inclusion.
-    function blendedF16(d, i, a, b, me) {
-      const aq0 = d[a] & 0xFFFE, aq1 = d[a + 1] & 0xFFFE,
-            aq2 = d[a + 2] & 0xFFFE, aq3 = d[a + 3] & 0xFFFE;
-      const bq0 = d[b] & 0xFFFE, bq1 = d[b + 1] & 0xFFFE,
-            bq2 = d[b + 2] & 0xFFFE, bq3 = d[b + 3] & 0xFFFE;
-      const aHash = (aq0 ^ Math.imul(aq1, 0x9E37) ^ Math.imul(aq2, 0x85EB) ^
-                     Math.imul(aq3, 0x27D4)) | 0;
-      const bHash = (bq0 ^ Math.imul(bq1, 0x9E37) ^ Math.imul(bq2, 0x85EB) ^
-                     Math.imul(bq3, 0x27D4)) | 0;
-      if (aHash === me || bHash === me) return false;
-      const alpha = h2f(d[i + 3]), pa = h2f(d[a + 3]), qa = h2f(d[b + 3]);
-      if (alpha < Math.min(pa, qa) || alpha > Math.max(pa, qa)) return false;
-      for (let c = 0; c < 3; c++) {
-        const v = h2f(maskF16Lsb(d[i + c])) * alpha;
-        const p = h2f(maskF16Lsb(d[a + c])) * pa;
-        const q = h2f(maskF16Lsb(d[b + c])) * qa;
-        if (v < (p < q ? p : q) || v > (p > q ? p : q)) return false;
-      }
-      return true;
-    }
-
-    function noisifyF16(d, stride, w, h, bx, by, tx, ty, tw, th, cw, ch, rate, flip) {
-      const thr = Math.max(0, Math.min(256, Math.floor(rate * 256)));
-      for (let y = ty; y < ty + th; y++) {
-        const Y = by + y;
-        if (Y < 0 || Y >= ch) continue;
-        for (let x = tx; x < tx + tw; x++) {
-          const X = bx + x;
-          if (X < 0 || X >= cw) continue;
-          const i = y * stride + x * 4;
-          if ((d[i + 3] & 0x7FFF) === 0) continue;
-          const hasL = X > 0 && x > 0, hasR = X + 1 < cw && x + 1 < w;
-          const hasU = Y > 0 && y > 0, hasD = Y + 1 < ch && y + 1 < h;
-          if (!((hasL && hasR) || (hasU && hasD))) continue;
-          const qR = d[i] & 0xFFFE, qG = d[i + 1] & 0xFFFE,
-                qB = d[i + 2] & 0xFFFE, qA = d[i + 3] & 0xFFFE;
-          const me = (qR ^ Math.imul(qG, 0x9E37) ^ Math.imul(qB, 0x85EB) ^
-                      Math.imul(qA, 0x27D4)) | 0;
-          let eligible = false;
-          if (hasL && hasR && blendedF16(d, i, i - 4, i + 4, me)) eligible = true;
-          if (!eligible && hasU && hasD && blendedF16(d, i, i - stride, i + stride, me)) eligible = true;
-          if (!eligible) continue;
-          const lR = hasL ? (d[i - 4] & 0xFFFE) : 0;
-          const rR = hasR ? (d[i + 4] & 0xFFFE) : 0;
-          const uR = hasU ? (d[i - stride] & 0xFFFE) : 0;
-          const dR = hasD ? (d[i + stride] & 0xFFFE) : 0;
-          const hs = (((lR + rR) | 0) ^ Math.imul((uR + dR) | 0, 0x27D4EB2F)) | 0;
-          const k  = fin(fin(fin(SEED ^ me) ^ hs) ^ 0) >>> 0;
-          if ((k & 255) >= thr) continue;
-          const c   = ((k >>> 8) & 0xFFFF) % 3;
-          const bit = (k >>> 24) & 1;
-          d[i + c] = (d[i + c] & 0xFFFE) | bit;
-          if (flip) flip(i + c, bit);
-        }
-      }
-    }
-
-    function noisifyInt(d, stride, w, h, bx, by, tx, ty, tw, th, cw, ch, rate, flip, mask) {
-      const thr = Math.max(0, Math.min(256, Math.floor(rate * 256)));
-      for (let y = ty; y < ty + th; y++) {
-        const Y = by + y;
-        if (Y < 0 || Y >= ch) continue;
-        for (let x = tx; x < tx + tw; x++) {
-          const X = bx + x;
-          if (X < 0 || X >= cw) continue;
-          const i = y * stride + x * 4;
-          if (d[i + 3] === 0) continue;
-          const hasL = X > 0 && x > 0, hasR = X + 1 < cw && x + 1 < w;
-          const hasU = Y > 0 && y > 0, hasD = Y + 1 < ch && y + 1 < h;
-          if (!((hasL && hasR) || (hasU && hasD))) continue;
-          let blend = false;
-          for (let c = 0; c < 4 && !blend; c++) {
-            if (hasL && hasR) {
-              const v = d[i + c] & mask;
-              const p = d[i - 4 + c] & mask, q = d[i + 4 + c] & mask;
-              if (v !== p && v !== q && ((p < v && v < q) || (q < v && v < p))) blend = true;
-            }
-            if (!blend && hasU && hasD) {
-              const v = d[i + c] & mask;
-              const p = d[i - stride + c] & mask, q = d[i + stride + c] & mask;
-              if (v !== p && v !== q && ((p < v && v < q) || (q < v && v < p))) blend = true;
-            }
-          }
-          if (!blend) continue;
-          const q0 = d[i] & mask, q1 = d[i + 1] & mask, q2 = d[i + 2] & mask;
-          const me = (q0 ^ Math.imul(q1, 0x9E3779B1) ^ Math.imul(q2, 0x85EBCA6B)) | 0;
-          const hs = (((hasL ? (d[i - 4] & mask) : 0) + (hasR ? (d[i + 4] & mask) : 0)) | 0) >>> 0;
-          const vs = (((hasU ? (d[i - stride] & mask) : 0) + (hasD ? (d[i + stride] & mask) : 0)) | 0) >>> 0;
-          const k = fin(fin(fin(SEED ^ me) ^ hs) ^ vs) >>> 0;
-          if ((k & 255) >= thr) continue;
-          const c   = ((k >>> 8) & 0xFFFF) % 3;
-          const bit = (k >>> 24) & 1;
-          d[i + c] = (d[i + c] & mask) | bit;
-          if (flip) flip(i + c, bit);
-        }
-      }
-    }
 
     /* ------------------------------------------------------------------ *
      * Hook infrastructure
@@ -490,14 +267,18 @@ CANVAS_JS_TEMPLATE = r"""
     ];
     function rendererAlias(native) {
       if (typeof native !== 'string' || /laptop|mobile|max-q/i.test(native)) return native;
+      if (PROFILE_VALUES.gpu) return PROFILE_VALUES.gpu;
       for (const [pattern, models] of RENDERER_FAMILIES) {
         const match = native.match(pattern);
         if (!match) continue;
         const choices = models.filter(model => model.toLowerCase() !== match[0].toLowerCase());
         const model = choices[(fin(SEED) >>> 0) % choices.length];
-        // A PCI device ID belongs to the original model, so do not pair it
-        // with the alias. Preserve ANGLE/backend and shader-model suffixes.
-        return native.replace(pattern, model).replace(/\s*\(0x[0-9a-f]+\)/ig, '');
+        // Preserve the renderer format with a verified model/device pair
+        // when available, never the physical device ID of a different model.
+        const alias = native.replace(pattern, model);
+        return GPU_DEVICE_IDS[model]
+          ? alias.replace(/\(0x[0-9a-f]+\)/ig, '(0x0000' + GPU_DEVICE_IDS[model] + ')')
+          : alias.replace(/\s*\(0x[0-9a-f]+\)/ig, '');
       }
       // Unknown families retain genuine identity rather than an invented
       // platform/vendor combination. Other enabled transforms still apply.
@@ -581,8 +362,6 @@ CANVAS_JS_TEMPLATE = r"""
       const gl2 = win.WebGL2RenderingContext;
       if (!gl1 && !gl2) return;
 
-      const nativeGetParam1 = gl1 ? gl1.prototype.getParameter : null;
-      const nativeGetParam2 = gl2 ? gl2.prototype.getParameter : null;
       const nativeExtensions1 = gl1 ? gl1.prototype.getSupportedExtensions : null;
       const nativeExtensions2 = gl2 ? gl2.prototype.getSupportedExtensions : null;
 
@@ -594,96 +373,73 @@ CANVAS_JS_TEMPLATE = r"""
         return pname === 0x9246 ? rendererAlias(native) : native;
       };
 
-      const readPixelsHandler = (t, self, args) => {
-        const x = args[0] | 0, y = args[1] | 0, w = args[2] | 0, h = args[3] | 0;
-        const format = args[4], type = args[5], pixels = args[6];
-        if (w <= 0 || h <= 0) return Reflect.apply(t, self, args);
-        if (!pixels || !ArrayBuffer.isView(pixels)) return Reflect.apply(t, self, args);
-        const dstOffset = (args.length >= 8 && Number.isFinite(args[7])) ? (args[7] | 0) : 0;
-        if (dstOffset < 0) return Reflect.apply(t, self, args);
-        if (pixels.length < dstOffset + w * h * 4) return Reflect.apply(t, self, args);
-        const destView = dstOffset ? pixels.subarray(dstOffset) : pixels;
-
-        const RGBA = self.RGBA, RGBA_INT = 0x8D99;
-        const U8 = self.UNSIGNED_BYTE, I8 = self.BYTE;
-        const U16 = self.UNSIGNED_SHORT, I16 = self.SHORT;
-        const U32 = self.UNSIGNED_INT, I32 = self.INT;
-        const F32 = self.FLOAT, F16 = self.HALF_FLOAT;
-
-        let strat = null;
-        if (format === RGBA) {
-          if (type === U8 && destView instanceof win.Uint8Array) strat = { kind: 'u8', Ctor: win.Uint8Array, mask: 254 };
-          else if (ENABLE_FLOATGL && type === F32 && destView instanceof win.Float32Array) strat = { kind: 'f32', Ctor: win.Float32Array };
-          else if (ENABLE_FLOATGL && type === F16 && destView instanceof win.Uint16Array) strat = { kind: 'f16', Ctor: win.Uint16Array, mask: 0xFFFE };
-        } else if (format === RGBA_INT) {
-          if (type === U8 && destView instanceof win.Uint8Array) strat = { kind: 'int', Ctor: win.Uint8Array, mask: 254 };
-          else if (type === I8 && destView instanceof win.Int8Array) strat = { kind: 'int', Ctor: win.Int8Array, mask: 254 };
-          else if (type === U16 && destView instanceof win.Uint16Array) strat = { kind: 'int', Ctor: win.Uint16Array, mask: 0xFFFE };
-          else if (type === I16 && destView instanceof win.Int16Array) strat = { kind: 'int', Ctor: win.Int16Array, mask: 0xFFFE };
-          else if (type === U32 && destView instanceof win.Uint32Array) strat = { kind: 'int', Ctor: win.Uint32Array, mask: 0xFFFFFFFE };
-          else if (type === I32 && destView instanceof win.Int32Array) strat = { kind: 'int', Ctor: win.Int32Array, mask: 0xFFFFFFFE };
-        }
-        if (!strat) return Reflect.apply(t, self, args);
-
-        const isGL2 = !!(gl2 && self instanceof gl2);
-        const nativeGetParam = isGL2 ? nativeGetParam2 : nativeGetParam1;
-        if (!nativeGetParam) return Reflect.apply(t, self, args);
-        try {
-          const align = Reflect.apply(nativeGetParam, self, [0x0D05]);
-          if (typeof align !== 'number' || (align !== 4 && align !== 1)) return Reflect.apply(t, self, args);
-          if (isGL2) {
-            const rowLen = Reflect.apply(nativeGetParam, self, [0x0D02]);
-            const skipRows = Reflect.apply(nativeGetParam, self, [0x0D03]);
-            const skipPx = Reflect.apply(nativeGetParam, self, [0x0D04]);
-            if (typeof rowLen !== 'number' || typeof skipRows !== 'number' || typeof skipPx !== 'number') return Reflect.apply(t, self, args);
-            if (rowLen !== 0 || skipRows !== 0 || skipPx !== 0) return Reflect.apply(t, self, args);
+      // Perturb the rendered color, not readback bytes. Every read path (PBO,
+      // float, crop, copy and canvas export) then observes the same framebuffer.
+      // Restrict rewriting to simple fragment shaders; complex preprocessors,
+      // multiple render targets, integer outputs and vertex shaders pass through.
+      function rewriteFragment(source) {
+        const code = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, match => match.replace(/[^\r\n]/g, ' '));
+        if (/^\s*#\s*(?!version\b|extension\b|line\b)\w+/m.test(code)) return null;
+        if (!/\bvarying\b/.test(code) && !/\bin\s+(?:(?:lowp|mediump|highp)\s+)?vec[234]\b/.test(code)) return null;
+        // Texture copies and shaders using only analytic expressions have no
+        // interpolated-color surface to vary. Preserve their exact results.
+        if (/\btexture\w*\s*\(/.test(code)) return null;
+        let output = 'gl_FragColor';
+        if (/^\s*#\s*version\s+300\b/m.test(code)) {
+          const outputs = [...code.matchAll(/\bout\s+(?:(?:lowp|mediump|highp)\s+)?vec4\s+(\w+)\s*;/g)];
+          if (outputs.length !== 1 || (code.match(/\bout\b/g) || []).length !== 1) return null;
+          output = outputs[0][1];
+        } else if (/\bgl_FragData\b/.test(code) || !/\bgl_FragColor\b/.test(code)) return null;
+        const mains = [...code.matchAll(/\bvoid\s+(main)\s*\(\s*(?:void\s*)?\)\s*\{/g)];
+        if (mains.length !== 1) return null;
+        const name = 'retail_profile_main_' + (SEED >>> 0);
+        if (code.includes(name)) return null;
+        const start = mains[0].index + mains[0][0].indexOf('main');
+        const delta = [0x18273,0x82731,0x73182].map(salt =>
+          ((((fin(SEED ^ salt) >>> 0) / 4294967296) - .5) * GL_NOISE_RATE / 16).toFixed(10));
+        return source.slice(0,start) + name + source.slice(start+4) +
+          '\nvoid main(){' + name + '();' +
+          'if(all(greaterThan(' + output + '.rgb,vec3(0.0)))&&all(lessThan(' + output + '.rgb,vec3(1.0)))){' +
+          output + '.rgb+=vec3(' + delta.join(',') + ')*' + output + '.rgb*(vec3(1.0)-' + output + '.rgb);}}\n';
+      }
+      function installShaderVariation(proto) {
+        const getShaderParameter = proto.getShaderParameter;
+        const getShaderSource = proto.getShaderSource;
+        const shaderSource = proto.shaderSource;
+        hook(proto, 'compileShader', (t,self,args) => {
+          // Compile the caller's source first: native validation, errors and
+          // original shader failures must retain their normal behavior.
+          const result = Reflect.apply(t,self,args);
+          const [shader] = args;
+          if (!shader || typeof shader !== 'object') return result;
+          if (Reflect.apply(getShaderParameter,self,[shader,0x8B4F]) !== 0x8B30 ||
+              !Reflect.apply(getShaderParameter,self,[shader,0x8B81])) return result;
+          const source = Reflect.apply(getShaderSource,self,[shader]);
+          if (typeof source !== 'string') return result;
+          const changed = rewriteFragment(source);
+          if (changed === null) return result;
+          Reflect.apply(shaderSource,self,[shader,changed]);
+          let compiled = false;
+          try {
+            Reflect.apply(t,self,args);
+            compiled = !!Reflect.apply(getShaderParameter,self,[shader,0x8B81]);
+          } finally {
+            // glShaderSource stores text without replacing the compiled shader.
+            // Keep source queries and later caller edits entirely native.
+            Reflect.apply(shaderSource,self,[shader,source]);
           }
-        } catch (e) { return Reflect.apply(t, self, args); }
-
-        const ret = Reflect.apply(t, self, args);
-        const bw = self.drawingBufferWidth | 0, bh = self.drawingBufferHeight | 0;
-        const px0 = Math.max(0, x - 1), py0 = Math.max(0, y - 1);
-        const px1 = Math.min(bw, x + w + 1), py1 = Math.min(bh, y + h + 1);
-        const pw = px1 - px0, ph = py1 - py0;
-        if (pw <= 0 || ph <= 0) return ret;
-        const tx = x - px0, ty = y - py0;
-
-        const dispatch = (buf, flip) => {
-          if (strat.kind === 'u8') noisify(buf, pw * 4, pw, ph, px0, py0, tx, ty, w, h, bw, bh, GL_NOISE_RATE, flip);
-          else if (strat.kind === 'int') noisifyInt(buf, pw * 4, pw, ph, px0, py0, tx, ty, w, h, bw, bh, GL_NOISE_RATE, flip, strat.mask);
-          else if (strat.kind === 'f32') noisifyF32(buf, pw * 4, pw, ph, px0, py0, tx, ty, w, h, bw, bh, GL_NOISE_RATE, flip);
-          else if (strat.kind === 'f16') noisifyF16(buf, pw * 4, pw, ph, px0, py0, tx, ty, w, h, bw, bh, GL_NOISE_RATE, flip);
-        };
-
-        try {
-          if (pw === w && ph === h && dstOffset === 0) { dispatch(pixels, null); return ret; }
-          const pad = new strat.Ctor(pw * ph * 4);
-          Reflect.apply(t, self, [px0, py0, pw, ph, format, type, pad]);
-          dispatch(pad, (idx, bit) => {
-            const localY = (idx / (pw * 4)) | 0;
-            const localX = ((idx % (pw * 4)) / 4) | 0;
-            const ix = localX - tx, iy = localY - ty;
-            if (ix < 0 || iy < 0 || ix >= w || iy >= h) return;
-            const j = (iy * w + ix) * 4 + (idx & 3);
-            if (strat.kind === 'f32') {
-              F32B[0] = destView[j];
-              U32B[0] = U32B[0] ^ bit;
-              destView[j] = F32B[0];
-            } else {
-              destView[j] = (destView[j] & strat.mask) | bit;
-            }
-          });
-        } catch (e) {}
-        return ret;
-      };
+          if (!compiled) Reflect.apply(t,self,args);
+          return result;
+        });
+      }
 
       if (gl1) {
-        hook(gl1.prototype, 'getParameter', getParamHandler(nativeExtensions1));
-        if (ENABLE_WEBGL) hook(gl1.prototype, 'readPixels', readPixelsHandler);
+        if (PROFILE_VALUES.gpu_choice !== 'native') hook(gl1.prototype, 'getParameter', getParamHandler(nativeExtensions1));
+        if (ENABLE_WEBGL && GL_NOISE_RATE > 0) installShaderVariation(gl1.prototype);
       }
       if (gl2) {
-        hook(gl2.prototype, 'getParameter', getParamHandler(nativeExtensions2));
-        if (ENABLE_WEBGL) hook(gl2.prototype, 'readPixels', readPixelsHandler);
+        if (PROFILE_VALUES.gpu_choice !== 'native') hook(gl2.prototype, 'getParameter', getParamHandler(nativeExtensions2));
+        if (ENABLE_WEBGL && GL_NOISE_RATE > 0) installShaderVariation(gl2.prototype);
       }
     }
 
@@ -692,6 +448,7 @@ CANVAS_JS_TEMPLATE = r"""
      * ------------------------------------------------------------------ */
 
     function installWebGPU() {
+      if (PROFILE_VALUES.webgpu_limits === 'native' && PROFILE_VALUES.gpu_choice === 'native') return;
       const GPU = win.GPU;
       const GPUAdapter = win.GPUAdapter;
       if (!GPU || !GPU.prototype) return;
@@ -723,7 +480,7 @@ CANVAS_JS_TEMPLATE = r"""
       for (const key of ['device', 'description']) {
         hookGetter(infoProto, key, () => '');
       }
-      if (!ENABLE_WEBGPU) return;
+      if (!ENABLE_WEBGPU || PROFILE_VALUES.webgpu_limits === 'native') return;
       const limitsProto = win.GPUSupportedLimits && win.GPUSupportedLimits.prototype;
       for (const key of Object.keys(GPU_LIMITS)) {
         hookGetter(limitsProto, key, native => clampLimit(key, native, GPU_LIMITS[key]));
@@ -993,6 +750,7 @@ CANVAS_JS_TEMPLATE = r"""
       for (const proto of [win.Navigator?.prototype, win.WorkerNavigator?.prototype]) {
         hookGetter(proto, 'hardwareConcurrency', native => {
           if (!Number.isInteger(native) || native < 2) return native;
+          if (PROFILE_VALUES.cpu) return Math.min(native, PROFILE_VALUES.cpu);
           const choices = [2, 4, 8, 12, 16].filter(value => value <= native);
           return choices[(fin(SEED ^ 0x37A15) >>> 0) % choices.length];
         });
@@ -1000,6 +758,7 @@ CANVAS_JS_TEMPLATE = r"""
           // A 64-bit browser heap can exceed 4 GB. Do not claim a desktop
           // memory bucket smaller than that engine capacity, or exceed native.
           if (typeof native !== 'number' || native < 8) return native;
+          if (PROFILE_VALUES.memory) return Math.min(native, PROFILE_VALUES.memory);
           const choices = [8, 16, 32].filter(value => value <= native);
           return choices[(fin(SEED ^ 0x96B31) >>> 0) % choices.length];
         });
@@ -1012,6 +771,8 @@ CANVAS_JS_TEMPLATE = r"""
       hook(win, 'queryLocalFonts', (target, self, args) =>
         Reflect.apply(target, self, args).then(fonts => fonts.filter(font => {
           const family = String(font.family).toLowerCase();
+          if (PROFILE_VALUES.font_mode === 'native') return true;
+          if (PROFILE_VALUES.fonts) return PROFILE_VALUES.fonts.some(name => name.toLowerCase() === family);
           if (['arial','times new roman','courier new','segoe ui','segoe ui emoji'].includes(family)) return true;
           let hash = SEED ^ 0x491FC;
           for (let i=0; i<family.length; i++) hash = Math.imul(hash ^ family.charCodeAt(i), 16777619);
@@ -1044,17 +805,18 @@ def build_scripts(
     spoof_navigator: bool = False,
     restrict_fonts: bool = False,
     perturb_float_readback: bool = False,
+    profile_values: dict | None = None,
 ) -> list[str]:
     """Return selected compatibility init scripts for one account seed.
 
     Transformations are opt-in and independent of browser launch mode.
-    Either GPU flag enables shared GPU identity policy; rendering/readback
+    Either GPU flag enables shared GPU identity policy; rendering
     and WebGPU capability policies remain separately selectable.
 
     ``perturb_canvas``        Gradient/Bezier drawing offsets; native bitmap
                               reads and exports, including float16 data.
     ``spoof_webgl``           Hardware-family renderer alias, WebGPU model
-                              redaction, RGBA/RGBA_INTEGER readback.
+                              redaction, interpolated fragment-color variation.
     ``spoof_webgpu``          Same identity policy plus adapter/device
                               limit and feature restrictions.
     ``spoof_audio``           Conservative AudioContext metadata fallback.
@@ -1068,15 +830,15 @@ def build_scripts(
     ``spoof_navigator``       Seeded CPU/memory buckets bounded by native values.
     ``restrict_fonts``        Permission-gated native local-font subset; font
                               rendering, FontFace and glyph metrics unchanged.
-    ``perturb_float_readback`` Perturb RGBA FLOAT and HALF_FLOAT
-                              readPixels destinations in WebGL.
+    ``perturb_float_readback`` Legacy compatibility argument; readback stays
+                              native for every format. Use spoof_webgl to
+                              enable the framebuffer drawing variation.
 
     Register once with ``BrowserContext.add_init_script``. By itself, cross-origin
     workers, service workers, and any worker started outside the wrapped
     constructors are not covered. The application supplies WorkerProfiles
-    separately for complete graphics-worker startup. Depth and stencil readbacks are never
-    perturbed. Integer non-edge pixels are bit-identical to native.
-    PBO-offset and non-default pack-state reads fall through to native.
+    separately for complete graphics-worker startup. All readbacks observe the
+    rendered framebuffer, including floating-point, PBO and packed reads.
     WebGPU device-level readback is not perturbed.
     """
     if not (perturb_canvas or spoof_webgl or spoof_webgpu or spoof_audio
@@ -1086,8 +848,8 @@ def build_scripts(
     seed = int(seed_int) & 0xFFFFFFFF
     js = CANVAS_JS_TEMPLATE
     js = js.replace("__SEED__",             str(seed))
-    js = js.replace("__NOISE_RATE__",       "0.5")
-    js = js.replace("__GL_NOISE_RATE__",    "0.25")
+    js = js.replace("__NOISE_RATE__",       str((profile_values or {}).get("canvas_noise", 0.5)))
+    js = js.replace("__GL_NOISE_RATE__",    str((profile_values or {}).get("webgl_noise", 0.25)))
     js = js.replace("__ENABLE_2D__",        "true" if perturb_canvas         else "false")
     js = js.replace("__ENABLE_WEBGL__",     "true" if spoof_webgl            else "false")
     js = js.replace("__ENABLE_WEBGPU__",    "true" if spoof_webgpu           else "false")
@@ -1095,7 +857,8 @@ def build_scripts(
     js = js.replace("__ENABLE_WORKERS__",   "true" if intercept_workers      else "false")
     js = js.replace("__ENABLE_NAVIGATOR__", "true" if spoof_navigator        else "false")
     js = js.replace("__ENABLE_FONTS__",     "true" if restrict_fonts         else "false")
-    js = js.replace("__ENABLE_FLOATGL__",   "true" if perturb_float_readback else "false")
+    js = js.replace("__PROFILE_VALUES__", json.dumps(profile_values or {}))
+    js = js.replace("__GPU_DEVICE_IDS__", json.dumps(GPU_DEVICE_IDS))
     return [js]
 
 

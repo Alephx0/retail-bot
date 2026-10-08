@@ -40,7 +40,7 @@ class WorkerProfiles:
         # the newly created context before enabling any target interception.
         session = await browser.new_browser_cdp_session()
         try:
-            expected = await session.send('Target.getBrowserContexts')
+            expected = await session.send('Target.createTarget', {'url': 'about:blank'})
         finally:
             await session.detach()
         async with httpx.AsyncClient(trust_env=False, timeout=5) as client:
@@ -52,9 +52,10 @@ class WorkerProfiles:
             raise RuntimeError('Worker profile endpoint must use the allocated loopback port')
         instance = cls(await connect(endpoint, proxy=None, max_size=8 * 1024 * 1024), script)
         try:
-            actual = await instance.send('Target.getBrowserContexts')
-            if not expected['browserContextIds'] or actual != expected:
+            actual = await instance.send('Target.getTargetInfo', {'targetId': expected['targetId']})
+            if actual['targetInfo']['targetId'] != expected['targetId']:
                 raise RuntimeError('Worker profile endpoint does not match the owned browser')
+            await instance.send('Target.closeTarget', {'targetId': expected['targetId']})
             await instance.send('Target.setAutoAttach', {
                 'autoAttach': True, 'waitForDebuggerOnStart': True,
                 'flatten': True, 'filter': cls.FILTER,
@@ -169,7 +170,7 @@ class WorkerProfiles:
     @staticmethod
     def _target_closed(exc):
         return any(text in str(exc).lower() for text in (
-            'no session with given id', 'session closed', 'target closed',
+            'no session with given id', 'session with given id not found', 'session closed', 'target closed',
             'target was closed', 'no target with given id',
         ))
 

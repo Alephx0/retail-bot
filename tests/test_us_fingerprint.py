@@ -23,7 +23,7 @@ def test_us_screen_profiles_repeat_and_do_not_mutate_existing_profile():
         seen.add((value['screen']['width'], value['screen']['height'], value['device_scale_factor']))
         assert list(profile) == ['seed']
     assert seen == set(SCREEN_PROFILES)
-    assert context_options(profile, {}, 'US') == {}
+    assert context_options(profile, {}, 'US')['timezone_id'] == 'America/New_York'
     assert context_options(profile, {**settings, 'fingerprint_backend': 'fingerprint-suite'}, 'US') == {}
     with pytest.raises(ValueError, match='US account'):
         context_options(profile, settings, 'UK')
@@ -39,10 +39,11 @@ def test_us_settings_and_timezone_validation(tmp_path):
         assert client.post('/api/settings', json={'cdp_attach': True}).status_code == 422
 
 
-def test_us_browser_screen_media_navigator_and_health(tmp_path):
+@pytest.mark.parametrize('headed', [False, True])
+def test_us_browser_screen_media_navigator_and_health(tmp_path, headed):
     async def scenario():
         store = Store(tmp_path)
-        store.put('settings', {'browser_channel': 'chrome', 'fingerprint_navigator': True,
+        store.put('settings', {'browser_channel': 'chrome', 'show_browser_window': headed, 'fingerprint_navigator': True,
             'fingerprint_screen': True, 'fingerprint_timezone': 'America/Chicago'}, 'settings')
         adapter = Amazon(store)
         outcomes = []
@@ -60,6 +61,9 @@ def test_us_browser_screen_media_navigator_and_health(tmp_path):
                 assert (await response.request.all_headers())['user-agent'] == values['main']['ua']
                 hints = await page.evaluate('navigator.userAgentData.toJSON()')
                 assert hints['brands'] and hints['platform'] == 'Windows'
+                if headed:
+                    detail = await page.evaluate("navigator.userAgentData.getHighEntropyValues(['architecture','bitness','platformVersion','fullVersionList'])")
+                    assert all(detail.get(key) for key in ('architecture', 'bitness', 'platformVersion', 'fullVersionList'))
                 assert values['main']['timezone'] == 'America/Chicago'
                 assert values['main']['language'] == 'en-US'
                 assert (await response.request.all_headers())['accept-language'].startswith('en-US')

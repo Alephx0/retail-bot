@@ -108,7 +108,7 @@ def test_visible_test_browser_isolated_repeatable_and_cleaned_up(tmp_path, monke
             assert [page.url for page in context.pages] == ['https://one.test/', 'https://two.test/']
             assert await context.cookies() == []
             assert launches[-1]['headless'] is False
-            assert 'args' not in launches[-1]  # Explicit Off overrides global graphics/worker launch.
+            assert not any('--remote-debugging-port' in arg for arg in launches[-1].get('args', []))  # Explicit Off overrides global graphics/worker launch.
             assert context.browser is not task.browser
             assert adapter.profiles.get(account)['seed'] == seed
             assert store.get('settings', 'settings')['show_browser_window'] is False
@@ -146,7 +146,7 @@ def test_mixed_implementations_use_the_correct_process(tmp_path, monkeypatch):
         adapter = Amazon(store)
         native_launches = []
 
-        def native_options(settings, seed=None):
+        def native_options(settings, seed=None, profile_values=None):
             native_launches.append((settings, seed))
             return {'headless': True}
 

@@ -47,12 +47,14 @@ def test_browser_window_setting_controls_launch(tmp_path, monkeypatch):
         monkeypatch.setattr('retail.amazon.async_playwright', lambda: FakePlaywright(driver))
         adapter = Amazon(store)
         await adapter.ready()
-        assert driver.chromium.options == [{'headless': False}]
+        assert len(driver.chromium.options) == 1
+        assert driver.chromium.options[0]['headless'] is False
+        assert driver.chromium.options[0]['channel'] == 'chromium'
         assert adapter.browser_visible
         store.put('settings', {'show_browser_window': False}, 'settings')
         adapter.browser = None
         await adapter.ready()
-        assert driver.chromium.options[-1] == {'headless': True}
+        assert driver.chromium.options[-1]['headless'] is True
         assert not adapter.browser_visible
         store.db.close()
 

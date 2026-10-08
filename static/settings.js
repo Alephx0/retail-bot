@@ -3,7 +3,7 @@
 // Drafts stay in memory, including across navigation. Never persist secret fields
 // in localStorage or include them in unrelated connection requests.
 const settingsSections = [['general','General'], ['browser','Browser'], ['notifications','Notifications'], ['integrations','Connections'], ['data','Data & privacy']];
-const stoppedSettings = ['max_running_tasks','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','agent_mode','ai_connection_id'];
+const stoppedSettings = ['max_running_tasks','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
 let settingsDraft = null, settingsBaseline = null, settingsSaving = false, settingsError = '', settingsSavedMessage = '';
 let installedBrowsers = null, browserLookupPending = false;
 Object.assign(titles, {
@@ -26,7 +26,7 @@ function settingsChanges() {
   const changes = {};
   for (const [key, value] of Object.entries(settingsDraft)) {
     if (['id','has_webhook','webhook','webhook_action'].includes(key)) continue;
-    if (value !== settingsBaseline[key]) changes[key] = value;
+    if (JSON.stringify(value) !== JSON.stringify(settingsBaseline[key])) changes[key] = value;
   }
   if (settingsDraft.webhook_action === 'remove') changes.webhook = '';
   if (settingsDraft.webhook_action === 'replace') changes.webhook = settingsDraft.webhook.trim();
@@ -123,6 +123,7 @@ function captureSettingsDraft() {
     if (['show_browser_window','cdp_attach'].includes(el.name)) value = value === 'true';
     settingsDraft[el.name] = value;
   }
+  settingsDraft.browser_extension_ids = [...form.querySelectorAll('[data-global-extension]:checked')].map(input=>input.value);
 }
 function refreshSettingsView() {
   if (view !== 'settings' && view !== 'troubleshooting') return;

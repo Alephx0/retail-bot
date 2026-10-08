@@ -1,6 +1,8 @@
 'use strict';
 
 const accountFingerprintOptions = [
+  ['browser_incognito', 'Incognito browser', [['true','On'],['false','Off (normal profile)']]],
+  ['browser_identity', 'Browser identity', [['default','Use browser application'],['chrome','Google Chrome'],['msedge','Microsoft Edge'],['brave','Brave'],['opera','Opera']]],
   ['fingerprint_backend', 'Profile implementation', [['javascript','JavaScript compatibility mode'],['native','Native Chromium profiles'],['fingerprint-suite','Apify fingerprint-suite (experimental)']]],
   ...[['canvas','Canvas rendering'],['webgl','WebGL identity and rendering'],['webgpu','WebGPU features and GPU identity'],['audio','Audio metadata repair'],['workers','Worker initialization'],['fonts','Local font enumeration'],['navigator','CPU, memory and browser identity'],['screen','Screen resolution and scaling'],['proxy_location','Match location to account proxy']].map(([key,label]) => ['fingerprint_'+key,label,[['true','On'],['false','Off']]]),
   ['fingerprint_timezone','US profile timezone',['America/New_York','America/Chicago','America/Denver','America/Los_Angeles','America/Phoenix','America/Anchorage','Pacific/Honolulu'].map(value => [value,value])]
@@ -9,13 +11,13 @@ const fingerprintLaunches = new Set();
 
 function accountFingerprintFields(account={}) {
   const global = state.settings?.[0] || {}, overrides = account.fingerprint_overrides || {};
-  return '<details class="account-fingerprint-fields"><summary>Fingerprint profile</summary><p class="help">Use global follows Settings automatically. Choose an override for any option that should differ for this account. Changes apply to new browsers.</p>' +
+  return '<details class="account-fingerprint-fields"><summary>Fingerprint profile</summary><div class="form-tabs" role="tablist"><button type="button" role="tab" aria-selected="true" data-fingerprint-tab="controls">Controls</button><button type="button" role="tab" aria-selected="false" data-fingerprint-tab="generated">Generated fingerprint</button></div><div data-fingerprint-pane="controls"><p class="help">Use global follows Settings automatically. Choose an override for any option that should differ for this account. Changes apply to new browsers.</p>' +
     accountFingerprintOptions.map(([key,label,options]) => {
       const current = String(global[key] ?? (key === 'fingerprint_backend' ? 'javascript' : key === 'fingerprint_proxy_location'));
       const globalLabel = options.find(([value]) => value === current)?.[1] || current;
       return select('account_'+key,label,[['',`Use global (${globalLabel})`],...options],overrides[key] == null ? '' : String(overrides[key]));
     }).join('') +
-    '<p class="help">Fingerprint-suite uses a complete profile; custom toggles are inactive. Native profiles use the executable configured in Settings; font, navigator, screen and US location controls apply only to JavaScript profiles. Graphics profiles initialize workers automatically.</p><button type="button" data-reset-fingerprint>Use global for all options</button></details>';
+    '<p class="help">Fingerprint-suite uses a complete profile; custom toggles are inactive. Native profiles use the executable configured in Settings; font, navigator, screen and US location controls work in both modes. Graphics profiles initialize workers automatically.</p><button type="button" data-reset-fingerprint>Use global for all options</button>' + accountExtensionsFields(account) + '</div><div data-fingerprint-pane="generated" hidden>' + generatedFingerprintFields(account) + '</div></details>';
 }
 
 function collectAccountFingerprint(form) {
@@ -24,6 +26,8 @@ function collectAccountFingerprint(form) {
     const value = form.elements['account_'+key]?.value;
     if (value) overrides[key] = value === 'true' ? true : value === 'false' ? false : value;
   }
+  const extensionMode = form.querySelector('[name=account_extensions_mode]')?.value;
+  if(extensionMode === 'custom') overrides.browser_extension_ids = [...form.querySelectorAll('[data-account-extension]:checked')].map(input => input.value);
   return overrides;
 }
 
@@ -31,8 +35,12 @@ function syncAccountFingerprintFields(root) {
   const backend = root.querySelector('[name=account_fingerprint_backend]')?.value || state.settings[0].fingerprint_backend;
   for (const [key] of accountFingerprintOptions) {
     const control = root.querySelector(`[name="account_${key}"]`);
-    if (control) control.disabled = key !== 'fingerprint_backend' && (backend === 'fingerprint-suite' ||
-      (backend === 'native' && ['fingerprint_fonts','fingerprint_navigator','fingerprint_screen','fingerprint_proxy_location','fingerprint_timezone'].includes(key)));
+    if (control) control.disabled = !['fingerprint_backend','browser_incognito','browser_identity'].includes(key) && backend === 'fingerprint-suite';
+  }
+  root.querySelectorAll('[name^="generated_"]').forEach(control => control.disabled = backend === 'fingerprint-suite');
+  if (backend === 'fingerprint-suite') {
+    root.querySelector('[data-preview-status]').textContent = 'Fingerprint-suite manages its complete profile. These presets apply to JavaScript and Native Chromium only.';
+    root.querySelector('[data-profile-preview]').innerHTML = '';
   }
 }
 
@@ -52,6 +60,8 @@ async function launchAccountFingerprint(id) {
 function editAccountFingerprint(id) {
   const account = state.accounts.find(item => item.id === id);
   const d = dialog(`<form><h2>Fingerprint · ${esc(account.name)}</h2>${accountFingerprintFields(account)}<p class="help">Testing opens a separate visible browser with this account’s fingerprint and proxy, without saved sign-in cookies. Starting websites are shared by all accounts. An empty list opens a blank tab.</p><p data-starting-sites-summary>${(state.settings[0].fingerprint_test_sites || []).map(site => esc(site.name)).join(' · ') || 'No starting websites'}</p><button type="button" data-fingerprint-sites>Manage starting websites</button><p data-fingerprint-error role="alert"></p><div class="modal-actions"><button type="button" data-dismiss-fingerprint>Cancel</button><button type="submit">Save</button><button type="submit" value="test" class="primary">Save & test</button></div></form>`);
+  d.dataset.accountId = id;
+  d.dataset.accountRegion = account.region;
   d.querySelector('details').open = true;
   syncAccountFingerprintFields(d);
   d.querySelector('[data-dismiss-fingerprint]').onclick = () => d.close();
@@ -60,7 +70,7 @@ function editAccountFingerprint(id) {
     const buttons = d.querySelectorAll('button[type=submit]');
     buttons.forEach(button => button.disabled = true);
     try {
-      await api(`accounts/${id}`, 'PUT', {fingerprint_overrides: collectAccountFingerprint(event.target)});
+      await api(`accounts/${id}`, 'PUT', {fingerprint_overrides: collectAccountFingerprint(event.target), ...collectGeneratedFingerprint(event.target)});
       if (event.submitter?.value === 'test') await launchAccountFingerprint(id);
       else { await refresh(); toast('Account fingerprint saved'); }
       d.close();
@@ -103,7 +113,8 @@ document.addEventListener('click', async event => {
   if (!button) return;
   if (button.hasAttribute('data-reset-fingerprint')) {
     const fields = button.closest('.account-fingerprint-fields');
-    fields.querySelectorAll('select').forEach(input => input.value = '');
+    for (const [key] of accountFingerprintOptions) fields.querySelector(`[name="account_${key}"]`).value = '';
+    fields.querySelector('[name=account_extensions_mode]').value = 'global';
     syncAccountFingerprintFields(fields);
   }
   else if (button.hasAttribute('data-fingerprint-sites')) editFingerprintSites();

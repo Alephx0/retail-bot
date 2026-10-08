@@ -18,10 +18,14 @@ In **Settings → Browser → Fingerprint profiles**, select **Native Chromium p
 
 - Canvas changes affect rendering operations, so native readback, image copying, and exports observe the rendered bitmap. The engine algorithm differs from the JavaScript backend's gradient/Bezier drawing offsets.
 - Enabling either GPU identity option applies one identity to **both WebGL and WebGPU**, including dedicated, shared, and service workers. WebGL shader perturbation is enabled only by the WebGL option. This coupling prevents contradictory identities across APIs.
+- WebGL variation uses the engine's seeded interpolated-color output changes. Analytic math, fragment coordinates and texture sampling retain native behavior. Standard and Subtle keep color variation active; Off removes the shader-noise switch. NVIDIA GPU aliases include their matching published PCI device IDs.
 - Worker propagation is automatic in native mode; the worker checkbox controls constructor interception only in JavaScript mode.
 - Audio retains the existing JavaScript fallback policy: valid native values and explicitly requested sample rates are preserved. The native build's audio override is deliberately unused because it overrides page-requested sample rates.
-- Each graphics-enabled context owns a separate browser process with its account seed. Closing the context closes that process. Profiles never share one process's seed across accounts. Expect more memory use than the shared stock-browser mode.
-- Settings with no graphics transformations use an unseeded instance of the same native build. Missing native executables raise an error; there is no silent fallback to JavaScript mode.
+- Each native context owns a separate browser process with its account seed. Closing the context closes that process. Profiles never share one process's seed across accounts. Expect more memory use than the shared stock-browser mode.
+- Settings with no graphics transformations disable the graphics switches; navigator, font, screen and timezone controls remain independent. Missing native executables raise an error; there is no silent fallback to JavaScript mode.
+- Navigator controls use native CPU/memory switches constrained to detected hardware. GPU presets retain the physical vendor and architecture. Screen/scaling uses browser context metrics; timezone can follow a verified US proxy exit. Local-font enumeration uses the same limited JavaScript filter as compatibility mode, preserving native font objects and rendering. WebGPU limits remain native.
+
+See [account profile controls, identities and extensions](account-fingerprints.md) for global inheritance, per-account presets, normal/incognito sessions and visible tests.
 
 The upstream rendering policy includes size/backend thresholds, including preservation of small canonical canvas shapes. Its source explicitly discusses CreepJS checks. Zero measured lies should therefore be interpreted as a result on that benchmark and the independent probes, not proof that the browser reproduces all physical GPU behavior or is indistinguishable from stock Chrome.
 

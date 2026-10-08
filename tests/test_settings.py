@@ -150,6 +150,12 @@ def test_settings_browser_drafts_validation_and_layout(tmp_path, monkeypatch):
                 await page.get_by_role('button', name='Save changes', exact=True).click()
                 await expect(page.locator('[data-settings-status]')).to_contain_text('Saved.')
                 assert client.get('/api/state').json()['settings'][0]['show_browser_window'] is False
+                await page.get_by_text('Advanced browser options', exact=True).click()
+                await page.get_by_text('Fingerprint profiles', exact=True).click()
+                await page.locator('[name=fingerprint_backend]').select_option('native')
+                for surface in ['fonts', 'navigator', 'screen', 'proxy_location', 'timezone']:
+                    await expect(page.locator('[name=fingerprint_'+surface+']')).to_be_enabled()
+                await page.locator('[name=fingerprint_backend]').select_option('javascript')
                 # Keyboard navigation follows the tab pattern.
                 await page.locator('[data-settings-tab=browser]').focus()
                 await page.keyboard.press('ArrowRight')

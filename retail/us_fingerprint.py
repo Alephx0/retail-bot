@@ -27,15 +27,17 @@ async def browser_identity_user_agent(browser):
 
 
 def enabled(settings):
-    return settings.get('fingerprint_backend', 'javascript') == 'javascript' and any(
+    return settings.get('fingerprint_backend', 'javascript') != 'fingerprint-suite' and any(
         settings.get('fingerprint_' + key) for key in SURFACES)
 
 
 def context_options(profile, settings, region):
-    if not enabled(settings):
+    if settings.get('fingerprint_backend') == 'fingerprint-suite':
         return {}
     if region != 'US':
-        raise ValueError('US font/navigator/screen profiles require a US account region')
+        if enabled(settings):
+            raise ValueError('US font/navigator/screen profiles require a US account region')
+        return {}
     timezone = settings.get('fingerprint_timezone', 'America/New_York')
     if timezone not in US_TIMEZONES:
         raise ValueError('Choose a supported US timezone')

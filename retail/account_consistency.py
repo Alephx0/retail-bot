@@ -32,6 +32,10 @@ class AccountBrowserProfiles:
                        'screen': {'width': 1280, 'height': 720}, 'device_scale_factor': 1,
                        'created_at': now()}
             profile = self.store.put('browser_profiles', profile, key)
+        requested_seed = account.get('fingerprint_seed')
+        if requested_seed and requested_seed != profile['seed']:
+            profile = {k: v for k, v in profile.items() if not k.startswith('observed')}
+            profile = self.store.put('browser_profiles', {**profile, 'seed': requested_seed}, key)
         if profile['locale'] != locale:
             profile.pop('observed', None)
             profile = self.store.put('browser_profiles', {**profile, 'locale': locale}, key)
