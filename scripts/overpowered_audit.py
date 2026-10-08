@@ -145,7 +145,7 @@ async def main(args):
                             **{'fingerprint_'+flag: flag in flags for flag in FLAGS}}
                         row['settings'] = settings
                         store.put('settings', settings, 'settings')
-                        account = store.put('accounts', Account(name='Isolated measurement', fingerprint_values=values).model_dump(), 'public-audit-fixed-v1')
+                        account = store.put('accounts', Account(name='Isolated measurement', fingerprint_values=values).model_dump(), args.profile_key)
                         adapter = Amazon(store)
                         context = await adapter.context(account)
                         row.update(await measure(context, folder, fit_screen=args.fit_screen))
@@ -178,7 +178,8 @@ if __name__ == '__main__':
     parser.add_argument('--cases', default='chrome-direct,js-disabled,js-webgl,js-webgl-no-noise,js-webgl-native-gpu,js-webgpu,js-webgpu-native,js-preserve-gpu,native-direct,native-navigator,native-webgl,native-webgpu')
     parser.add_argument('--repeats', type=int, choices=range(1, 4), default=1)
     parser.add_argument('--incognito', action='store_true')
-    parser.add_argument('--identity', choices=['chrome', 'msedge'], default='chrome')
+    parser.add_argument('--identity', choices=['chrome', 'chromium', 'msedge'], default='chrome')
+    parser.add_argument('--profile-key', default='public-audit-fixed-v1', help='Deterministic profile key; no account credentials or session are loaded')
     parser.add_argument('--fit-screen', action='store_true')
     parser.add_argument('--creepjs', action='store_true')
     parser.add_argument('--visits', type=int, choices=range(1,5), default=1)

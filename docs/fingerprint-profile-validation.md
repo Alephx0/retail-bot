@@ -7,6 +7,32 @@ enabled and GPU variation active**, measured in both modes. The user accepted
 category still reads **Medium**. No detector response, score or displayed result
 was replaced by the app.
 
+## Follow-up: bundled Chromium versus installed Chrome
+
+The user's 0.70 Elevated JavaScript result was reproduced on October 8. The app
+was configured for Bundled Chromium 153, while the earlier 0.20 measurements used
+installed Google Chrome 154. With the same account seed, all eight toggles,
+incognito mode and an RTX 3060 Ti alias of the physical RTX 3070:
+
+| JavaScript browser | Visits | Bot score | CreepJS lies / warnings / errors |
+| --- | --- | --- | --- |
+| Bundled Chromium 153 | 2 | 0.70 Elevated both times | 0 / 0 / 0 |
+| Installed Chrome 154 | 2 | 0.20 Low both times | 0 / 0 / 0 |
+| Installed Chrome 154 with the account's four selected extensions | 3 | 0.20 Low all three times | 0 / 0 / 0 |
+
+The displayed automated-browser, anti-detect, user-agent and developer-tools
+checks were clear in every run. This isolates the observed difference to the
+browser-build selection in these tests, not to a known private scoring rule.
+Version, brand and other build capabilities differ together. No claim is made
+that changing only the reported brand would reproduce the result.
+
+The local app's Browser application was changed to installed Chrome. Surface
+toggles, generated presets and extension assignments were retained. Account and
+global help now distinguish the browser application from profile implementation.
+Evidence: `user-chromium/`, `user-chrome/` and `user-chrome-extensions/` under
+`artifacts/overpowered-investigation/`. Diagnostic profiles contained no saved
+account credentials or login sessions.
+
 ## GPU variation enabled: subsequent repair
 
 The latest repair measures **0.20 Low with GPU aliasing and WebGL variation

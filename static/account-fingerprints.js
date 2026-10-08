@@ -17,7 +17,7 @@ function accountFingerprintFields(account={}) {
       const globalLabel = options.find(([value]) => value === current)?.[1] || current;
       return select('account_'+key,label,[['',`Use global (${globalLabel})`],...options],overrides[key] == null ? '' : String(overrides[key]));
     }).join('') +
-    '<p class="help">Fingerprint-suite uses a complete profile; custom toggles are inactive. Native profiles use the executable configured in Settings; font, navigator, screen and US location controls work in both modes. Graphics profiles initialize workers automatically.</p><button type="button" data-reset-fingerprint>Use global for all options</button>' + accountExtensionsFields(account) + '</div><div data-fingerprint-pane="generated" hidden>' + generatedFingerprintFields(account) + '</div></details>';
+    '<p class="help">JavaScript compatibility uses the selected browser application. Select Google Chrome as Browser identity to use installed Chrome for this account; Bundled Chromium can receive different detector scores. Fingerprint-suite uses a complete profile; custom toggles are inactive. Native profiles use the executable configured in Settings; font, navigator, screen and US location controls work in both modes. Graphics profiles initialize workers automatically.</p><button type="button" data-reset-fingerprint>Use global for all options</button>' + accountExtensionsFields(account) + '</div><div data-fingerprint-pane="generated" hidden>' + generatedFingerprintFields(account) + '</div></details>';
 }
 
 function collectAccountFingerprint(form) {
