@@ -20,6 +20,7 @@ render=function(){
   if(focused)return;
   const draft=$('#group-settings[data-dirty="true"]'),scroll=$('.group-settings')?.scrollTop||0;
   if(view==='home'){screen.innerHTML=homeView();loadAnalytics();}
+  else if(view==='task_groups'){screen.innerHTML=taskGroupView();}
   else if(view==='tasks'){screen.innerHTML=groupId?taskDetail():groups();if(groupId){$('#primary').textContent='+ Create tasks';if(draft&&$('#group-settings')?.dataset.id===draft.dataset.id)$('#group-settings').replaceWith(draft);if($('.group-settings'))$('.group-settings').scrollTop=scroll;}}
   else if(['accounts','profiles','proxies','input_lists'].includes(view))screen.innerHTML=resourceView(view);
   else if(view==='manager')screen.innerHTML=managerView();

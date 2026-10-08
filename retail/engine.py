@@ -115,6 +115,11 @@ class Engine:
         if not task:
             raise ValueError("Task not found")
         group = self.store.get("groups", task["group_id"])
+        if group and (group.get('task_group_id') or (getattr(self,'group_coordinator',None) and any(g.get('legacy_id')==group['id'] for g in self.group_coordinator.repo.all('group')))):
+            raise ValueError('This group has migrated. Start it in the new Task Groups workspace.')
+        coordinator = getattr(self, 'group_coordinator', None)
+        if coordinator and task.get('account_id') and coordinator.busy_account(task['account_id']):
+            raise ValueError('This account is reserved or busy in a task group')
         if not group or not (group.get("products", "").strip() or group.get("input_list_id")):
             raise ValueError("Configure the group monitor input before starting tasks")
         settings = self.store.get("settings", "settings") or {}
@@ -151,9 +156,11 @@ class Engine:
     async def stop_all(self):
         self.stopping_all = True
         try:
+            coordinator = getattr(self, 'group_coordinator', None)
+            group_count = await coordinator.stop_all() if coordinator else 0
             ids = {task["id"] for task in self.store.all("tasks") if task.get("status") == "scheduled" or task["id"] in self.jobs}
             await asyncio.gather(*(self.stop(id) for id in ids))
-            return len(ids)
+            return len(ids) + group_count
         finally:
             self.stopping_all = False
 
@@ -206,6 +213,9 @@ class Engine:
         elif scope == 'accounts':
             context = self.amazon.logins.get(id)
             pages = context.pages if context else []
+        elif scope == 'group_attempts' and getattr(self, 'group_coordinator', None):
+            page = self.group_coordinator.pages.get(id)
+            pages = [page] if page else []
         else:
             raise ValueError('Unknown browser scope')
         return next((page for page in reversed(pages) if not page.is_closed()), None)
@@ -229,6 +239,11 @@ class Engine:
             task = self.store.get('tasks', id)
             if not task or task.get('status') not in ('attention', 'review') or id not in self.wakes or self.wakes[id].is_set():
                 raise ValueError('Take Control is available only while this task is paused')
+        if scope == 'group_attempts':
+            attempt = self.group_coordinator.repo.require('attempt', id)
+            run = self.group_coordinator.repo.require('run', attempt['run_id'])
+            if attempt['state'] not in ('waiting_user', 'reconciliation_required') or (attempt['state']=='waiting_user' and run['state']!='watching'):
+                raise ValueError('Browser input is available only for manual review or reconciliation')
         kind = action.get('kind')
         if kind == 'click':
             size = page.viewport_size or await page.evaluate('({width: innerWidth, height: innerHeight})')

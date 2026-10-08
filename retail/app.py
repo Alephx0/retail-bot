@@ -26,6 +26,9 @@ from .models import AIConnection, account_fingerprint_settings, BrowserExtension
 from .browser_runtime import browser_options as identity_browser_options, extension_paths, validate_extension_path, CATALOG
 from .fingerprint_profiles import generated, inspect_hardware, gpu_choices, FONT_SETS
 from .ai_provider import AIProvider, ProviderError
+from .task_groups.coordinator import Coordinator
+from .task_groups.api import router as task_group_router
+from .task_groups.workspace_lock import WorkspaceLock
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = {"accounts": Account, "groups": Group, "proxies": ProxyList, "tasks": Task, "settings": Settings,
@@ -36,25 +39,37 @@ MODELS = {"accounts": Account, "groups": Group, "proxies": ProxyList, "tasks": T
 def create_app(data_dir=None):
     @asynccontextmanager
     async def lifespan(app):
-        app.state.store = Store(Path(data_dir or os.environ.get("RETAIL_DATA", ROOT / "data")))
+        folder = Path(data_dir or os.environ.get("RETAIL_DATA", ROOT / "data"))
+        app.state.workspace_lock = WorkspaceLock(folder)
+        app.state.store = Store(folder)
         app.state.resources = Resources(app.state.store)
         app.state.resources.migrate()
         app.state.proxy_pool = ProxyPool(app.state.store)
         app.state.proxy_pool.sync()
         app.state.engine = Engine(app.state.store)
+        app.state.group_coordinator = Coordinator(app.state.engine)
+        app.state.engine.group_coordinator = app.state.group_coordinator
         app.state.proxy_health = ProxyHealth(app.state.store)
         for record in app.state.store.all("harvesters"):
             app.state.store.delete("harvesters", record["id"])
         for record in app.state.store.all("proxy_health"):
             if record.get("status") == "testing":
                 app.state.store.put("proxy_health", {**record, "status": "interrupted"})
-        await app.state.engine.boot()
-        yield
-        await app.state.engine.close()
-        await app.state.proxy_health.close()
-        app.state.store.db.close()
+        try:
+            await app.state.engine.boot()
+            await app.state.group_coordinator.boot()
+            yield
+        finally:
+            try:
+                await app.state.group_coordinator.close()
+                await app.state.engine.close()
+                await app.state.proxy_health.close()
+                app.state.store.db.close()
+            finally:
+                app.state.workspace_lock.close()
 
     app = FastAPI(title="Retail Desk", lifespan=lifespan)
+    app.include_router(task_group_router)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 
     @app.middleware("http")
@@ -139,6 +154,7 @@ def create_app(data_dir=None):
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
         result["events"] = store().all("events")[-150:][::-1]
         result["active"] = list(app.state.engine.jobs)
+        result['task_groups'] = [app.state.group_coordinator.summary(g) for g in app.state.group_coordinator.repo.all('group')]
         result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
         result['extension_catalog'] = CATALOG
         result['settings'] = [public('settings', {**Settings().model_dump(), **(store().get('settings', 'settings') or {})})]
@@ -179,6 +195,8 @@ def create_app(data_dir=None):
             if data.get('clear_api_key'):
                 merged['api_key'] = ''
         if kind == 'settings':
+            if app.state.group_coordinator.active() and any(merged.get(k) != old.get(k) for k in data if k.startswith(('browser_', 'fingerprint_', 'show_browser', 'native_browser', 'cdp_')) or k == 'max_running_tasks'):
+                raise HTTPException(409, 'Stop task-group runs before changing browser settings')
             if merged.get('ai_connection_id'):
                 require('ai_connections', merged['ai_connection_id'])
             if merged.get('agent_mode', 'off') != 'off' and not merged.get('ai_connection_id'):
@@ -191,6 +209,10 @@ def create_app(data_dir=None):
             raise HTTPException(422, "Folder resource type cannot change")
         if kind == "accounts" and id in app.state.engine.amazon.logins:
             raise HTTPException(409, "Close or save this account's open browser before editing")
+        if kind == 'accounts' and id and app.state.group_coordinator.busy_account(id):
+            raise HTTPException(409, 'This account is active in a task group; stop its work before editing')
+        if kind == 'proxies' and app.state.group_coordinator.active():
+            raise HTTPException(409, 'Stop task-group runs before changing connection lists')
         try:
             valid = MODELS[kind].model_validate(merged).model_dump(mode="json")
             if kind == 'accounts':
@@ -279,6 +301,12 @@ def create_app(data_dir=None):
         if kind not in MODELS or kind == "settings":
             raise HTTPException(404, "Unknown collection")
         require(kind, id)
+        if kind == 'proxies' and app.state.group_coordinator.active():
+            raise HTTPException(409, 'Stop task-group runs before removing connection lists')
+        if kind == 'accounts' and app.state.group_coordinator.busy_account(id):
+            raise HTTPException(409, 'This account is reserved or busy in a task group')
+        if kind == 'accounts' and any(id in app.state.group_coordinator.repo.require('revision',g['revision_id'])['plan']['account_ids'] for g in app.state.group_coordinator.repo.all('group')):
+            raise HTTPException(409, 'Remove this account from its task-group plans before deleting it')
         if kind == 'ai_connections' and (store().get('settings', 'settings') or {}).get('ai_connection_id') == id:
             raise HTTPException(409, 'Deselect this AI connection in Settings before deleting it')
         if kind == "tasks":
@@ -346,9 +374,13 @@ def create_app(data_dir=None):
     async def browser_frame(scope: str, id: str, request: Request):
         if request.headers.get('x-retail-client') != 'dashboard':
             raise HTTPException(403, 'Local dashboard header required')
-        if scope not in ('tasks', 'accounts'):
+        if scope not in ('tasks', 'accounts', 'group_attempts'):
             raise HTTPException(404, 'Unknown browser scope')
-        require(scope, id)
+        if scope == 'group_attempts':
+            if not app.state.group_coordinator.repo.get('attempt', id):
+                raise HTTPException(404, 'Attempt not found')
+        else:
+            require(scope, id)
         try:
             frame = await app.state.engine.browser_frame(scope, id)
         except ValueError as exc:
@@ -357,9 +389,13 @@ def create_app(data_dir=None):
 
     @app.post('/api/browser/{scope}/{id}/input')
     async def browser_input(scope: str, id: str, request: Request):
-        if scope not in ('tasks', 'accounts'):
+        if scope not in ('tasks', 'accounts', 'group_attempts'):
             raise HTTPException(404, 'Unknown browser scope')
-        require(scope, id)
+        if scope == 'group_attempts':
+            if not app.state.group_coordinator.repo.get('attempt', id):
+                raise HTTPException(404, 'Attempt not found')
+        else:
+            require(scope, id)
         try:
             action = await request.json()
             if not isinstance(action, dict):
@@ -371,6 +407,10 @@ def create_app(data_dir=None):
     @app.post("/api/accounts/{id}/{action}")
     async def account_action(id: str, action: str):
         account = require("accounts", id)
+        if action in ('login', 'register', 'test-fingerprint', 'save-session') and app.state.group_coordinator.busy_account(id):
+            raise HTTPException(409, 'This account is reserved or busy in a task group')
+        if action in ('login', 'register', 'test-fingerprint'):
+            await app.state.group_coordinator.pool.discard(id)
         if action in ("login", "register", "save-session") and any(t.get("account_id") == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
             raise HTTPException(409, "Stop this account's running tasks before changing its session")
         if account.get("retailer", "amazon") != "amazon" and action not in ('test-fingerprint', 'close-fingerprint-test'):
@@ -600,10 +640,13 @@ def create_app(data_dir=None):
         results=[]
         for account in accounts:
             try:
+                if app.state.group_coordinator.busy_account(account['id']):
+                    raise ValueError('This account is reserved or busy in a task group')
                 if any(t.get("account_id")==account["id"] and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
                     raise ValueError("Stop this account's tasks first")
                 if action in ("open","verify"):
                     if account.get("retailer","amazon")!="amazon": raise ValueError("Retailer adapter is not implemented")
+                    await app.state.group_coordinator.pool.discard(account['id'])
                     await app.state.engine.amazon.login(account)
                     if action=="verify":
                         context=app.state.engine.amazon.logins[account["id"]]
