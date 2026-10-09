@@ -25,6 +25,7 @@ class Engine:
         self.pages = {}
         self.live_view_locks = {}
         self.stopping_all = False
+        self.stopping_tasks = set()
         self.diagnostics = Diagnostics(store)
 
     def status(self, id, status, message, **metadata):
@@ -68,6 +69,14 @@ class Engine:
 
     async def schedule(self):
         while True:
+            coordinator = getattr(self, 'group_coordinator', None)
+            if coordinator:
+                try:
+                    await coordinator.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.store.event('task-groups', 'scheduler_error', 'Saved plan scheduling recovered from an error')
             local = datetime.now().astimezone()
             for group in self.store.all("groups"):
                 due = occurrences(group.get("schedule", {}), local)
@@ -111,7 +120,7 @@ class Engine:
     async def start(self, id):
         if getattr(self,"legacy_read_only",False):
             raise ValueError("Import this saved plan from Task Groups before starting it")
-        if self.stopping_all:
+        if self.stopping_all or id in self.stopping_tasks:
             raise ValueError("All tasks are stopping; try again after the stop completes")
         if id in self.jobs:
             return
@@ -122,7 +131,7 @@ class Engine:
         if group and (group.get('task_group_id') or (getattr(self,'group_coordinator',None) and any(g.get('legacy_id')==group['id'] for g in self.group_coordinator.repo.all('group')))):
             raise ValueError('This group has migrated. Start it in the new Task Groups workspace.')
         coordinator = getattr(self, 'group_coordinator', None)
-        if coordinator and task.get('account_id') and coordinator.busy_account(task['account_id']):
+        if coordinator and task.get('account_id') and coordinator.repo.claimed(task['account_id']):
             raise ValueError('This account is reserved or busy in a task group')
         if not group or not (group.get("products", "").strip() or group.get("input_list_id")):
             raise ValueError("Configure the group monitor input before starting tasks")
@@ -133,6 +142,7 @@ class Engine:
         if submission and not task["simulation"]:
             raise ValueError("This task already has an order submission record. Review order history; create a new task only for an intentional new purchase.")
         if not task["simulation"]:
+            self.check_pending_order(task['account_id'])
             if not RETAILERS[group.get("retailer", "amazon")].get("automation"):
                 raise ValueError("This retailer's live adapter is planned; Amazon automation is being implemented first")
             account = self.store.get("accounts", task["account_id"])
@@ -148,14 +158,23 @@ class Engine:
         self.status(id, "starting", "Starting simulation" if task["simulation"] else "Opening Amazon browser")
         self.jobs[id] = asyncio.create_task(self.run(id))
 
+    def check_pending_order(self, account_id):
+        if any(s.get('account_id') == account_id and s.get('status') != 'confirmed'
+               for s in self.store.all('submissions')):
+            raise ValueError('Verify this account\'s pending order before starting another purchase task')
+
     async def stop(self, id):
-        job = self.jobs.get(id)
-        if job:
-            job.cancel()
-            await asyncio.gather(job, return_exceptions=True)
-        self.jobs.pop(id, None)
-        self.wakes.pop(id, None)
-        self.status(id, "stopped", "Stopped")
+        self.stopping_tasks.add(id)
+        try:
+            job = self.jobs.get(id)
+            if job:
+                job.cancel()
+                await asyncio.gather(job, return_exceptions=True)
+            self.jobs.pop(id, None)
+            self.wakes.pop(id, None)
+            self.status(id, "stopped", "Stopped")
+        finally:
+            self.stopping_tasks.discard(id)
 
     async def stop_all(self):
         self.stopping_all = True

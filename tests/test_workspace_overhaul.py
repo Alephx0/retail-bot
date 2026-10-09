@@ -102,12 +102,13 @@ def test_uncertain_outcome_blocks_archive_until_verified(tmp_path):
     repo.close();store.db.close()
 
 
-def test_unmigrated_legacy_plans_cannot_start_second_scheduler(tmp_path):
+def test_original_tasks_and_saved_plans_share_one_scheduler(tmp_path):
     with TestClient(create_app(tmp_path),headers=HEADERS) as client:
         old=client.post('/api/groups',json={'name':'Saved plan','products':'B012345678'}).json()
         task=client.post('/api/tasks',json={'group_id':old['id']}).json()
-        assert client.post('/api/tasks/'+task['id']+'/start').status_code==409
-        assert client.app.state.engine.scheduler is None
+        assert client.post('/api/tasks/'+task['id']+'/start').status_code==200
+        assert client.app.state.engine.scheduler is not None
+        assert client.app.state.group_coordinator.scheduler is None
         assert client.get('/api/state').json()['groups'][0]['id']==old['id']
 
 

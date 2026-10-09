@@ -22,14 +22,15 @@ class Coordinator:
         self.monitor_slots={}; self.product_cursor={}; self.retailer_backoffs={}
         self.scheduler=None; self.closing=False
 
-    async def boot(self):
+    async def boot(self, *, schedule=True):
         self.repo.recover()
         for attempt in self.repo.all('attempt'):
             if attempt['state']=='confirmed' and not self.engine.store.get('checkouts','group-checkout-'+attempt['id']):
                 plan=self.repo.require('run',attempt['run_id'])['plan']
                 self.record_checkout(attempt['id'],attempt.get('observation',{}),
                     {'total':attempt['money_cents']/100,'currency':{'US':'USD','UK':'GBP','CA':'CAD'}[plan['region']]},attempt['order_id'])
-        self.scheduler=asyncio.create_task(self.loop())
+        if schedule:
+            self.scheduler=asyncio.create_task(self.loop())
 
     def active(self):
         return self.repo.active_runs()

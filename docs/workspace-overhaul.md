@@ -1,5 +1,7 @@
 # Retail workspace overhaul
 
+Historical report for commit `aac0172`. The subsequent [original-task workflow restoration](original-task-workflow.md) supersedes its primary task-group UI and scheduler-retirement decision.
+
 Branch: `overhaul/retail-workspace`, created from `main` (`58f4509`). The original checkout and its uncommitted work were left intact. The previously tested group coordinator and concurrency repairs were carried over explicitly; unrelated fingerprint changes were not included.
 
 ## Architecture audit and decisions

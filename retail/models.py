@@ -251,6 +251,7 @@ class Task(BaseModel):
     proxy_id: str = ""
     simulation: bool = True
     quantity: int = Field(default=1, ge=1, le=30)
+    max_total: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     scheduled_at: datetime | None = None
     profile_id: str = ""
     checkout_mode: Literal["review", "automatic", "monitor", "quote"] = "review"

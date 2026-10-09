@@ -4,7 +4,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 let state={groups:[],tasks:[],accounts:[],proxies:[],events:[],checkouts:[],feed:[],settings:[],active:[],profiles:[],mailboxes:[],solvers:[],input_lists:[],retailers:[],proxy_health:[],harvesters:[],task_groups:[]};
 let view='task_groups',groupId=null,search='',editing=null,selected=new Set(),historyFilter='all',stateLoaded=false;
 let refreshPending=false,toastTimer;
-const titles={...featureTitles,task_groups:['Task groups','One objective. Your accounts, working together.','Create group'],home:['Overview','Your workspace at a glance.',''],checkouts:['Order history','Confirmed purchases and recorded outcomes.','Export CSV'],events:['Activity','Recent workspace activity.',''],feed:['Product observations','Availability from your running groups.',''],settings:['Settings','Defaults that work for your whole workspace.',''],tools:['Tools','Optional resources and workspace utilities.','']};
+const titles={...featureTitles,task_groups:['Task groups','Your groups, accounts and independent tasks.','Create group'],home:['Overview','Your workspace at a glance.',''],checkouts:['Order history','Confirmed purchases and recorded outcomes.','Export CSV'],events:['Activity','Recent workspace activity.',''],feed:['Product observations','Availability from your running groups.',''],settings:['Settings','Defaults that work for your whole workspace.',''],tools:['Tools','Optional resources and workspace utilities.','']};
 async function api(path,method='GET',body){
   const response=await fetch('/api/'+path,{method,headers:{'Content-Type':'application/json','X-Retail-Client':'dashboard'},body:body===undefined?undefined:JSON.stringify(body)});
   const data=await response.json();
@@ -12,7 +12,7 @@ async function api(path,method='GET',body){
   return data;
 }
 function toast(message){$('#toast').textContent=message;$('#toast').style.display='block';clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').style.display='none',6000);}
-const statusNames={not_needed:'Goal reached',watching:'Running',preparing:'Starting',scheduled:'Scheduled',paused:'Paused',stopped:'Stopped',stopping:'Stopping',completed:'Successful',confirmed:'Successful',reserved:'Waiting',carting:'Checking out',reviewing:'Checking out',submitting:'Confirming order',waiting_user:'Needs review',reconciliation_required:'Verify outcome',read_error:'Needs attention',attention:'Needs attention',retrying:'Retrying',failed:'Failed',error:'Failed',cancelled:'Stopped',rejected:'Not eligible',quoted:'Price verified',eligible:'Available',out_of_stock:'Waiting for stock',waiting:'Waiting',ready:'Ready',disabled:'Disabled'};
+const statusNames={idle:'Ready',starting:'Starting',monitoring:'Running',in_queue:'Queued',review:'Needs review',checkout:'Checking out',not_needed:'Goal reached',watching:'Running',preparing:'Starting',scheduled:'Scheduled',paused:'Paused',stopped:'Stopped',stopping:'Stopping',completed:'Successful',confirmed:'Successful',reserved:'Waiting',carting:'Checking out',reviewing:'Checking out',submitting:'Confirming order',waiting_user:'Needs review',reconciliation_required:'Verify outcome',read_error:'Needs attention',attention:'Needs attention',retrying:'Retrying',failed:'Failed',error:'Failed',cancelled:'Stopped',rejected:'Not eligible',quoted:'Price verified',eligible:'Available',out_of_stock:'Waiting for stock',waiting:'Waiting',ready:'Ready',disabled:'Disabled'};
 function badge(status='ready'){
   const color=['completed','confirmed','ready','saved','connected'].includes(status)?'success':['failed','error','reconciliation_required'].includes(status)?'error':['paused','attention','read_error','waiting_user','retrying'].includes(status)?'warning':['watching','running','preparing','carting','submitting'].includes(status)?'processing':'neutral';
   return `<span class="badge ${color}"><span class="status-dot"></span>${esc(statusNames[status]||String(status).replaceAll('_',' '))}</span>`;
@@ -26,6 +26,10 @@ async function refresh(force=false){
   refreshPending=true;
   try{
     if(view==='task_groups'&&stateLoaded&&!force){
+      const next=await api('task-workspace');
+      const changed=['groups','tasks','active'].some(key=>JSON.stringify(next[key])!==JSON.stringify(state[key]));
+      Object.assign(state,next);if(changed)render();
+    }else if(view==='saved_plans'&&stateLoaded&&!force){
       if(taskGroupId)await loadTaskGroup();
       else{const next=(await api('task-groups')).groups;if(JSON.stringify(next)!==JSON.stringify(state.task_groups)){state.task_groups=next;render();}}
     }else{
@@ -41,7 +45,7 @@ function hydrateIcons(){document.querySelectorAll('[data-icon]').forEach(el=>{el
 // Patch changed nodes in the runtime view, preserving focus and unchanged rows.
 function updateRegion(root,html){
   const template=document.createElement('template');template.innerHTML=html;
-  function key(node){if(node.nodeType!==Node.ELEMENT_NODE)return '';const attrs=[...node.attributes].filter(a=>a.name.startsWith('data-tg-')||a.name==='data-account-row');return attrs.map(a=>a.name+'='+a.value).join('|');}
+  function key(node){if(node.nodeType!==Node.ELEMENT_NODE)return '';const attrs=[...node.attributes].filter(a=>a.name.startsWith('data-tg-')||a.name.startsWith('data-work-')||a.name==='data-preserve-draft'||a.name==='data-task-row'||a.name==='data-account-row');return attrs.map(a=>a.name+'='+a.value).join('|');}
   function patch(parent,next){
     for(let i=0;i<next.childNodes.length;i++){
       const incoming=next.childNodes[i];let current=parent.childNodes[i];
@@ -52,6 +56,7 @@ function updateRegion(root,html){
         parent.insertBefore(existing||incoming.cloneNode(true),current);current=parent.childNodes[i];
       }else if(!incomingKey&&key(current)){current.replaceWith(incoming.cloneNode(true));continue;}
       if(current.isEqualNode(incoming))continue;
+      if(current.nodeType===Node.ELEMENT_NODE&&current.hasAttribute('data-preserve-draft')&&current.getAttribute('data-preserve-draft')===incoming.getAttribute?.('data-preserve-draft'))continue;
       if(current.nodeType!==incoming.nodeType||current.nodeName!==incoming.nodeName){current.replaceWith(incoming.cloneNode(true));continue;}
       if(current.nodeType===Node.TEXT_NODE){current.nodeValue=incoming.nodeValue;continue;}
       if(current.nodeType!==Node.ELEMENT_NODE)continue;

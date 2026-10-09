@@ -109,7 +109,7 @@ function settingsView() {
   const nav = settingsSections.map(([key,label]) => `<button type="button" id="settings-tab-${key}" role="tab" aria-controls="settings-panel-${key}" aria-selected="${settingsTab === key}" tabindex="${settingsTab === key ? 0 : -1}" data-settings-tab="${key}" class="${settingsTab === key ? 'selected' : ''}">${label}</button>`).join('');
   const html = `<div data-settings-shell class="settings-workspace"><div class="settings-navigation"><div role="tablist" aria-label="Settings sections" aria-orientation="vertical">${nav}</div><button type="button" data-context-view="troubleshooting">Troubleshooting ↗</button></div><form id="settings-form" novalidate><div class="settings-panels">${settingsPanel('general',general)}${settingsPanel('browser',browser)}${settingsPanel('notifications',notifications)}${settingsPanel('integrations',connections)}${settingsPanel('data',data)}</div><div class="settings-savebar"><p id="settings-error" role="alert" tabindex="-1">${esc(settingsError)}</p><div class="setting-actions"><span data-settings-status role="status"></span><button type="button" data-settings-discard>Discard changes</button><button class="primary" type="submit">Save changes</button></div></div></form></div>`;
   queueMicrotask(() => { updateSettingsStatus(); loadInstalledBrowsers(); });
-  return '<div class="settings-defaults"><div><h2>Purchasing defaults</h2><p class="help">Shared by groups. Individual overrides always take precedence.</p></div><button data-purchasing-defaults>Manage defaults</button></div>'+html;
+  return html;
 }
 
 function captureSettingsDraft() {

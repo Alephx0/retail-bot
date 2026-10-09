@@ -11,16 +11,17 @@ function filteredResources(kind){const folder=resourceFolder(kind);return state[
 function render(){
   if(!titles[view])view='task_groups';
   document.body.classList.toggle('settings-open',view==='settings');
-  $('.page-heading').hidden=view==='task_groups'&&!!taskGroupId;
+  $('.page-heading').hidden=view==='task_groups'&&!!groupId||view==='saved_plans'&&!!taskGroupId;
   $('#trace-recording').hidden=!state.settings[0]?.trace_enabled;
   const meta=titles[view];$('#title').textContent=meta[0];$('#crumb').textContent=meta[0];$('#subtitle').textContent=meta[1];$('#primary').hidden=!meta[2];$('#primary').innerHTML=(meta[2]?icon(view==='checkouts'?'file-text':'plus',16):'')+esc(meta[2].replace(/^[+\uFF0B]\s*/,''));
 
-  document.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('active',x.dataset.view===view));$('#nav-count').textContent=(state.task_groups||[]).length;
+  document.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('active',x.dataset.view===view));$('#nav-count').textContent=state.groups.length;
   const screen=$('#screen'),focused=screen.contains(document.activeElement)&&['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!['checkbox','color'].includes(document.activeElement.type);
   if(focused)return;
 
   if(view==='home'){screen.innerHTML=homeView();loadAnalytics();}
-  else if(view==='task_groups'){screen.innerHTML=taskGroupView();}
+  else if(view==='task_groups'){updateRegion(screen,taskWorkspace());const form=screen.querySelector('[data-work-settings]');if(form)form.querySelector('[type=submit]').disabled=state.tasks.some(t=>t.group_id===groupId&&state.active.includes(t.id));}
+  else if(view==='saved_plans'){screen.innerHTML=taskGroupView();}
 
   else if(['accounts','profiles','proxies','input_lists'].includes(view))screen.innerHTML=resourceView(view);
   else if(view==='tools')screen.innerHTML=toolsView();
@@ -29,7 +30,7 @@ function render(){
   else if(view==='troubleshooting'){if(!screen.querySelector('[data-troubleshooting-shell]'))screen.innerHTML=troubleshootingView();}
   else if(view==='feed')screen.innerHTML=feed();
   else if(view==='events')screen.innerHTML=events();
-  else if(view==='checkouts')screen.innerHTML=checkouts();
+  else if(view==='checkouts')screen.innerHTML=checkouts()+submissionJournal();
   else screen.innerHTML=featureView(view);
   hydrateIcons();hydrateTabs();
 }
@@ -56,7 +57,6 @@ document.addEventListener('click',async event=>{
     if(b.dataset.removeMember){await api('organization/members','POST',{folder_id:resourceFolder(view),resource_id:b.dataset.removeMember,remove:true});await refresh();}
     if(b.dataset.resourceCreate)openEditor(b.dataset.resourceCreate);
     if(b.dataset.period){homePeriod=b.dataset.period;homeReport=null;render();}
-    if(b.hasAttribute('data-purchasing-defaults'))await editPurchasingDefaults();
     if(b.dataset.settingsTab)activateSettingsTab(b.dataset.settingsTab);
     if(b.dataset.contextView){navigate(b.dataset.contextView);}
     if(b.hasAttribute('data-export-orders'))exportCSV();
@@ -76,4 +76,4 @@ function decorateResourceEditor(kind,id){if(!$('#modal').open)return;if(!id&&res
   fields.innerHTML=tabs([['general','General'],['shipping','Shipping'],['billing','Billing'],['payment','Payment']],'general','data-profile-tab');for(const [key,nodes] of Object.entries(sections)){const panel=document.createElement('section');panel.dataset.pane=key;panel.hidden=key!=='general';nodes.forEach(node=>panel.append(node));fields.append(panel);}fields.querySelectorAll('[data-profile-tab]').forEach(button=>button.onclick=()=>{setPane(fields,button.dataset.profileTab);fields.querySelectorAll('[data-profile-tab]').forEach(x=>{x.classList.toggle('selected',x===button);x.setAttribute('aria-selected',String(x===button));});hydrateTabs();});
 }
 }
-function toolsView(){return '<div class="tool-grid">'+[['profiles','credit-card','Shipping & payment profiles','Reusable address and payment details.'],['proxies','globe','Connections','Manage and test proxy lists.'],['input_lists','file-text','Product lists','Reuse saved products in your task groups.'],['manager','users','Account utilities','Verify sessions and update account relationships in bulk.'],['mailboxes','mail','Mailboxes','Email verification connections.'],['solvers','key-round','Verification services','Optional verification integrations.'],['feed','package','Product observations','Recent availability and price checks.'],['troubleshooting','cable','Diagnostics','Inspect failures and recovery evidence.']].map(([v,i,t,h])=>`<button class="tool-card" data-context-view="${v}">${icon(i,22)}<span><strong>${t}</strong><small>${h}</small></span>${icon('chevron-right',16)}</button>`).join('')+'</div>';}
+function toolsView(){return '<div class="tool-grid">'+[['saved_plans','layers','Saved purchasing plans','Review plans and outcomes from the previous workspace.'],['profiles','credit-card','Shipping & payment profiles','Reusable address and payment details.'],['proxies','globe','Connections','Manage and test proxy lists.'],['input_lists','file-text','Product lists','Reuse saved products in your task groups.'],['manager','users','Account utilities','Verify sessions and update account relationships in bulk.'],['mailboxes','mail','Mailboxes','Email verification connections.'],['solvers','key-round','Verification services','Optional verification integrations.'],['feed','package','Product observations','Recent availability and price checks.'],['troubleshooting','cable','Diagnostics','Inspect failures and recovery evidence.']].map(([v,i,t,h])=>`<button class="tool-card" data-context-view="${v}">${icon(i,22)}<span><strong>${t}</strong><small>${h}</small></span>${icon('chevron-right',16)}</button>`).join('')+'</div>';}

@@ -1,11 +1,10 @@
 # Retail Desk
 
-This branch implements the [simplified retail workspace](docs/workspace-overhaul.md):
-shared purchasing objectives, inherited defaults, independent account overrides,
-bounded concurrent execution and a redesigned responsive interface. Start in
-**Task Groups**. Existing plans can be imported there; the previous scheduler
-is retired. The report covers design decisions, safeguards, measured performance
-and validation. [AGENTS.md](AGENTS.md) defines the development standards.
+This branch restores the [original group and task workflow](docs/original-task-workflow.md)
+with the modern responsive interface. Create a group, add independent account tasks,
+then start all or selected tasks. Existing groups work directly. The newer purchasing
+plans retain their history and outcome controls under Tools. [AGENTS.md](AGENTS.md)
+defines the development standards.
 
 A local retail automation workspace inspired by the public Refract and Stellar workflows. Version 0.4 adds a Home dashboard, canonical resource folders, profile/account assignment previews, contextual tabs, account session management, structured task states, and independent monitoring/cart/checkout services. This is an independent implementation, **not full parity with either commercial bot**.
 
@@ -42,19 +41,19 @@ Open **http://127.0.0.1:8765**. Subsequent launches can use `start.ps1`. Keep th
 
 ## Amazon setup
 
-1. Choose **Task Groups → Create group**, enter an ASIN and save with the default Simulation mode. Simulation does not make Amazon requests or invoke paid solvers.
+1. Choose **Task Groups → Create group**, enter a name, retailer, monitor input and order limit. Add a task in Simulation mode. Simulation does not make Amazon requests or invoke paid solvers.
 2. If needed, add an IMAP mailbox using your provider's host and app password. Test the TLS connection. OAuth-only mailboxes are not supported yet.
 3. Add an account with Amazon US, email, optional password and authenticator secret. Link its mailbox and CAPTCHA provider. **Open** in Accounts opens a visible sign-in browser directly, without a Take Control dialog. Complete remaining verification in that window; a fresh account-page check saves the session automatically. Managed sign-ins use a separate visible browser even when tasks are configured as headless. Existing externally connected browsers keep their own window mode. **Save session** remains a manual fallback. Take Control is reserved for active tasks.
 4. Set default shipping and payment methods on Amazon. Profiles do not override them.
 5. Create a task group with ASINs or a reusable input list. Formats: `ASIN`, `ASIN;max_price`, `ASIN;offer_id`, `ASIN;max_price;offer_id`. Amazon product URLs and decimal caps are accepted.
-6. Select participating accounts. Their saved connections and browser profiles are used independently. Test proxy health from Tools if needed; this measures reachability, not retailer acceptance.
-7. Save and start the group, or configure an optional schedule. Use an account row's settings to override defaults only for that assignment. **Notify only** never carts. **Review** prepares checkout for manual confirmation. **Automatic** may place a real order once started, when all checks pass.
+6. Choose **Add tasks**, select one or more accounts, and choose quantity and task behavior. Account connections are used by default; task-specific choices remain available. Test proxy health from Tools if needed; this measures reachability, not retailer acceptance.
+7. Start individual, selected or all tasks. Each task can be edited independently after stopping it. **Monitor only** never carts. **Cart + browser review** prepares checkout for manual confirmation. **Automatic checkout** may place a real order once started. Optional group schedules retain the same task settings.
 
 Automatic mode requires Amazon US and a recognized checkout layout with exactly the target ASIN, verified quantity, unit price, allowed seller/condition, an order total within the group budget and a recognized place-order button. The engine writes its submission intent before clicking. An uncertain response is never retried automatically. A task with a submission record cannot restart live; review Amazon order history before intentionally creating a new purchasing task.
 
 Unknown checkout layouts and mixed carts fall back to browser review. In review mode, budgets gate the observed item subtotal; **verify the final tax/shipping-inclusive total yourself**. Supported Amazon CVV forms can use the encrypted account CVV. Bank 3DS and unsupported verification layouts require interaction. Order confirmation is not proof of successful payment or fulfillment. When an observed payment prompt follows confirmation, the task stays open for approval and records payment verification separately. The order-attempt journal remains visible even if no confirmation was received.
 
-One account lease protects each live browser session. Other accounts execute independently within resource limits. Stopping does not clear a retailer cart or cancel an order. Interrupted group runs recover paused and require explicit review/resume. First-success mode is the default; multiple-success and unit targets are optional purchase goals. Uncertain mutations retain their reservations and never retry automatically.
+Tasks sharing a live account queue behind an account lock; unrelated accounts execute within the browser-worker limit. Group edits require stopping its tasks. An optional task order limit overrides the group limit without changing other tasks. Multiple tasks can result in multiple purchases. A pending submission blocks further live tasks on that account until verified. Stopping does not clear a retailer cart or cancel an order. Saved purchasing plans retain their quota journal and uncertain-outcome reconciliation.
 
 ## Current limits
 
@@ -170,7 +169,7 @@ Run `python -m pytest -q` for fixture tests. `scripts/smoke_workspace.py` target
 
 ## Version 0.4 architecture and workflows
 
-The eight sidebar destinations are Home, Task Groups, Accounts, Profiles, Proxies, Input Lists, Account Manager, and Settings. Settings has General, Browser, Notifications, Connections, and Data & privacy sections. Email and solvers are in Connections; retailer status is linked from General; observations and logs are in Troubleshooting. See [the settings guide](docs/settings.md) for save behavior and defaults. Profiles use General/Shipping/Billing/Payment tabs. Task groups use General/Monitoring/Checkout/Advanced tabs.
+Primary navigation is Task Groups, Overview, Accounts, Orders, Activity, Tools and Settings. Optional resources live in Tools. Settings retains General, Browser, Notifications, Connections and Data & privacy. Task groups use a compact settings sidebar and individual task table. See [the workflow guide](docs/original-task-workflow.md).
 
 `retail/resources.py` owns canonical resource memberships and account/profile relationships. `All` is a virtual view. Existing named account/profile groups migrate once without copying resources. Create New inside a folder adds membership; Import Existing adds references to existing records. Deleting a folder preserves its resources.
 

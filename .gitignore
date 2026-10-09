@@ -1,6 +1,7 @@
 .venv/
 node_modules/
 data/
+data-restored-tasks/
 __pycache__/
 .pytest_cache/
 artifacts/

@@ -49,7 +49,6 @@ def create_app(data_dir=None):
         app.state.engine = Engine(app.state.store)
         app.state.group_coordinator = Coordinator(app.state.engine)
         app.state.engine.group_coordinator = app.state.group_coordinator
-        app.state.engine.legacy_read_only = True
         app.state.proxy_health = ProxyHealth(app.state.store)
         for record in app.state.store.all("harvesters"):
             app.state.store.delete("harvesters", record["id"])
@@ -57,8 +56,8 @@ def create_app(data_dir=None):
             if record.get("status") == "testing":
                 app.state.store.put("proxy_health", {**record, "status": "interrupted"})
         try:
+            await app.state.group_coordinator.boot(schedule=False)
             await app.state.engine.boot()
-            await app.state.group_coordinator.boot()
             yield
         finally:
             try:
@@ -125,6 +124,8 @@ def create_app(data_dir=None):
         if id in app.state.engine.jobs:
             raise HTTPException(409, "Stop the task before editing")
         valid.update(status="scheduled" if valid["scheduled_at"] else "idle", message="Scheduled" if valid["scheduled_at"] else "Ready to start", updated_at=now())
+        if not id:
+            valid['created_at'] = now()
         return valid
 
     def public(kind, value):
@@ -253,6 +254,8 @@ def create_app(data_dir=None):
                 old.pop('session_storage', None)
                 old["logged_in"] = False
         if kind == "groups":
+            if id and any(t['group_id'] == id and t['id'] in app.state.engine.jobs for t in store().all('tasks')):
+                raise HTTPException(409, 'Stop this group before changing its settings')
             if "schedule" in data:
                 valid["schedule"]["configured_at"] = now()
             if id and valid["retailer"] != old.get("retailer") and any(t["group_id"] == id for t in store().all("tasks")):
@@ -570,6 +573,32 @@ def create_app(data_dir=None):
         except ValidationError:
             raise HTTPException(422, "Task settings are invalid; no tasks were created")
         return {"created": store().put_many("tasks", records)}
+
+    @app.get('/api/task-workspace')
+    async def task_workspace():
+        return {kind: store().all(kind) for kind in ('groups', 'tasks')} | {
+            'active': list(app.state.engine.jobs),
+        }
+
+    @app.post('/api/task-workspace/{group_id}/duplicate')
+    async def duplicate_task_group(group_id: str):
+        import json
+        import uuid
+        original = require('groups', group_id)
+        group = Group.model_validate(original).model_dump(mode='json')
+        group.update(id=uuid.uuid4().hex, name=(group['name']+' copy')[:100],
+                     schedule={'auto_start': False, 'days': [], 'slots': [], 'configured_at': None})
+        records = [('groups', group)]
+        for task in store().all('tasks'):
+            if task['group_id'] == group_id:
+                copy = Task.model_validate(task).model_dump(mode='json')
+                copy.update(group_id=group['id'], simulation=True, scheduled_at=None)
+                copy.update(id=uuid.uuid4().hex, status='idle', message='Ready to start')
+                records.append(('tasks', copy))
+        rows = [(record['id'], kind, store().cipher.encrypt(json.dumps(record).encode())) for kind, record in records]
+        with store().db:
+            store().db.executemany('INSERT INTO records VALUES (?, ?, ?)', rows)
+        return group
 
     @app.post("/api/organization/members")
     async def memberships(request: Request):
