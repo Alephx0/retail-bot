@@ -14,35 +14,24 @@ function editTaskGroup(g=null){
     `<label for="group-products">Monitor input</label><textarea id="group-products" name="products" rows="3" placeholder="Product link or ASIN, one per line">${esc(current.products)}</textarea>`+
     input('max_total','Maximum order total',current.max_total,'number','min="0" step="0.01" required')+
     '<p class="help">Includes shipping and tax. Add account tasks after creating the group.</p>',async data=>{
-      const result=await api('groups'+(g?'/'+g.id:''),g?'PUT':'POST',{...current,...data,max_total:Number(data.max_total)});groupId=result.id;selected.clear();
+      const result=await api('groups'+(g?'/'+g.id:''),g?'PUT':'POST',{...current,...data,max_total:Number(data.max_total)});groupId=result.id;taskGroupSettingsTab='general';selected.clear();
     },g?'Save group':'Create group');
 }
-function editMonitorSettings(g){
-  taskForm('Monitor settings',
-    select('input_list_id','Saved product list',[['','Use group monitor input'],...state.input_lists.filter(x=>x.retailer===g.retailer).map(x=>[x.id,x.name])],g.input_list_id||'')+
-    input('delay_ms','Check interval (ms)',g.delay_ms??4500,'number','min="3500" max="3600000" required')+
-    select('mode','Monitor for',[['restock','Restocks'],['deals','Deals']],g.mode||'restock')+
-    check('allow_third_party','Allow third-party sellers',g.allow_third_party)+check('allow_used','Allow used products',g.allow_used)+
-    `<details><summary>Offer and deal filters</summary>${input('offer_id','Offer ID',g.offer_id||'')}${input('max_price','Maximum item price',g.max_price??'','number','min="0" step="0.01"')}${input('min_discount','Minimum discount (%)',g.min_discount||0,'number','min="0" max="100"')}${input('min_savings','Minimum savings',g.min_savings||0,'number','min="0" step="0.01"')}${check('only_freebies','Only free items in deals mode',g.only_freebies)}</details>`,async data=>{
-      for(const k of ['delay_ms','min_discount','min_savings'])data[k]=Number(data[k]);data.max_price=data.max_price===''?null:Number(data.max_price);await api('groups/'+g.id,'PUT',data);
-    });
-}
 function editAccountTask(task=null){
+  if(!task){createProfileTasks();return;}
   const g=state.groups.find(x=>x.id===groupId),accounts=state.accounts.filter(a=>a.retailer===g.retailer);
-  const t=task||{simulation:true,quantity:1,checkout_mode:'review',use_account_proxy:true};
-  const accountInput=task?select('account_id','Account',[['','Virtual account (simulation)'],...accounts.map(a=>[a.id,a.name])],t.account_id):
-    `<fieldset><legend>Accounts</legend><div class="account-picks">${accounts.map(a=>`<label class="account-pick"><input type="checkbox" data-task-account="${a.id}"><span>${esc(a.name)}<small>${esc(a.email||'')}</small></span></label>`).join('')||'<p class="help">Add an account in Accounts, or test with a virtual account.</p>'}</div><p class="help">One independent task per selected account. No selection uses a virtual account in simulation.</p></fieldset>`;
-  const d=taskForm(task?'Edit task':'Add tasks',accountInput+
+  const t=task;
+  const accountInput=select('account_id','Account',[['','Virtual account (simulation)'],...accounts.map(a=>[a.id,a.name])],t.account_id);
+  const d=taskForm('Edit task',accountInput+
+    select('profile_id','Checkout profile',[['','None'],...state.profiles.map(p=>[p.id,p.name])],t.profile_id||'')+
+    '<p class="help">Amazon uses shipping and payment saved on the account. Profile assignment does not replace those defaults.</p>'+
     select('simulation','Execution',[['true','Simulation'],['false','Live']],String(t.simulation))+
     input('quantity','Item quantity',t.quantity,'number','min="1" max="30" required')+
     select('checkout_mode','Task behavior',[['review','Cart + browser review'],['automatic','Automatic checkout'],['monitor','Monitor only'],['quote','Checkout total only']],t.checkout_mode)+
-    `<details><summary>Task options</summary>${input('max_total','Maximum order total',t.max_total??'','number',`min="0" step="0.01" placeholder="Use group limit: ${g.max_total}"`)}<p class="help">Leave blank to use the group limit. Each task can confirm one order; multiple tasks can produce multiple purchases.</p>${check('use_account_proxy','Use account connection',t.use_account_proxy)}${select('proxy_id','Task connection',[['','Direct'],...state.proxies.map(p=>[p.id,p.name])],t.proxy_id||'')}${check('use_buy_now','Use Buy Now when available',t.use_buy_now)}${check('force_free_shipping','Require free shipping',t.force_free_shipping)}${check('auto_open_3ds','Open browser for payment verification',t.auto_open_3ds)}${input('scheduled_at','Individual start time',t.scheduled_at?new Date(new Date(t.scheduled_at)-new Date(t.scheduled_at).getTimezoneOffset()*60000).toISOString().slice(0,16):'','datetime-local')}${input('retry_delay_ms','Retry delay (ms)',t.retry_delay_ms??3500,'number','min="1000" max="3600000" required')}${task?'':input('task_count','Tasks per account',1,'number','min="1" max="100" required')}</details>`,async (data,form)=>{
+    `<details><summary>Task options</summary>${input('max_total','Maximum order total',t.max_total??'','number',`min="0" step="0.01" placeholder="Use group limit: ${g.max_total}"`)}<p class="help">Leave blank to use the group limit. Each task can confirm one order; multiple tasks can produce multiple purchases.</p>${check('use_account_proxy','Use account connection',t.use_account_proxy)}${select('proxy_id','Task connection',[['','Direct'],...state.proxies.map(p=>[p.id,p.name])],t.proxy_id||'')}${check('use_buy_now','Use Buy Now when available',t.use_buy_now)}${check('force_free_shipping','Require free shipping',t.force_free_shipping)}${check('auto_open_3ds','Open browser for payment verification',t.auto_open_3ds)}${input('scheduled_at','Individual start time',t.scheduled_at?new Date(new Date(t.scheduled_at)-new Date(t.scheduled_at).getTimezoneOffset()*60000).toISOString().slice(0,16):'','datetime-local')}${input('retry_delay_ms','Retry delay (ms)',t.retry_delay_ms??3500,'number','min="1000" max="3600000" required')}</details>`,async (data,form)=>{
       const payload={...t,...data,group_id:g.id,simulation:data.simulation==='true',quantity:Number(data.quantity),max_total:data.max_total===''?null:Number(data.max_total),retry_delay_ms:Number(data.retry_delay_ms),scheduled_at:data.scheduled_at?new Date(data.scheduled_at).toISOString():null};
-      if(task){await api('tasks/'+task.id,'PUT',payload);return;}
-      const ids=[...form.querySelectorAll('[data-task-account]:checked')].map(el=>el.dataset.taskAccount);
-      if(!ids.length){if(!payload.simulation)throw Error('Select an account for a live task.');if(Number(data.task_count)!==1)throw Error('Select accounts to create multiple tasks.');await api('tasks','POST',payload);}
-      else await api('task-batches/create','POST',{...payload,account_ids:ids,task_count:Number(data.task_count)});
-    },task?'Save task':'Create tasks');
+      await api('tasks/'+task.id,'PUT',payload);
+    },'Save task');
   const f=d.querySelector('form'),sync=()=>f.elements.proxy_id.disabled=f.elements.use_account_proxy.checked;
   f.elements.use_account_proxy.onchange=sync;sync();
 }

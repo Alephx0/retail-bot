@@ -12,7 +12,7 @@
 
 ## Product and interface
 
-- Justify every new setting with a concrete user need. Group creation has name, retailer, monitor input and order limit. Add tasks separately with account selection, execution mode, quantity and behavior. Keep purchase goals, unit quotas and global purchasing inheritance out of the primary workflow.
+- Justify every new setting with a concrete user need. Group creation has name, retailer, monitor input and order limit. Preserve the requested General, Monitoring, Checkout and Advanced group tabs and profile/profile-group assignment previews in Add tasks. Keep purchase goals, unit quotas and global purchasing inheritance out of the primary workflow.
 - Use progressive disclosure for optional preferences. Preserve explicit settings when a form edits other values. Show whether an account inherits or overrides a setting.
 - Use the existing native HTML component patterns: labelled inputs, native modal dialogs, confirmation with cancel focused, accessible buttons and tab navigation. The frontend is vanilla JavaScript; do not add React just to consume shadcn components.
 - Use the local Iconify Lucide subset in `static/icons.js`. Verify icons through Iconify before adding them. Include accessible names for icon buttons. Do not introduce another icon family, emojis or runtime CDN requests.

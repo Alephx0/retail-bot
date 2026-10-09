@@ -20,7 +20,7 @@ function render(){
   if(focused)return;
 
   if(view==='home'){screen.innerHTML=homeView();loadAnalytics();}
-  else if(view==='task_groups'){updateRegion(screen,taskWorkspace());const form=screen.querySelector('[data-work-settings]');if(form)form.querySelector('[type=submit]').disabled=state.tasks.some(t=>t.group_id===groupId&&state.active.includes(t.id));}
+  else if(view==='task_groups'){updateRegion(screen,taskWorkspace());const heading=screen.querySelector('.tg-header');if(heading){heading.classList.add('group-highlighted');heading.style.borderLeftColor=state.groups.find(g=>g.id===groupId)?.highlight||'#64d9ad';}const form=screen.querySelector('[data-work-settings]');if(form)form.querySelector('[type=submit]').disabled=state.tasks.some(t=>t.group_id===groupId&&state.active.includes(t.id));}
   else if(view==='saved_plans'){screen.innerHTML=taskGroupView();}
 
   else if(['accounts','profiles','proxies','input_lists'].includes(view))screen.innerHTML=resourceView(view);
