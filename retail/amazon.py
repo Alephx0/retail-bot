@@ -1055,7 +1055,7 @@ class Amazon:
                 raise Attention(f'Checkout navigation needs review: {exc}. AI cannot bypass missing item or price evidence') from exc
         raise Attention('Checkout navigation did not reach a verifiable order review after five safe steps')
 
-    async def checkout_snapshot(self, page, asin, quantity, max_total, *, max_unit_price=None, allow_third_party=False, allow_used=False):
+    async def checkout_snapshot(self, page, asin, quantity, max_total, *, max_unit_price=None, allow_third_party=False, allow_used=False, allow_recovery=True):
         """Fail closed: only the known US checkout review structure may submit."""
         if urlparse(page.url).hostname != "www.amazon.com":
             raise Attention("Automatic order submission currently requires Amazon US")
@@ -1137,7 +1137,7 @@ class Amazon:
                 values.append(money(text))
         if not values and self.agent and self.store and (self.store.get('settings', 'settings') or {}).get('agent_mode') in ('recovery', 'agent'):
             try:
-                values = [await self.agent.resolve_total(page, set(DOMAINS.values()))]
+                values = [await self.agent.resolve_total(page, set(DOMAINS.values()), allow_model=allow_recovery)]
             except InteractionError as exc:
                 raise Attention('Final order total changed and AI could not verify it: ' + str(exc)) from exc
         if not values or any(value is None or value != values[0] for value in values) or values[0] > max_total:
@@ -1145,6 +1145,8 @@ class Amazon:
         try:
             button = getattr(page, '_retail_submit_control', None)
             if button is None:
+                if not allow_recovery:
+                    raise Attention('Validated submission control is missing')
                 button = await self.resolve_action(page,"SUBMIT_ORDER")
             await button.click(trial=True, timeout=3000)
         except InteractionError as exc:
@@ -1167,8 +1169,10 @@ class Amazon:
             entry = {'label': match[1].strip(), 'amount': amount}
             if entry not in components:
                 components.append(entry)
-        return {"total": values[0], "quantity": quantity, "asin": asin, "currency": "USD",
-                "unit_price": unit_price, "price_components": components}
+        snapshot = {"total": values[0], "quantity": quantity, "asin": asin, "currency": "USD",
+                    "unit_price": unit_price, "price_components": components}
+        page._retail_review['snapshot'] = snapshot
+        return snapshot
 
     async def submit_order(self, page):
         # Caller must persist the submission intent BEFORE invoking this method.
@@ -1182,7 +1186,12 @@ class Amazon:
             raise Attention('Checkout review expired or changed during input preparation; submission stopped')
         # Check financial facts again after any agent round trips, using the
         # already validated control. There is no model call after journaling.
-        await self.checkout_snapshot(page, *review['args'], **review['limits'])
+        fresh = await self.checkout_snapshot(page, *review['args'], **review['limits'], allow_recovery=False)
+        if any(fresh.get(key) != review['snapshot'].get(key) for key in ('asin','quantity','currency','total','unit_price')):
+            raise Attention('Checkout facts changed after submission intent; reconcile before retrying')
+        gate = getattr(page, '_retail_submit_gate', None)
+        if gate:
+            gate()
         button = page._retail_submit_control
         page._retail_review = None
         page._retail_submit_control = None
@@ -1206,21 +1215,9 @@ class Amazon:
             return None
         if order:
             return order[0]
-        path = urlparse(page.url).path.lower()
-        if path != '/gp/buy/thankyou/handlers/display.html':
-            return None
-        exact_heading = page.get_by_role('heading', name=re.compile(r'^order placed,? thanks!?$', re.I))
-        if await exact_heading.count() != 1:
-            return None
-        task_id = getattr(page.context, '_retail_task_id', None)
-        journal = self.store.get('submissions', 'submission-' + task_id) if self.store and task_id else None
-        if journal:
-            asin = journal.get('asin')
-            quantity = journal.get('quantity')
-            links = page.locator(f"a[href*='/dp/{asin}']") if asin else page.locator('a[href*="/dp/"]')
-            if await links.count() != 1 or not quantity or not re.search(rf'\b{quantity}\s*$', await links.first.inner_text()):
-                return None
-        return 'amazon-confirmed-' + uuid.uuid4().hex
+        # A success heading without a retailer order ID is an uncertain outcome.
+        # Invented IDs cannot support deduplication or reconciliation.
+        return None
 
     async def free_shipping(self, page):
         options = page.locator("label").filter(has_text=re.compile(r"FREE.*(?:delivery|shipping)|(?:delivery|shipping).*FREE", re.I))

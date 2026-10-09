@@ -41,7 +41,7 @@ def test_automatic_login_and_encrypted_session_capture(tmp_path):
             assert await adapter.confirmation(page) == '123-1234567-1234567'
             await page.goto('https://www.amazon.com/gp/buy/thankyou/handlers/display.html')
             await page.set_content('<h4>Order placed, thanks!</h4><a href="/dp/B012345678">Fixture product 1</a>')
-            assert (await adapter.confirmation(page)).startswith('amazon-confirmed-')
+            assert await adapter.confirmation(page) is None
             await browser.close()
         store.db.close()
     asyncio.run(scenario())

@@ -14,8 +14,7 @@ class BrowserPool:
         self.sessions = {}
         self.lock = asyncio.Lock()
 
-    async def _drop(self, account_id):
-        entry=self.sessions.pop(account_id,None)
+    async def _close_entry(self, entry):
         if entry:
             try:
                 await entry['context'].close()
@@ -44,30 +43,39 @@ class BrowserPool:
             claim=self.repo.claimed(account_id)
             if claim and claim!=attempt_id:
                 raise Conflict('Account is reserved by another attempt')
+            stale=None
             async with self.lock:
                 entry=self.sessions.get(account_id)
                 if entry and (entry['page'].is_closed() or entry['profile_key']!=profile_key):
-                    await self._drop(account_id); entry=None
-                if not entry:
+                    stale=self.sessions.pop(account_id); entry=None
+                if entry:
+                    entry['busy']=True
+            await self._close_entry(stale)
+            if not entry:
+                evicted=None
+                async with self.lock:
                     if self.engine.browser_slots.locked():
                         idle=[(k,v) for k,v in self.sessions.items() if not v['busy'] and not self.repo.claimed(k)]
                         if idle:
-                            await self._drop(min(idle,key=lambda p:p[1]['used'])[0])
-                    if self.engine.browser_slots.locked():
-                        raise Conflict('Waiting for a browser slot')
-                    await self.engine.browser_slots.acquire()
-                    context=None
+                            evicted=self.sessions.pop(min(idle,key=lambda p:p[1]['used'])[0])
+                await self._close_entry(evicted)
+                # No browser I/O under the pool lock. The account lock owns this creation.
+                if self.engine.browser_slots.locked():
+                    raise Conflict('Waiting for a browser slot')
+                await self.engine.browser_slots.acquire()
+                context=None
+                try:
+                    context=await self.engine.amazon.context(account)
+                    page=await context.new_page()
+                    entry={'context':context,'page':page,'busy':True,'used':time.monotonic(),'profile_key':profile_key}
+                    self.sessions[account_id]=entry
+                except BaseException:
                     try:
-                        context=await self.engine.amazon.context(account)
-                        page=await context.new_page()
-                        entry={'context':context,'page':page,'busy':True,'used':time.monotonic(),'profile_key':profile_key}
-                        self.sessions[account_id]=entry
-                    except BaseException:
                         if context:
                             await context.close()
+                    finally:
                         self.engine.browser_slots.release()
-                        raise
-                entry['busy']=True
+                    raise
             yield entry
         finally:
             if entry:
@@ -76,18 +84,19 @@ class BrowserPool:
 
     async def trim(self, all_idle=False):
         async with self.lock:
-            for key, entry in list(self.sessions.items()):
-                claim=self.repo.claimed(key)
-                if not entry['busy'] and not claim and (all_idle or time.monotonic()-entry['used']>60):
-                    await self._drop(key)
+            entries=[self.sessions.pop(key) for key,entry in list(self.sessions.items())
+                     if not entry['busy'] and not self.repo.claimed(key)
+                     and (all_idle or time.monotonic()-entry['used']>60)]
+        await asyncio.gather(*(self._close_entry(entry) for entry in entries))
 
     async def discard(self, account_id):
         async with self.lock:
             if self.sessions.get(account_id,{}).get('busy'):
                 raise Conflict('Account browser operation is still running')
-            await self._drop(account_id)
+            entry=self.sessions.pop(account_id,None)
+        await self._close_entry(entry)
 
     async def close(self):
         async with self.lock:
-            for key in list(self.sessions):
-                await self._drop(key)
+            entries=list(self.sessions.values()); self.sessions.clear()
+        await asyncio.gather(*(self._close_entry(entry) for entry in entries))

@@ -49,7 +49,7 @@ def test_atomic_goal_account_and_money_reservations(tmp_path):
     store,repo,group,run=setup(tmp_path)
     a=reserve(repo,run)
     with pytest.raises(Conflict,match='busy'): reserve(repo,run)
-    assert repo.progress(run)=={'confirmed_units':0,'reserved_units':1,'spent_cents':0,'reserved_cents':9000}
+    assert repo.progress(run)=={'confirmed_units':0,'reserved_units':1,'spent_cents':0,'reserved_cents':9000,'confirmed_orders':0,'reserved_orders':1}
     repo.intent(a['id'],snapshot())
     repo.finish(a['id'],'confirmed','confirmed','ORDER-1',8000)
     b=reserve(repo,run)

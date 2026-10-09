@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..models import inputs
-from .domain import Plan, cents
+from .domain import Plan, cents, enabled_accounts, effective_plan
 from .repository import Conflict
 
 router=APIRouter()
@@ -81,15 +81,17 @@ async def duplicate(id:str,request:Request):
 async def detail(id:str,request:Request):
     c=service(request)
     try:
-        result=c.summary(c.repo.require('group',id)); run=result['run']
+        result=c.summary(c.repo.require('group',id))
+        run=c.repo.require('run',result['run']['id']) if result['run'] else None
         result['readiness']=c.readiness(result['plan'])
+        result['members']=[c.repo.member_state(run['id'],a) for a in enabled_accounts(run['plan'])] if run else []
         result['observations']=c.repo.all('observation',run['id']) if run else []
-        history=c.repo.group_attempts(id)
+        history=c.repo.group_attempts(id,limit=100)
         recent={a['id']:a for a in history[-100:]}
         recent.update({a['id']:a for a in history if a['state']=='reconciliation_required'})
         result['attempts']=[public_attempt(a) for a in recent.values()]
         result['events']=c.repo.group_events(id)
-        result['runs']=[{k:r[k] for k in ('id','state','created_at','revision_id')} for r in c.repo.all('run',id)[-50:]]
+        result['runs']=[{k:r[k] for k in ('id','state','created_at','revision_id')} for r in c.repo.all('run',id,limit=50)]
         return result
     except ValueError as exc:
         raise HTTPException(404,str(exc)) from exc
@@ -112,8 +114,17 @@ async def recheck(id:str,request:Request):
     try:
         group=c.repo.require('group',id); plan=c.repo.require('revision',group['revision_id'])['plan']
         for account_id in plan['account_ids']:
-            c.cooldowns.pop(account_id,None); c.read_errors.pop(account_id,None)
+            key=(group.get('active_run_id',''),account_id)
+            c.cooldowns.pop(key,None); c.read_errors.pop(key,None)
         return c.readiness(plan)
+    except ValueError as exc:
+        raise invalid(exc) from exc
+
+
+@router.post('/api/group-runs/{id}/accounts/{account_id}/{action}')
+async def member_command(id:str,account_id:str,action:str,request:Request):
+    try:
+        return await service(request).member_command(id,account_id,action)
     except ValueError as exc:
         raise invalid(exc) from exc
 
@@ -192,7 +203,7 @@ async def attempt_details(id:str,request:Request):
     c=service(request)
     try:
         a=c.repo.require('attempt',id)
-        return {'attempt':public_attempt(a),'plan':c.repo.require('run',a['run_id'])['plan'],
+        return {'attempt':public_attempt(a),'plan':effective_plan(c.repo.require('run',a['run_id'])['plan'],a['account_id']),
                 'browser_profile':a.get('browser_profile',{}),'events':[e for e in c.repo.events(a['run_id'],limit=500) if e['attempt_id']==id]}
     except ValueError as exc:
         raise invalid(exc) from exc
