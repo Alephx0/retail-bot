@@ -6,7 +6,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from .domain import Plan, windows, effective_plan, enabled_accounts, goal_met
+from .domain import Plan, windows, effective_plan, enabled_accounts, goal_met, resolve_defaults
 
 ACTIVE_RUNS = {'scheduled', 'preparing', 'watching', 'paused', 'stopping'}
 HELD = {'reserved', 'preparing', 'carting', 'reviewing', 'waiting_user', 'submitting', 'reconciliation_required', 'confirmed'}
@@ -112,7 +112,10 @@ class Repository:
 
     def get(self, kind, id):
         row = self.db.execute('SELECT payload FROM tg_records WHERE kind=? AND id=?', (kind, id)).fetchone()
-        return json.loads(self.store.cipher.decrypt(row[0])) if row else None
+        value=json.loads(self.store.cipher.decrypt(row[0])) if row else None
+        if value and kind=='revision':
+            value['plan']=resolve_defaults(value['plan'],self.store)
+        return value
 
     def require(self, kind, id):
         value = self.get(kind, id)
@@ -144,6 +147,10 @@ class Repository:
             'SELECT e.seq,e.run_id,e.payload FROM tg_events e JOIN tg_records r ON r.id=e.run_id WHERE r.kind=? AND r.owner=? ORDER BY e.seq DESC LIMIT ?',
             ('run',group_id,limit))]
 
+    def recent_events(self, limit=150):
+        return [dict(json.loads(self.store.cipher.decrypt(p)),seq=s,run_id=r) for s,r,p in self.db.execute(
+            'SELECT seq,run_id,payload FROM tg_events ORDER BY seq DESC LIMIT ?', (limit,))]
+
     def group_attempts(self, group_id, limit=None):
         sql = "SELECT a.id,a.payload FROM tg_records a JOIN tg_records r ON a.owner=r.id WHERE a.kind='attempt' AND r.kind='run' AND r.owner=? ORDER BY a.rowid DESC"
         rows = self.db.execute(sql + (' LIMIT ?' if limit else ''), (group_id, limit) if limit else (group_id,)).fetchall()
@@ -153,21 +160,37 @@ class Repository:
         return sorted(values.values(), key=lambda a:a['created_at'])
 
     def save_plan(self, data, group_id=None, expected_revision=None, legacy_id=''):
-        plan = Plan.model_validate(data).model_dump(mode='json',exclude_none=True)
+        plan = Plan.model_validate(resolve_defaults(data,self.store)).model_dump(mode='json',exclude_none=True)
+        plan['account_settings']={key:value for key,value in plan['account_settings'].items()
+                                  if not value['enabled'] or value['overrides']}
         with self.transaction():
             group = self.require('group', group_id) if group_id else {'id':uuid.uuid4().hex, 'created_at':stamp(), 'armed':False}
+            if group.get('archived'):
+                raise Conflict('This group has been deleted')
             if group_id and group['revision_id'] != expected_revision:
                 raise Conflict('This group changed. Refresh before saving.')
             if group.get('active_run_id'):
                 run = self.get('run', group['active_run_id'])
                 if run and run['state'] in ACTIVE_RUNS:
                     raise Conflict('Stop this run before editing its plan')
-            revision = {'id':uuid.uuid4().hex, 'plan':plan, 'at':stamp()}
+            saved={key:value for key,value in plan.items() if key not in plan['inherited_fields']}
+            revision = {'id':uuid.uuid4().hex, 'plan':saved, 'at':stamp()}
             self._put('revision', revision, group['id'])
             group.update(name=plan['name'], revision_id=revision['id'], updated_at=stamp(), armed=False)
             if legacy_id:
                 group['legacy_id'] = legacy_id
             return self._put('group', group)
+
+    def archive(self, group_id):
+        with self.transaction():
+            group=self.require('group',group_id)
+            if any(a['state'] in HELD-{'confirmed'} for a in self.group_attempts(group_id)):
+                raise Conflict('Resolve pending purchase outcomes before deleting this group')
+            if any(r['group_id']==group_id for r in self.active_runs()):
+                raise Conflict('Stop the group before deleting it')
+            group.update(archived=True,armed=False,updated_at=stamp())
+            self._put('group',group)
+            return group
 
     def start(self, group_id, key, current=None, occurrence=None):
         current = current or datetime.now(timezone.utc)
@@ -180,6 +203,8 @@ class Repository:
             if existing and existing['state'] in ACTIVE_RUNS:
                 return existing
             plan = Plan.model_validate(self.require('revision', group['revision_id'])['plan']).model_dump(mode='json',exclude_none=True)
+            if group.get('archived'):
+                raise Conflict('This group has been deleted')
             scheduled = plan['schedule']['kind'] != 'manual'
             if scheduled and occurrence is None:
                 occurrence = next((w for w in windows(plan['schedule'],current) if w['end']>current.isoformat()),None)

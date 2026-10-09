@@ -114,7 +114,28 @@ def goal_met(plan, progress):
     return progress['confirmed_units'] >= Plan.model_validate(plan).desired_units
 
 
+INHERITABLE = {'action', 'units_per_order', 'per_account_units', 'per_account_orders',
+               'allow_third_party', 'allow_used', 'max_read_errors', 'retry_delay_seconds',
+               'read_timeout_seconds', 'checkout_timeout_seconds', 'monitor_interval_ms'}
+
+
+def purchasing_defaults(store):
+    values = {key: Plan.model_fields[key].default for key in INHERITABLE}
+    values.update((store.get('task_group_defaults', 'defaults') or {}).get('values', {}))
+    values['monitor_interval_ms'] = (store.get('settings', 'settings') or {}).get('default_monitor_delay',4500)
+    return values
+
+
+def resolve_defaults(plan, store):
+    inherited = plan.get('inherited_fields', [])
+    if not isinstance(inherited, list) or any(not isinstance(key, str) or key not in INHERITABLE for key in inherited):
+        raise ValueError('Choose supported inherited defaults')
+    defaults = purchasing_defaults(store)
+    return {**plan, **{key:defaults[key] for key in inherited}}
+
+
 class Plan(Model):
+    inherited_fields: list[str] = Field(default_factory=list, max_length=11)
     name: str = Field(min_length=1, max_length=100)
     retailer: Literal['amazon'] = 'amazon'
     region: Literal['US', 'UK', 'CA'] = 'US'
@@ -150,6 +171,8 @@ class Plan(Model):
 
     @model_validator(mode='after')
     def valid(self):
+        if set(self.inherited_fields)-INHERITABLE or len(set(self.inherited_fields))!=len(self.inherited_fields):
+            raise ValueError('Choose supported inherited defaults')
         if set(self.account_settings) - set(self.account_ids):
             raise ValueError('Account settings must reference assigned accounts')
         for settings in self.account_settings.values():

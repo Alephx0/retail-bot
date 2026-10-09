@@ -7,7 +7,7 @@ from ..account_consistency import PurchaseCooldown
 from ..amazon import Attention, BackoffRequired
 from ..store import now
 from .browser_pool import BrowserPool
-from .domain import Plan, AccountOverrides, qualifying, windows, effective_plan, enabled_accounts, goal_met
+from .domain import Plan, AccountOverrides, qualifying, windows, effective_plan, enabled_accounts, goal_met, resolve_defaults
 from .execution import Executor
 from .repository import ACTIVE_RUNS, HELD, Conflict, Repository
 
@@ -25,7 +25,7 @@ class Coordinator:
     async def boot(self):
         self.repo.recover()
         for attempt in self.repo.all('attempt'):
-            if attempt['state']=='confirmed' and not attempt['simulation'] and not self.engine.store.get('checkouts','group-checkout-'+attempt['id']):
+            if attempt['state']=='confirmed' and not self.engine.store.get('checkouts','group-checkout-'+attempt['id']):
                 plan=self.repo.require('run',attempt['run_id'])['plan']
                 self.record_checkout(attempt['id'],attempt.get('observation',{}),
                     {'total':attempt['money_cents']/100,'currency':{'US':'USD','UK':'GBP','CA':'CAD'}[plan['region']]},attempt['order_id'])
@@ -47,8 +47,8 @@ class Coordinator:
         if until>self.clock():
             raise Conflict('Account purchase cooldown until '+until.isoformat())
 
-    def readiness(self, plan):
-        plan=Plan.model_validate(plan).model_dump(mode='json',exclude_none=True); errors=[]; accounts=[]
+    def readiness(self, plan, *, resolve=True):
+        plan=Plan.model_validate(resolve_defaults(plan,self.engine.store) if resolve else plan).model_dump(mode='json',exclude_none=True); errors=[]; accounts=[]
         for id in plan['account_ids']:
             a=self.engine.store.get('accounts',id)
             reason='Ready'
@@ -329,11 +329,14 @@ class Coordinator:
         self.engine.store.put('checkouts',{'task_id':attempt_id,'group_run_id':a['run_id'],'account_id':a['account_id'],
             'retailer':plan['retailer'],'asin':a['product_id'],'title':product.get('title',a['product_id']),
             'quantity':a['units'],'total':snapshot['total'],'currency':snapshot['currency'],'order_id':order_id,
-            'simulation':False,'status':'confirmation_detected','at':a['updated_at']},'group-checkout-'+attempt_id)
+            'simulation':a['simulation'],'status':'confirmation_detected','at':a['updated_at']},'group-checkout-'+attempt_id)
 
     def summary(self, group):
-        plan=Plan.model_validate(self.repo.require('revision',group['revision_id'])['plan']).model_dump(mode='json',exclude_none=True)
+        saved_plan=self.repo.require('revision',group['revision_id'])['plan']
+        plan=Plan.model_validate(saved_plan).model_dump(mode='json',exclude_none=True)
         run=self.repo.get('run',group.get('active_run_id',''))
+        if run and run['state'] in ACTIVE_RUNS:
+            plan=run['plan']  # Display the same frozen configuration execution uses.
         progress=self.repo.progress(run) if run else {'confirmed_units':0,'reserved_units':0,'spent_cents':0,'reserved_cents':0,'confirmed_orders':0,'reserved_orders':0}
         same_quota=run and run['plan']['simulation']==plan['simulation'] and (run['revision_id']==group['revision_id'] or plan['schedule']['quota_scope']==run['plan']['schedule']['quota_scope']=='group')
         return {**group,'plan':plan,'goal_fulfilled':bool(same_quota and goal_met(plan,progress)), 'run':{k:v for k,v in run.items() if k!='plan'} if run else None,'progress':progress}

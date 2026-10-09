@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..models import inputs
-from .domain import Plan, cents, enabled_accounts, effective_plan
+from .domain import Plan, cents, enabled_accounts, effective_plan, purchasing_defaults, INHERITABLE
 from .repository import Conflict
 
 router=APIRouter()
@@ -29,7 +29,48 @@ def invalid(exc):
 @router.get('/api/task-groups')
 async def groups(request:Request):
     c=service(request)
-    return {'groups':[c.summary(g) for g in c.repo.all('group')]}
+    return {'groups':[c.summary(g) for g in c.repo.all('group') if not g.get('archived')]}
+
+
+@router.get('/api/task-group-defaults')
+async def defaults(request:Request):
+    return {'values':purchasing_defaults(service(request).engine.store),'inheritable':sorted(INHERITABLE)}
+
+
+@router.put('/api/task-group-defaults')
+async def update_defaults(request:Request):
+    c=service(request)
+    try:
+        data=await request.json()
+        if not isinstance(data,dict) or set(data)-INHERITABLE:
+            raise ValueError('Only purchasing defaults can be updated here')
+        values={**purchasing_defaults(c.engine.store),**data}
+        checked=Plan(name='Defaults',products=[{'product_id':'B000000000','max_unit_cents':10000}],**values)
+        if checked.per_account_units < checked.units_per_order:
+            raise ValueError('The account unit limit must cover the default order quantity')
+        values={key:getattr(checked,key) for key in INHERITABLE}
+        delay=values.pop('monitor_interval_ms')
+        c.engine.store.put('task_group_defaults',{'values':values},'defaults')
+        if 'monitor_interval_ms' in data:
+            settings=c.engine.store.get('settings','settings') or {}
+            c.engine.store.put('settings',{**settings,'default_monitor_delay':delay},'settings')
+        return await defaults(request)
+    except (ValueError,TypeError) as exc:
+        raise invalid(exc) from exc
+
+
+@router.delete('/api/task-groups/{id}')
+async def delete_group(id:str,request:Request):
+    c=service(request)
+    try:
+        group=c.repo.require('group',id)
+        run=c.repo.get('run',group.get('active_run_id',''))
+        if run and run['state'] in ('scheduled','preparing','watching','paused','stopping'):
+            await c.command(run['id'],'stop')
+        c.repo.archive(id)
+        return {'deleted':True}
+    except ValueError as exc:
+        raise invalid(exc) from exc
 
 
 @router.post('/api/task-groups/preview')
@@ -83,7 +124,9 @@ async def detail(id:str,request:Request):
     try:
         result=c.summary(c.repo.require('group',id))
         run=c.repo.require('run',result['run']['id']) if result['run'] else None
-        result['readiness']=c.readiness(result['plan'])
+        result['readiness']=c.readiness(result['plan'],resolve=False)
+        for account in result['readiness']['accounts']:
+            account['progress']=c.repo.progress(run,'account:'+account['id']) if run else {'confirmed_orders':0}
         result['members']=[c.repo.member_state(run['id'],a) for a in enabled_accounts(run['plan'])] if run else []
         result['observations']=c.repo.all('observation',run['id']) if run else []
         history=c.repo.group_attempts(id,limit=100)

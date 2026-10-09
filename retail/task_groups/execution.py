@@ -59,6 +59,8 @@ class Executor:
                     await self.gate(id)
                 self.repo.intent(id,snapshot)
                 self.repo.finish(id,'confirmed','Simulated order; no purchase placed','SIM-'+uuid.uuid4().hex,total)
+                confirmed=self.repo.require('attempt',id)
+                self.c.record_checkout(id,attempt['observation'],snapshot,confirmed['order_id'])
                 return
             account=self.c.engine.store.get('accounts',attempt['account_id'])
             if not account:

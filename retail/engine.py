@@ -48,6 +48,8 @@ class Engine:
             self.store.event(id, status, message)
 
     async def boot(self):
+        if getattr(self,"legacy_read_only",False):
+            return  # Saved legacy plans are available for explicit, backed-up migration.
         for task in self.store.all("tasks"):
             if task.get("status") not in ("idle", "stopped", "scheduled", "completed", "error"):
                 self.status(task["id"], "stopped", "Stopped after application restart; review Amazon cart before restarting")
@@ -107,6 +109,8 @@ class Engine:
                 self.store.event(task["id"], "notification_error", "Discord notification could not be delivered")
 
     async def start(self, id):
+        if getattr(self,"legacy_read_only",False):
+            raise ValueError("Import this saved plan from Task Groups before starting it")
         if self.stopping_all:
             raise ValueError("All tasks are stopping; try again after the stop completes")
         if id in self.jobs:

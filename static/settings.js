@@ -33,6 +33,7 @@ function settingsChanges() {
   return changes;
 }
 function settingsDirty() { return Object.keys(settingsChanges()).length > 0; }
+function settingsRuntimeActive(){return !!state.active?.length||(state.task_groups||[]).some(g=>tgActive(g.run));}
 function settingHelp(text) { return `<p class="setting-help">${text}</p>`; }
 function settingCard(title, help, content) {
   return `<div class="setting-card"><h3>${title}</h3>${help ? settingHelp(help) : ''}${content}</div>`;
@@ -48,7 +49,7 @@ function settingsView() {
   ensureSettingsDraft();
   if (!settingsSections.some(x => x[0] === settingsTab)) settingsTab = 'general';
   const s = settingsDraft;
-  const general = settingCard('Monitoring defaults', 'Applies to new task groups. Existing groups keep their own interval.',
+  const general = settingCard('Monitoring defaults', 'Used by groups that inherit workspace defaults. Active runs keep their starting interval.',
     secondsField('default_monitor_delay', 'Check interval (seconds)', s.default_monitor_delay ?? 4500, 3.5, 3600)) +
     settingCard('Resource usage', 'Extra tasks queue when all browser workers are busy. Higher limits use more memory.',
       input('max_running_tasks', 'Maximum active browser workers', s.max_running_tasks ?? 10, 'number', 'min="1" max="50" required') +
@@ -108,7 +109,7 @@ function settingsView() {
   const nav = settingsSections.map(([key,label]) => `<button type="button" id="settings-tab-${key}" role="tab" aria-controls="settings-panel-${key}" aria-selected="${settingsTab === key}" tabindex="${settingsTab === key ? 0 : -1}" data-settings-tab="${key}" class="${settingsTab === key ? 'selected' : ''}">${label}</button>`).join('');
   const html = `<div data-settings-shell class="settings-workspace"><div class="settings-navigation"><div role="tablist" aria-label="Settings sections" aria-orientation="vertical">${nav}</div><button type="button" data-context-view="troubleshooting">Troubleshooting ↗</button></div><form id="settings-form" novalidate><div class="settings-panels">${settingsPanel('general',general)}${settingsPanel('browser',browser)}${settingsPanel('notifications',notifications)}${settingsPanel('integrations',connections)}${settingsPanel('data',data)}</div><div class="settings-savebar"><p id="settings-error" role="alert" tabindex="-1">${esc(settingsError)}</p><div class="setting-actions"><span data-settings-status role="status"></span><button type="button" data-settings-discard>Discard changes</button><button class="primary" type="submit">Save changes</button></div></div></form></div>`;
   queueMicrotask(() => { updateSettingsStatus(); loadInstalledBrowsers(); });
-  return html;
+  return '<div class="settings-defaults"><div><h2>Purchasing defaults</h2><p class="help">Shared by groups. Individual overrides always take precedence.</p></div><button data-purchasing-defaults>Manage defaults</button></div>'+html;
 }
 
 function captureSettingsDraft() {
@@ -148,7 +149,8 @@ function activateSettingsTab(key, focus = false) {
 function updateSettingsStatus() {
   const form = $('#settings-form');
   if (!form || !settingsDraft) return;
-  const s = settingsDraft, saved = state.settings[0] || {}, running = !!state.active?.length;
+  const s = settingsDraft, saved = state.settings[0] || {}, running = settingsRuntimeActive();
+  $('#trace-recording').hidden=!saved.trace_enabled;
   const dirty = settingsDirty();
   document.querySelector('.settings-navigation [role=tablist]').setAttribute('aria-orientation', matchMedia('(max-width:740px)').matches ? 'horizontal' : 'vertical');
   form.querySelector('[data-settings-status]').textContent = settingsSaving ? 'Saving…' : dirty ? 'Unsaved changes · applies across sections' : (settingsSavedMessage || 'All changes saved');
@@ -220,7 +222,7 @@ async function saveSettings(form) {
   }
   const patch = settingsChanges();
   if (!Object.keys(patch).length) return;
-  if (state.active?.length) {
+  if (settingsRuntimeActive()) {
     const locked = stoppedSettings.find(key => key in patch);
     if (locked) return settingsFieldError('Stop running tasks before saving this change. Your draft is kept.',form.elements[locked]);
   }

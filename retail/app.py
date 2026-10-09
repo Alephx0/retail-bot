@@ -49,6 +49,7 @@ def create_app(data_dir=None):
         app.state.engine = Engine(app.state.store)
         app.state.group_coordinator = Coordinator(app.state.engine)
         app.state.engine.group_coordinator = app.state.group_coordinator
+        app.state.engine.legacy_read_only = True
         app.state.proxy_health = ProxyHealth(app.state.store)
         for record in app.state.store.all("harvesters"):
             app.state.store.delete("harvesters", record["id"])
@@ -153,8 +154,10 @@ def create_app(data_dir=None):
     async def state():
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
         result["events"] = store().all("events")[-150:][::-1]
+        group_events=[{**e,'task_id':e['run_id'],'status':e['kind']} for e in app.state.group_coordinator.repo.recent_events()]
+        result['events']=sorted(result['events']+group_events,key=lambda e:e['at'],reverse=True)[:150]
         result["active"] = list(app.state.engine.jobs)
-        result['task_groups'] = [app.state.group_coordinator.summary(g) for g in app.state.group_coordinator.repo.all('group')]
+        result['task_groups'] = [app.state.group_coordinator.summary(g) for g in app.state.group_coordinator.repo.all('group') if not g.get('archived')]
         result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
         result['extension_catalog'] = CATALOG
         result['settings'] = [public('settings', {**Settings().model_dump(), **(store().get('settings', 'settings') or {})})]
@@ -305,7 +308,7 @@ def create_app(data_dir=None):
             raise HTTPException(409, 'Stop task-group runs before removing connection lists')
         if kind == 'accounts' and app.state.group_coordinator.busy_account(id):
             raise HTTPException(409, 'This account is reserved or busy in a task group')
-        if kind == 'accounts' and any(id in app.state.group_coordinator.repo.require('revision',g['revision_id'])['plan']['account_ids'] for g in app.state.group_coordinator.repo.all('group')):
+        if kind == 'accounts' and any(not g.get('archived') and id in app.state.group_coordinator.repo.require('revision',g['revision_id'])['plan']['account_ids'] for g in app.state.group_coordinator.repo.all('group')):
             raise HTTPException(409, 'Remove this account from its task-group plans before deleting it')
         if kind == 'ai_connections' and (store().get('settings', 'settings') or {}).get('ai_connection_id') == id:
             raise HTTPException(409, 'Deselect this AI connection in Settings before deleting it')

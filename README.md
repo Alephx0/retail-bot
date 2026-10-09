@@ -1,10 +1,11 @@
 # Retail Desk
 
-This branch adds the [task-group coordinator and workspace](docs/task-group-implementation.md):
-product goals, account assignments, aggregate spending reservations, timed
-preparation, outcome recovery and explicit legacy migration. Open **Task Groups**
-for the new workflow; **Legacy tasks** retains existing configurations. The
-[architecture proposal](docs/task-group-architecture.md) records the design.
+This branch implements the [simplified retail workspace](docs/workspace-overhaul.md):
+shared purchasing objectives, inherited defaults, independent account overrides,
+bounded concurrent execution and a redesigned responsive interface. Start in
+**Task Groups**. Existing plans can be imported there; the previous scheduler
+is retired. The report covers design decisions, safeguards, measured performance
+and validation. [AGENTS.md](AGENTS.md) defines the development standards.
 
 A local retail automation workspace inspired by the public Refract and Stellar workflows. Version 0.4 adds a Home dashboard, canonical resource folders, profile/account assignment previews, contextual tabs, account session management, structured task states, and independent monitoring/cart/checkout services. This is an independent implementation, **not full parity with either commercial bot**.
 
@@ -41,19 +42,19 @@ Open **http://127.0.0.1:8765**. Subsequent launches can use `start.ps1`. Keep th
 
 ## Amazon setup
 
-1. Try **Load simulation -> Start all**. Simulation does not make Amazon requests or invoke paid solvers.
+1. Choose **Task Groups → Create group**, enter an ASIN and save with the default Simulation mode. Simulation does not make Amazon requests or invoke paid solvers.
 2. If needed, add an IMAP mailbox using your provider's host and app password. Test the TLS connection. OAuth-only mailboxes are not supported yet.
 3. Add an account with Amazon US, email, optional password and authenticator secret. Link its mailbox and CAPTCHA provider. **Open** in Accounts opens a visible sign-in browser directly, without a Take Control dialog. Complete remaining verification in that window; a fresh account-page check saves the session automatically. Managed sign-ins use a separate visible browser even when tasks are configured as headless. Existing externally connected browsers keep their own window mode. **Save session** remains a manual fallback. Take Control is reserved for active tasks.
 4. Set default shipping and payment methods on Amazon. Profiles do not override them.
 5. Create a task group with ASINs or a reusable input list. Formats: `ASIN`, `ASIN;max_price`, `ASIN;offer_id`, `ASIN;max_price;offer_id`. Amazon product URLs and decimal caps are accepted.
-6. Optionally assign separate monitor/checkout proxy pools. Test health against Amazon; this measures reachability and latency, not guaranteed retailer acceptance.
-7. Create a task, or choose an account group to create one task per matching retailer account. Accounts with saved credentials can prepare their own session at task start. **Monitor only** never carts. **Review** opens the cart for manual checkout. **Automatic** may place a real order once started, when all checks pass.
+6. Select participating accounts. Their saved connections and browser profiles are used independently. Test proxy health from Tools if needed; this measures reachability, not retailer acceptance.
+7. Save and start the group, or configure an optional schedule. Use an account row's settings to override defaults only for that assignment. **Notify only** never carts. **Review** prepares checkout for manual confirmation. **Automatic** may place a real order once started, when all checks pass.
 
 Automatic mode requires Amazon US and a recognized checkout layout with exactly the target ASIN, verified quantity, unit price, allowed seller/condition, an order total within the group budget and a recognized place-order button. The engine writes its submission intent before clicking. An uncertain response is never retried automatically. A task with a submission record cannot restart live; review Amazon order history before intentionally creating a new purchasing task.
 
 Unknown checkout layouts and mixed carts fall back to browser review. In review mode, budgets gate the observed item subtotal; **verify the final tax/shipping-inclusive total yourself**. Supported Amazon CVV forms can use the encrypted account CVV. Bank 3DS and unsupported verification layouts require interaction. Order confirmation is not proof of successful payment or fulfillment. When an observed payment prompt follows confirmation, the task stays open for approval and records payment verification separately. The order-attempt journal remains visible even if no confirmation was received.
 
-Only one live task per account runs at a time; additional tasks queue and acquire the account session when the previous task finishes. Stopping closes the task browser but does not clear a server-side cart or cancel an order. Active tasks stop after an app restart unless their group has auto-start enabled; future schedules remain scheduled. Loop Checkouts is off by default. When enabled, verified successes may continue up to Maximum Checkouts Per Run. Uncertain submissions never loop or retry.
+One account lease protects each live browser session. Other accounts execute independently within resource limits. Stopping does not clear a retailer cart or cancel an order. Interrupted group runs recover paused and require explicit review/resume. First-success mode is the default; multiple-success and unit targets are optional purchase goals. Uncertain mutations retain their reservations and never retry automatically.
 
 ## Current limits
 
