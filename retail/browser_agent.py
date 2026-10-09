@@ -35,7 +35,7 @@ class BrowserAgent:
             path = re.sub(r'/p-\d{3}-\d{7}-\d{7}(?=/)', '/{checkout}', path)
         return parsed.hostname, path
 
-    async def resolve_total(self, page, domains):
+    async def resolve_total(self, page, domains, *, allow_model=True):
         """Use read-only MCP to recover a renamed final-review total."""
         settings = self.store.get('settings', 'settings') or {}
         connection = self.store.get('ai_connections', settings.get('ai_connection_id', ''))
@@ -52,6 +52,8 @@ class BrowserAgent:
                     result = await browser.validate_total(row['ref'])
                     if result.get('validated'):
                         return result['total']
+        if not allow_model:
+            raise InteractionError('Saved total evidence changed; submission stopped')
         record = {'task_id': getattr(page.context, '_retail_task_id', ''), 'action': 'READ_ORDER_TOTAL',
                   'connection_id': connection['id'], 'model': connection['model'], 'at': now(), 'status': 'started', 'steps': 0}
         try:

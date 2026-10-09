@@ -3,7 +3,7 @@ import asyncio
 import uuid
 
 from ..amazon import Attention
-from .domain import cents, qualifying
+from .domain import cents, qualifying, effective_plan
 from .repository import Conflict, MUTATED
 
 
@@ -15,7 +15,7 @@ class Executor:
         while True:
             attempt=self.repo.require('attempt',attempt_id)
             run=self.repo.require('run',attempt['run_id'])
-            if run['state']=='paused':
+            if run['state']=='paused' or self.repo.member_state(attempt['run_id'],attempt['account_id'])['state']=='paused':
                 await asyncio.sleep(.2)
                 continue
             return self.repo.gate(attempt_id)
@@ -30,7 +30,15 @@ class Executor:
         await event.wait()
 
     async def run(self, attempt):
-        id=attempt['id']; run=self.repo.require('run',attempt['run_id']); plan=run['plan']
+        plan=effective_plan(self.repo.require('run',attempt['run_id'])['plan'],attempt['account_id'])
+        try:
+            await asyncio.wait_for(self.execute(attempt,plan),plan.get('checkout_timeout_seconds',300))
+        except TimeoutError:
+            # execute's cancellation handler records a safe or uncertain outcome before returning.
+            return
+
+    async def execute(self, attempt, plan):
+        id=attempt['id']; run=self.repo.require('run',attempt['run_id'])
         target=next(p for p in plan['products'] if p['product_id']==attempt['product_id'])
         try:
             await self.gate(id)
@@ -61,10 +69,17 @@ class Executor:
             async with self.c.pool.lease(account,id) as session:
                 page=session['page']; adapter=self.c.engine.amazon
                 self.c.pages[id]=page
+                page._retail_agent_attempts=set()
+                page._retail_submit_control=None
+                page._retail_review=None
+                page._retail_submit_gate=lambda:self.repo.submit_gate(id)
+                page._retail_task_id=id
+                session['context']._retail_task_id=id
                 self.repo.stage(id,'preparing','Verifying account session and offer')
                 await adapter.ensure_session(session['context'],account,page)
                 item={'asin':target['product_id'],'max_price':target['max_unit_cents']/100,'offer_id':target['offer_id']}
                 product=await adapter.inspect(page,item,plan['region'])
+                page._retail_product_condition=product.get('condition','')
                 ok,reason,message=qualifying(product,target,plan)
                 if not ok:
                     self.repo.finish(id,'rejected','Fresh account check: '+message); return
@@ -120,6 +135,6 @@ class Executor:
                              str(exc) if safe else 'Browser operation failed; inspect account and diagnostics')
             if current['state'] not in MUTATED and not isinstance(exc,Conflict):
                 import time
-                self.c.cooldowns[attempt['account_id']]=time.monotonic()+30
+                self.c.cooldowns[(attempt['run_id'],attempt['account_id'])]=time.monotonic()+30
         finally:
             self.c.pages.pop(id,None); self.c.wakes.pop(id,None)

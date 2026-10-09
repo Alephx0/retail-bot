@@ -64,12 +64,70 @@ class Schedule(Model):
         return self
 
 
+class AccountOverrides(Model):
+    """Only group-local purchasing options; None means inherit, including false/zero."""
+    action: Literal['notify', 'review', 'automatic', 'quote'] | None = None
+    units_per_order: int | None = Field(default=None, ge=1, le=30)
+    per_account_units: int | None = Field(default=None, ge=1, le=1000)
+    per_account_orders: int | None = Field(default=None, ge=1, le=1000)
+    per_account_spend_cents: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    max_order_cents: int | None = Field(default=None, ge=0, le=100_000_000)
+    max_unit_cents: int | None = Field(default=None, ge=0, le=100_000_000)
+    product_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    allow_third_party: bool | None = None
+    allow_used: bool | None = None
+    max_read_errors: int | None = Field(default=None, ge=1, le=10)
+    retry_delay_seconds: int | None = Field(default=None, ge=5, le=600)
+    read_timeout_seconds: int | None = Field(default=None, ge=5, le=300)
+    checkout_timeout_seconds: int | None = Field(default=None, ge=30, le=3600)
+
+
+class AccountSettings(Model):
+    enabled: bool = True
+    overrides: AccountOverrides = Field(default_factory=AccountOverrides)
+
+
+def effective_plan(plan, account_id):
+    """Resolve once per operation from an immutable revision; never mutate the source."""
+    assignment = plan.get('account_settings', {}).get(account_id, {})
+    overrides = {k: v for k, v in assignment.get('overrides', {}).items() if v is not None}
+    result = {**plan, **overrides}
+    result['products'] = [dict(p) for p in plan['products']
+                          if not overrides.get('product_ids') or p['product_id'] in overrides['product_ids']]
+    if 'max_unit_cents' in overrides:
+        for product in result['products']:
+            product['max_unit_cents'] = overrides['max_unit_cents']
+    return result
+
+
+def enabled_accounts(plan):
+    if not plan['account_ids'] and plan['simulation']:
+        return ['simulation']
+    return [id for id in plan['account_ids'] if plan.get('account_settings', {}).get(id, {}).get('enabled', True)]
+
+
+def goal_met(plan, progress):
+    if plan.get('goal_mode', 'units') == 'first_success':
+        return progress.get('confirmed_orders', 0) >= 1
+    if plan.get('goal_mode') == 'multiple_success':
+        return progress.get('confirmed_orders', 0) >= plan.get('target_orders', 1)
+    return progress['confirmed_units'] >= Plan.model_validate(plan).desired_units
+
+
 class Plan(Model):
     name: str = Field(min_length=1, max_length=100)
     retailer: Literal['amazon'] = 'amazon'
     region: Literal['US', 'UK', 'CA'] = 'US'
     products: list[ProductTarget] = Field(min_length=1, max_length=20)
     account_ids: list[str] = Field(default_factory=list, max_length=100)
+    account_settings: dict[str, AccountSettings] = Field(default_factory=dict)
+    goal_mode: Literal['units', 'first_success', 'multiple_success'] = 'units'
+    target_orders: int = Field(default=1, ge=1, le=1000)
+    per_account_orders: int = Field(default=1000, ge=1, le=1000)
+    per_account_spend_cents: int = Field(default=1_000_000_000, ge=0, le=1_000_000_000)
+    retry_delay_seconds: int = Field(default=5, ge=5, le=600)
+    read_timeout_seconds: int = Field(default=45, ge=5, le=300)
+    checkout_timeout_seconds: int = Field(default=300, ge=30, le=3600)
     action: Literal['notify', 'review', 'automatic', 'quote'] = 'review'
     simulation: bool = True
     selection: Literal['any', 'each'] = 'any'
@@ -92,6 +150,16 @@ class Plan(Model):
 
     @model_validator(mode='after')
     def valid(self):
+        if set(self.account_settings) - set(self.account_ids):
+            raise ValueError('Account settings must reference assigned accounts')
+        for settings in self.account_settings.values():
+            overrides = settings.overrides
+            if overrides.product_ids and (len(set(overrides.product_ids)) != len(overrides.product_ids) or set(overrides.product_ids) - {p.product_id for p in self.products}):
+                raise ValueError('Account products must be unique targets in this group')
+            if overrides.max_order_cents is not None and overrides.max_order_cents > self.max_spend_cents:
+                raise ValueError('Account order allowance cannot exceed the group spending limit')
+        if self.goal_mode != 'units' and self.selection != 'any':
+            raise ValueError('Order-count goals require Any matching product; use unit targets for Each product')
         if len(set(self.account_ids)) != len(self.account_ids):
             raise ValueError('Select each account only once')
         if len({p.product_id for p in self.products}) != len(self.products):

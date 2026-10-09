@@ -1,4 +1,6 @@
-# Task groups: proposed architecture
+# Task groups: original architecture proposal
+
+> Historical design notes. See [the implemented architecture and evaluation](task-group-implementation.md) for current behavior, measurements and limitations.
 
 Status: design proposal, October 8, 2026. No production execution behavior or
 existing groups are changed by this document. The user confirmed both continuous

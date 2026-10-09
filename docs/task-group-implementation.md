@@ -1,151 +1,98 @@
-# Task-group redesign branch
+# Task Group architecture and implementation
 
-The `task-group-redesign` branch implements the group workspace and execution
-coordinator described in the [architecture proposal](task-group-architecture.md).
-Existing task groups remain under **Legacy tasks**. No legacy group is silently
-converted, and migration starts with a stopped simulation plan.
+The `task-group-redesign` branch implements shared purchasing objectives with independent account settings and execution. This report supersedes the earlier architecture proposal. Existing legacy tasks remain available; migration requires an explicit preview and starts in simulation.
 
-## Using the workspace
+## Evaluation and decision
 
-Open **Task Groups → Create group** and configure four sections:
+The previous branch already separated immutable plans from runs and attempts, reused authenticated account browsers, and journaled purchase intent. Those are useful correctness boundaries and remain. Its main weaknesses were:
 
-1. Products: paste Amazon links or ASINs, or import a saved input list. Set each
-   product's unit-price cap and quantity target when using Each product.
-2. Accounts: select accounts or a folder. The selection is saved as explicit
-   account IDs. Browser identity, fingerprint and connection remain account-owned.
-3. Goal: Notify, Prepare for review, Automatic checkout, or Get checkout total.
-   Choose Any matching product or Each product. Configure units per order,
-   per-account unit limits, maximum final order total and group spending limit.
-4. Timing: manual/continuous, one dated window, or weekly windows, with an IANA
-   timezone and preparation lead time. Goals persist across windows by default;
-   per-window quotas require an explicit selection.
+- Accounts were only a list of IDs: every purchasing option was group-wide.
+- A whole-group `gather` barrier made the next monitoring cycle wait for the slowest account.
+- Browser creation and closure happened while holding a global pool lock, serializing independent account launches.
+- Each progress read decrypted every attempt in the quota's historical runs; the scheduler also decrypted inactive runs.
+- Read failures were keyed globally by account, contaminating otherwise independent groups.
+- A cancellation before the executor's first coroutine step could leave its reservation unreleased.
+- Final checkout facts were re-read but discarded, allowing a changed total to be charged against stale accounting. Success headings without retailer order numbers received synthetic IDs.
 
-Simulation is the default and never opens a retailer browser or submits an order.
-Without selected accounts it uses one virtual account, so its per-account limit
-still applies. Review simulations wait for **Check outcome** in Activity.
-Automatic simulations complete after the deterministic product observation.
+A targeted restructuring is preferable to replacing the working ledger or adding another scheduler, message broker, database, or execution service. SQLite transactions coordinate reservations; asyncio overlaps browser I/O; account locks isolate sessions. Retailer adapters still own DOM verification and browser actions.
 
-The group workspace shows **Products / Accounts / Activity**, confirmed and
-reserved units, spending, account readiness and timing. Start is idempotent. Pause
-blocks the next automatic mutation; Resume continues with the same reservations.
-Stop cancels waiting work and retains uncertain outcomes. Duplicate creates a new
-simulation plan with a fresh goal, rather than resetting old purchase history.
+## Data ownership and configuration
 
-Advanced filters include minimum price, discount, savings, free items, seller and
-condition. Discount rules require a verified reference price. Activity retains
-unresolved attempts from earlier runs and offers recorded plan/browser details.
+`Plan` owns products, goals, schedules, defaults, assigned account IDs, and a sparse `account_settings` map keyed by those IDs. Each entry contains `enabled` and `overrides`. Missing or null options inherit; explicit false and zero remain overrides. Disabling preserves overrides. Validation rejects settings for unassigned accounts and product selections outside the group.
 
-Live execution currently supports **Amazon US**. The existing adapter's final
-checkout snapshot is USD-specific; UK and Canada remain simulation-only in this
-new workspace until their final-total validation is implemented. Other retailer
-adapters are not added by this branch.
+Supported overrides are action, quantity per order, account unit/order/spending limits, maximum order total, unit-price cap, selected product IDs, seller/condition policy, read retry count/delay, read timeout, and checkout/review timeout. ASINs represent purchasable variants. Shipping and payment use the retailer account's saved defaults: the adapter does not implement arbitrary application shipping/payment-profile selection, so no nonfunctional controls were added.
 
-## Execution and persistence
+Credentials, sessions, proxies, browser identity and fingerprints remain account-owned. They are not copied into ordinary group configuration. Revisions and execution snapshots are encrypted. Overrides apply only within their group and never edit global accounts. Editing requires a stopped/completed group and an expected revision ID; a running attempt always uses its frozen plan.
 
-- `retail/task_groups/domain.py`: validated plans, products, integer money,
-  qualification reasons and timezone-aware execution windows.
-- `repository.py`: encrypted SQLite run/attempt/revision/event payloads, atomic
-  account and quota reservations, unique command/order identities, generation
-  checks and durable submission intent. Operational indexes contain opaque IDs;
-  retailer order identities are hashed in the deduplication index.
-- `browser_pool.py`: reusable bounded account sessions, account locks, shared
-  browser capacity with the legacy runner, idle eviction and profile invalidation.
-- `coordinator.py`: monitoring, account-scoped observation caching, fair account
-  rotation, preparation, recurring windows, read-error cooldowns and dispatch.
-- `execution.py`: account-specific revalidation and the existing Amazon cart,
-  final-total and submission methods. Automated submissions are never retried
-  after crossing the durable intent boundary.
-- `api.py`: readiness, commands, history, reconciliation, migrations and an SSE
-  event endpoint. The dashboard currently uses compact group detail polling;
-  server event streaming is available for a later UI transport migration.
-- `workspace_lock.py`: OS-held lock preventing two updated engines from owning
-  the same data directory. The pre-redesign app does not participate in this
-  lock; do not point both old and new app versions at one live data directory.
+The existing `account_ids` field is retained for compatibility with account deletion guards, migration and existing integrations. The settings map stores only assignment configuration, not copies of account data. Old plans acquire defaults when validated; their existing unit-count goals retain their meaning.
 
-The current Amazon adapter is account-bound. Monitoring shares an observation
-only for the same account, region, product and offer within its freshness interval.
-It does not assume that different accounts see the same price or stock. Wider
-public-stock sharing requires a separately validated adapter capability.
+## Execution flow
 
-Browser capacity limits account contexts. A browser driver/base process and
-temporary hardware probes may also exist; this is not a strict OS process-count
-limit. Accounts with an active manual checkout remain exclusive. Idle monitor
-sessions can be evicted for checkout work or legacy tasks. A monitor observation
-is always revalidated inside the purchasing account before carting.
+1. Create/save a validated immutable revision. Readiness resolves effective account options on the backend.
+2. Start idempotently creates one run and quota identity. Timed runs prepare sessions before their execution window.
+3. The coordinator dispatches each enabled account independently, rotating through its selected products. Each account has its own next-read deadline, retry state and timeout. A per-group semaphore bounds reads; global browser capacity bounds contexts.
+4. Account-scoped observations can be reused briefly across groups. Other accounts' observations are never substituted. Authentication and a fresh product check precede checkout.
+5. One SQLite transaction reserves the account, quantity, order slot and conservative final-order allowance. The executor applies the account's resolved settings.
+6. Cart and checkout review verify product, quantity, seller, condition, currency and final total. Durable submission intent precedes the single automatic submit.
+7. The adapter revalidates the same financial facts and the current authorization immediately before clicking. Changed facts stop submission. Model calls are forbidden during that final recheck; previously validated price evidence may be reused deterministically.
+8. A retailer order number and verified total produce a deduplicated confirmation. The ledger updates account/product/group counters in the same transaction, and the group completes when its goal is satisfied.
 
-## Outcomes and recovery
+Read errors retry with bounded exponential delays; exhausted retries require rechecking. Ordinary failures are group/account-local. A retailer-requested backoff applies across the account's groups and cannot be cleared by rechecking another group. No access-control or purchase-limit bypass is implemented.
 
-Reservations hold a conservative maximum order allowance, including room for
-shipping/tax. Final review reduces that reservation to the verified total before
-automatic submission. Confirmed orders consume quota once. Proven pre-mutation
-failures release quota; uncertain cart/submission results keep both the account
-claim and reservation.
+Browser launches run outside the pool lock. Account locks still prevent concurrent use of the same authenticated session. Idle contexts are reusable and evictable; uncertain attempts keep their account ownership. Recovery budgets and checkout evidence are reset for each independent attempt.
 
-**Activity → View browser** opens uncertain outcomes for inspection without
-restarting automation. **Resolve outcome** requires verification notes and either
-a verified no-order/cart result or the actual order number, matching product,
-quantity and final total. Reconciliation records user-verified evidence; it is not
-an independent retailer verification. Larger actual quantities/totals are recorded
-truthfully and count against subsequent limits rather than being clamped to caps.
+## Goals, lifecycle and uncertainty
 
-Review mode never submits automatically. After the user completes checkout,
-confirmation is checked and the actual final total is reconciled explicitly,
-because the user could have changed the checkout during manual review.
+- **First confirmed order:** multiple accounts monitor and prepare concurrently; only one checkout receives an order reservation. This intentionally serializes purchase authorization to prevent two external orders for a one-order objective.
+- **Multiple confirmed orders:** independent checkouts run concurrently up to the configured concurrency, order, account and spending limits.
+- **Unit target:** preserves prior behavior, including separate targets for each product. Order-count goals use Any matching product; conflicting Each-product semantics are rejected.
 
-On restart, pending live effects become reconciliation-required and other runs
-pause for explicit resume. A missing display/history projection for an already
-confirmed order is rebuilt from the durable ledger. Purchase cooldowns also read
-confirmed ledger entries. A timeout between clicking and confirmation does not
-release a reservation or create another automatic order attempt.
+Group states remain scheduled, preparing, watching, paused, stopping, stopped and completed. Account execution controls are running, paused and stopped; saved assignment enablement is separate. Attempt stages retain reserved, preparing, carting, reviewing, waiting_user, submitting and terminal outcomes. The UI shows the active attempt or latest observation alongside account controls.
 
-Scheduled windows have stable occurrence identities, skip nonexistent DST wall
-times, and choose the first occurrence of a repeated wall time. Timed preparation
-checks sessions without carting or submitting. Missing a window does not trigger
-a late purchase. An interrupted window does not automatically resume after restart.
+Group/account pause prevents subsequent mutations at gates. Already-dispatched browser input cannot be recalled; cancellation after a possible cart or order mutation is uncertain. Stop cancels reads and checkout tasks, including reservations whose coroutine never started. Checkout timeouts include manual-review and paused time, so reservations cannot silently hold an active executor forever.
 
-## Migration and development
+Uncertain outcomes retain account ownership, units, money and order slots. They never trigger automatic submission replay. Restart pauses active runs and quarantines possible mutations. Activity retains older unresolved attempts and requires retailer-history/cart verification, notes, order ID, actual quantity and actual total to reconcile. User reconciliation is recorded evidence, not an independent retailer API verification. Actual totals are recorded truthfully even if they exceed configured limits.
 
-The migration preview imports products and account assignments and asks the user
-to choose purchase goals. It does not reinterpret a task-count multiplier as an
-instruction to buy that many units. Mixed legacy task behavior is intentionally
-not silently reproduced: the new plan starts with review behavior in simulation.
-Choose the new behavior explicitly after checking the preview.
+Confirmed purchases persist across restarts and ordinary stop/start. Duplicate creates a new explicit objective. Per-window quotas remain available for recurring schedules. A browser success heading alone is insufficient to confirm an order.
 
-Applying migration requires stopped legacy tasks and no unresolved legacy
-submission record. It creates an encrypted database backup in
-`data/migration-backups/`, retains legacy task IDs/history, disables old schedules,
-and prevents the old runner from starting the migrated group. Backups rely on the
-same workspace vault key and Windows account protection as the original database.
+## Persistence and frontend
 
-For an isolated local instance:
+The encrypted attempt ledger remains authoritative. Encrypted group/account/product counters replace historical scans on the reservation and progress paths. Counter deltas, attempt state, account claims and order deduplication commit together under `BEGIN IMMEDIATE`; rollback restores all of them. Plaintext indexes contain operational IDs and states, never credentials or payment data.
 
-```powershell
-.\.venv\Scripts\python run.py --port 8770 --data-dir artifacts/task-group-workspace
-```
+Schema version 2 builds counters and state indexes transactionally from existing encrypted records. It first writes `task-groups-before-v2.sqlite3` beside the database. Original revisions and attempts remain intact. Subsequent starts do not reapply counters. Existing legacy migration and its backup workflow remain supported.
 
-Use the standard README installation first in a new checkout. Browser binaries,
-optional fingerprint-suite packages and account data are not Git source. The
-development checkout is separate from the original application's data directory.
+The scheduler queries indexed active runs. Detail views read only recent attempts/runs plus unresolved outcomes. API summaries omit duplicate run plans and repeated full effective plans for each account. The Task Groups screen polls its compact endpoint rather than also fetching the entire application state every cycle. Configuration dialogs preserve drafts while monitoring updates continue.
 
-## Validation
+The Accounts tab displays inherited/overridden settings, effective purchasing limits, enabled status, observations and active attempt state. Settings are available during creation and after stopping. Individual pause/resume/stop controls operate without altering other accounts.
 
-New tests cover concurrent reservation writers, quota persistence across restarts,
-idempotent starts, duplicate order identities, uncertain cart/submission effects,
-manual review, durable intent before submission, account-specific monitor sharing,
-browser reuse, scheduled preparation/window closure, DST and migration.
+## Measurements
 
-Browser UI verification creates a group, imports two products, checks readiness,
-persists the plan, starts simulated execution, and verifies automatic two-unit
-completion and Activity history. Screenshots and machine-readable regression
-results live under ignored `artifacts/task-group-build/`.
+Windows local measurements, encrypted temporary SQLite databases, 30 progress samples per history size:
 
-The full regression run passed 241 tests with four optional browser-backend tests
-skipped because their dependencies are absent from the isolated checkout. After
-subsequent recovery and filtering refinements, the final affected workspace,
-settings and account checks passed (58 tests, including 20 task-group tests). Chrome UI
-checks also exercised review, pause/resume, duplication, timing fields and details
-without application JavaScript errors.
+| Historical attempts | Previous median | Redesigned median |
+| --- | ---: | ---: |
+| 10 | 0.261 ms | 0.0367 ms |
+| 100 | 2.168 ms | 0.0329 ms |
+| 1,000 | 19.297 ms | 0.0335 ms |
 
-Live execution is validated with deterministic adapter fixtures, not a real
-retailer purchase. The existing Amazon layout and checkout limitations continue
-to apply. No throughput or retailer-acceptance gain is claimed from fixture tests.
+A controlled browser-pool benchmark compares the previous committed implementation (`fc64488`) with the redesign using identical 50 ms mocked launches and capacity 10:
+
+| Accounts | Previous elapsed | Redesigned elapsed |
+| --- | ---: | ---: |
+| 10 | 613 ms | 63 ms |
+| 50 | 3,114 ms | 310 ms |
+| 100 | 6,228 ms | 619 ms |
+
+Peak parallel launches changed from 1 to 10. These measurements demonstrate reduced local coordination overhead, not retailer acceptance or real-browser throughput. Run `python -m scripts.benchmark_task_groups`; machine-readable results are under `artifacts/task-group-build/`.
+
+Remaining costs include browser startup/memory, retailer response time, synchronous SQLite writes, readiness checks, and the quarter-second scheduler tick. Browser and monitor limits intentionally bound concurrency. A single-process local service remains appropriate; no distributed scaling is claimed. Broad AI cost accounting and repair-recipe promotion remain separate adapter work, not solved by this Task Group change.
+
+## Verification
+
+The full regression run passed **260 tests, 4 skipped**. Subsequent targeted checks passed **78 affected tests**, including **41 Task Group tests**, including additional stress and adapter integration tests added after the full run. The optional skips are existing browser-backend dependencies. A Starlette/httpx deprecation warning remains.
+
+Coverage includes inheritance, explicit zero/false, group/global isolation, disabled assignments, quantity overrides, invalid product selections, 16 competing reservation writers, concurrent starts, order-count goals, duplicate orders, account pause/resume, early cancellation, read/checkout timeouts, retry exhaustion, retailer backoff, restart uncertainty, transactional rollback, counter migration and API consistency. A 100-account simulation confirms 100 orders with at most 10 concurrent checkout executors and no leftover claims. An intercepted real-browser fixture verifies the new executor supplies evidence required by the modern Amazon checkout layout.
+
+Playwright MCP exercised the actual interface in an isolated fixture app: create one group, select two accounts, override one account to two units, inherit one unit on the other, run to two confirmed simulated orders/three units, then disable an account while preserving its overrides. It reported no application JavaScript errors. `scripts/smoke_task_groups.js` contains the repeatable interaction sequence.
+
+Live checkout remains Amazon US only; UK/Canada are simulation-only. No real purchase was placed. Fixture success does not guarantee compatibility with every retailer layout or account-specific checkout flow.

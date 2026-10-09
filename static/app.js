@@ -18,7 +18,8 @@ function name(kind,id){return state[kind].find(x=>x.id===id)?.name || '—';}
 function time(value){return value?new Date(value).toLocaleString(): '—';}
 function table(headers, rows){return `<div class="table-wrap"><table><thead><tr>${headers.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;}
 function empty(icon,title,description,actions=''){return `<div class="empty"><div class="empty-icon">${icon}</div><h2>${title}</h2><p>${description}</p>${actions}</div>`;}
-async function refresh(){try{state=await api('state');processSounds();$('#connection').textContent='● Connected';render();}catch(e){$('#connection').textContent='● Disconnected';}}
+let stateLoaded=false;
+async function refresh(){try{if(view==='task_groups'&&stateLoaded){if(taskGroupId){await loadTaskGroup(true);}else{state.task_groups=(await api('task-groups')).groups;render();}$('#connection').textContent='Connected';return;}state=await api('state');stateLoaded=true;processSounds();$('#connection').textContent='● Connected';render();}catch(e){$('#connection').textContent='● Disconnected';}}
 // The application renderer is installed by redesign.js after shared helpers load.
 function render(){}
 function groups(){
