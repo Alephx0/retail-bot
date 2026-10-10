@@ -258,7 +258,7 @@ def test_checkout_rechecks_price_before_single_submission():
             page = await browser.new_page()
             await page.route('https://www.amazon.com/**', lambda r: r.fulfill(body='<body></body>', content_type='text/html'))
             await page.goto('https://www.amazon.com/checkout')
-            fixture = '''<div id="spc-orders"><div data-asin="B012345678" data-quantity="1" data-seller="Amazon.com" data-condition="new"><span class="a-price"><span class="a-offscreen">$20.00</span></span></div></div><table id="subtotals-marketplace-table"><tr><td>Order total:</td><td id="total">$21.20</td></tr></table><button onclick="window.orders=(window.orders||0)+1">Place your order</button>'''
+            fixture = '''<div id="spc-orders"><div data-asin="B012345678" data-quantity="1" data-seller="Amazon.com" data-condition="new"><span class="a-price"><span class="a-offscreen">$20.00</span></span></div></div><table id="subtotals-marketplace-table"><tr><td>Order total:</td><td id="total">$21.20</td></tr></table><button onclick="window.orders=(window.orders||0)+1;this.insertAdjacentHTML('afterend','<h1>Order placed 123-1234567-1234567</h1>')">Place your order</button>'''
             await page.set_content(fixture)
             adapter = Amazon(None)
             with pytest.raises(Attention): await adapter.submit_order(page)
@@ -363,7 +363,7 @@ def test_amazon_agent_end_to_end_checkout_fixture(tmp_path, seller_missing):
             if '/order-history' in path:
                 html = '<div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>'
             elif '/dp/' in path:
-                html = '<span id="productTitle">Fixture</span><div id="corePrice_feature_div"><span class="a-price"><span class="a-offscreen">$20.00</span></span></div><span id="sellerProfileTriggerId">Amazon.com</span><button onclick="fetch(\'/add-item\')">Add item to cart</button>'
+                html = '<span id="productTitle">Fixture</span><div id="corePrice_feature_div"><span class="a-price"><span class="a-offscreen">$20.00</span></span></div><span id="sellerProfileTriggerId">Amazon.com</span><span id="nav-cart-count">0</span><button onclick="fetch(\'/add-item\').then(()=>document.querySelector(\'#nav-cart-count\').textContent=\'1\')">Add item to cart</button>'
                 html += '<div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>'
             elif '/gp/cart/' in path:
                 html = '<div id="sc-active-cart">' + ('<div data-asin="B012345678" data-quantity="1">Fixture</div>' if cart_items else '') + '</div><button onclick="location.href=\'/checkout\'">Continue to checkout</button>'
@@ -403,9 +403,9 @@ def test_amazon_agent_end_to_end_checkout_fixture(tmp_path, seller_missing):
                 assert current['status'] == 'completed', current
                 assert len(orders) == 1
                 assert len(store.all('checkouts')) == 1
-                # The shared anonymous monitor and account recheck each resolve
-                # availability without clicking; only the cart action adds an item.
-                assert [r['action'] for r in store.all('agent_runs')] == ['ADD_TO_CART', 'ADD_TO_CART', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'SUBMIT_ORDER']
+                # Inventory monitoring never invokes AI action recovery. The
+                # account offer and cart still resolve their purchase controls.
+                assert [r['action'] for r in store.all('agent_runs')] == ['ADD_TO_CART', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'SUBMIT_ORDER']
                 assert cart_items == 1
                 assert store.get('submissions', 'submission-' + task['id'])['status'] == 'confirmed'
             finally:

@@ -132,7 +132,17 @@ class TaskRunner:
                 slot_acquired=True
                 while task['account_id'] in getattr(adapter, 'logins', {}):
                     self.status(id, 'in_queue', 'Waiting for the account login browser to close')
-                    await asyncio.sleep(0.5)
+                    login_context = adapter.logins[task['account_id']]
+                    closed = asyncio.Event()
+                    def on_closed(_):
+                        closed.set()
+                    login_context.on('close', on_closed)
+                    try:
+                        with stage('Waiting for login browser close'):
+                            if adapter.logins.get(task['account_id']) is login_context:
+                                await closed.wait()
+                    finally:
+                        login_context.remove_listener('close', on_closed)
                 account = self.store.get("accounts", task["account_id"])
                 account_proxy = account.get("proxy") or self.proxy(account.get("proxy_list_id", ""), account["id"])
                 connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)

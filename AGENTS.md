@@ -11,6 +11,7 @@
 - Keep encrypted credentials in the existing vault. Group plans contain references, never copied credentials. Migrations must preserve original records and have tested recovery.
 - Prefer bounded asynchronous operations and compact read models. Measure before adding infrastructure. Do not duplicate authoritative state in the frontend.
 - Shared inventory monitors use read-only stock inspection without AI purchase-control recovery. Keep account offer checks before carting. Use bounded, on-demand stage timings to diagnose latency; distinguish nested timings, intentional waits, and live network variability from controlled benchmarks.
+- Amazon action readiness must depend on observable page or lifecycle states, never fixed settle sleeps. Bound stalled waits using browser timeouts, preserve retailer polling/backoff intervals, and never retry an irreversible action because its expected state did not appear. Test immediate, delayed, missing and interrupted transitions.
 
 ## Product and interface
 

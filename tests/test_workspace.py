@@ -88,12 +88,13 @@ def test_cvv_verification_does_not_submit_orders_or_bank_forms():
             assert not await adapter.verify_cvv(page, '123')
             await page.set_content('<form><input name="cvv"><button>Place order</button></form>')
             assert not await adapter.verify_cvv(page, '123')
-            await page.set_content('<form onsubmit="event.preventDefault();this.remove()"><input name="cvv"><button>Verify card</button></form>')
+            await page.set_content('<form onsubmit="event.preventDefault();this.outerHTML=\'<p>Card verified</p>\'"><input name="cvv"><button>Verify card</button></form>')
             assert await adapter.verify_cvv(page, '123')
             assert not await page.locator('input[name=cvv]').count()
             await page.set_content('<table id="subtotals-marketplace-table"><tr><td>Shipping</td><td>$0.00</td></tr></table>')
             await adapter.free_shipping(page)
             await page.set_content('<table id="subtotals-marketplace-table"><tr><td>Shipping</td><td>$5.00</td></tr></table>')
+            page.set_default_timeout(150)
             import pytest
             with pytest.raises(Attention):
                 await adapter.free_shipping(page)

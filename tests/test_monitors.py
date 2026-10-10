@@ -258,6 +258,40 @@ def test_one_account_waiting_for_login_does_not_block_another(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('cancel', [False, True])
+def test_wait_for_open_login_browser_uses_close_event_and_cleans_listener(tmp_path, cancel):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        engine.amazon.stock.add('B012345678')
+        class Login:
+            def __init__(self): self.callbacks = []
+            def on(self, event, callback): self.callbacks.append(callback)
+            def remove_listener(self, event, callback): self.callbacks.remove(callback)
+            def close(self):
+                engine.amazon.logins.pop(account['id'])
+                for callback in list(self.callbacks): callback(self)
+        login = Login()
+        engine.amazon.logins = {account['id']: login}
+        task = task_record(store, group, account, monitor_asin='B012345678', use_account_proxy=True)
+        try:
+            await engine.start(task['id'])
+            await until(lambda: login.callbacks)
+            assert not engine.amazon.authentications
+            if cancel:
+                await engine.stop(task['id'])
+            else:
+                login.close()
+                await until(lambda: task['id'] not in engine.jobs)
+                assert store.get('tasks', task['id'])['status'] == 'completed'
+            assert login.callbacks == []
+            assert engine.browser_slots._value == 10
+            assert not engine.account_locks[account['id']].locked()
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
 def test_stock_during_signin_reuses_verified_browser_without_early_carting(tmp_path):
     async def scenario():
         store, group, account, engine = fixture(tmp_path)

@@ -30,6 +30,7 @@ from .browser_runtime import browser_options, extension_paths
 from .fingerprint_profiles import generated, inspect_hardware
 from .account_consistency import AccountBrowserProfiles
 from .performance import stage, timed
+from .amazon_states import PAGE_STATE
 
 
 def money(text: str) -> float | None:
@@ -553,8 +554,25 @@ class Amazon:
     async def watch_login(self, account_id, context, page):
         """Save a manually completed login without asking the user to click Save."""
         deadline = time.monotonic() + 1800
+        previous = None
         try:
             while self.logins.get(account_id) is context and not page.is_closed() and time.monotonic() < deadline:
+                # Wait inside the browser for a signed-in header. After a failed
+                # verification require a changed page state before trying again.
+                handle = await page.wait_for_function('''previous => {
+                    if (!['www.amazon.com', 'www.amazon.co.uk', 'www.amazon.ca'].includes(location.hostname)) return false;
+                    const label = document.querySelector('#nav-link-accountList .nav-line-1');
+                    const value = label?.getClientRects().length ? label.innerText.trim() : '';
+                    if (!value || /sign in/i.test(value) || location.pathname.includes('/ap/')) return false;
+                    const blocked = [...document.querySelectorAll('#captchacharacters, #auth-error-message-box, #auth-warning-message-box')].some(e => e.getClientRects().length);
+                    if (blocked || /access denied|robot check|verify your identity|verify it's you|additional verification required|no default payment method|no default address/i.test(document.body?.innerText || '')) return false;
+                    const signature = performance.timeOrigin + '|' + location.href + '|' + value;
+                    return signature !== previous ? signature : false;
+                }''', arg=previous, timeout=max(1, (deadline - time.monotonic()) * 1000))
+                try:
+                    previous = await handle.json_value()
+                finally:
+                    await handle.dispose()
                 if urlparse(page.url).hostname in DOMAINS.values() and '/ap/' not in urlparse(page.url).path:
                     label = await self.text(page, '#nav-link-accountList .nav-line-1')
                     if label and 'sign in' not in label.lower():
@@ -566,12 +584,10 @@ class Amazon:
                                 # persisting the authenticated storage state.
                                 await self.ensure_session(context, account, page)
                             except Attention:
-                                await asyncio.sleep(1)
                                 continue
                         await context.close()
                         self.logins.pop(account_id, None)
                         return
-                await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -977,6 +993,26 @@ class Amazon:
                 "available": available, 'availability_status': stock_status,
                 'availability_message': availability_message, 'agent_error': agent_error}
 
+    async def wait_state(self, page, state, **evidence):
+        """Return on observable progress; default browser timeout only bounds stalls."""
+        with stage('Wait for ' + state + ' state'):
+            try:
+                handle = await page.wait_for_function(PAGE_STATE, arg={'state': state, **evidence})
+            except BrowserTimeoutError as exc:
+                raise Attention(f'Amazon did not confirm the {state} state before the browser timeout. Review the browser; no action was repeated.') from exc
+            try:
+                result = await handle.json_value()
+            finally:
+                await handle.dispose()
+            if isinstance(result, dict) and result.get('error'):
+                await self.check(page)
+                if result.get('continuation'):
+                    # check() permits one exact, same-origin Continue shopping
+                    # action. Re-observe its resulting page, never assume success.
+                    return await self.wait_state(page, state, **evidence)
+                raise Attention(result['error'])
+            return result
+
     async def cart(self, page, quantity, asin):
         domain = urlparse(page.url).hostname
         if domain not in DOMAINS.values():
@@ -1012,7 +1048,7 @@ class Amazon:
                 choices = await picker.locator('option').evaluate_all("els => els.map(e => e.value)")
                 if str(quantity) in choices:
                     await picker.select_option(str(quantity))
-                    await page.wait_for_timeout(500)
+                    await self.wait_state(page, 'quantity', asin=asin, quantity=quantity)
                     updated = await self.get_cart(page)
                     if len(updated) == 1 and updated[0]['asin'] == asin and updated[0]['quantity'] == quantity:
                         return quantity
@@ -1047,14 +1083,19 @@ class Amazon:
             await selector.select_option(str(actual))
         elif quantity!=1:
             raise CartRejected("Requested item quantity could not be selected")
+        before = await page.evaluate(PAGE_STATE, {'state': 'cart', 'snapshot': True, 'asin': asin, 'quantity': actual})
+        if before.get('error'):
+            await self.check(page)
+            raise Attention(before['error'])
         try:
             await behavior.click(page, await self.resolve_action(page,"ADD_TO_CART"))
         except InteractionError as exc:
             raise Attention(str(exc)) from exc
-        await page.wait_for_timeout(1500)
+        await self.wait_state(page, 'cart', asin=asin, quantity=actual, before=before)
         await self.check(page)
         # Cart is a handoff, never evidence that an order was placed.
         await self.navigate(page, f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
+        await self.wait_state(page, 'quantity', asin=asin, quantity=actual)
         await self.check(page)
         lines=await self.get_cart(page)
         matching=[line for line in lines if line['asin']==asin]
@@ -1174,23 +1215,13 @@ class Amazon:
         Recommendations are not cart contents. Only explicit checkout continuation
         or refusal of a modal offer can be clicked here; never Add or Place order.
         """
+        before = None
         for _ in range(5):
-            # Wait for hydrated content instead of assuming checkout is ready
-            # after one fixed sleep. This also handles same-URL transitions.
-            for poll in range(40):
-                await self.check(page)
-                dialogs = page.locator('[role=dialog]:visible,dialog[open]:visible,[aria-modal=true]:visible')
-                review = page.locator('#spc-orders [data-asin]:visible, #checkout-item-block [data-asin]:visible')
-                final_review = page.locator("input[name='placeYourOrder1']:visible, #placeOrder:visible")
-                continuation = page.get_by_role('link', name=re.compile(AMAZON_ACTIONS['CONTINUE_CHECKOUT'], re.I)).or_(page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['CONTINUE_CHECKOUT'], re.I)))
-                if await dialogs.count() or await review.count() or await final_review.count() or await continuation.count():
-                    break
-                await page.wait_for_timeout(250)
-            if urlparse(page.url).hostname not in set(DOMAINS.values()):
-                raise Attention('Checkout left the permitted retailer; review the browser')
-            if await dialogs.count():
+            observed = await self.wait_state(page, 'checkout', before=before)
+            await self.check(page)
+            if observed['kind'] == 'dialog':
                 action = 'DISMISS_CHECKOUT_OFFER'
-            elif await review.count() or await final_review.count():
+            elif observed['kind'] == 'review':
                 return
             else:
                 action = 'CONTINUE_CHECKOUT'
@@ -1200,7 +1231,7 @@ class Amazon:
                 if href and (urlparse(href).scheme != 'https' or urlparse(href).hostname not in set(DOMAINS.values())):
                     raise InteractionError('Checkout continuation leaves the permitted retailer')
                 await behavior.click(page, control, timeout=5000)
-                await page.wait_for_timeout(250)
+                before = observed
             except InteractionError as exc:
                 # AI is a bounded fallback after deterministic semantics. Keep
                 # this message specific so the user knows whether the issue is
@@ -1349,28 +1380,18 @@ class Amazon:
         page._retail_review = None
         page._retail_submit_control = None
         await button.click(no_wait_after=True)
-        await page.wait_for_timeout(1800)
+        await self.wait_state(page, 'submission')
 
     async def confirmation(self, page):
         if urlparse(page.url).hostname not in DOMAINS.values():
             return None
-        for _ in range(24):
-            body = await page.locator('body').inner_text()
-            if re.search(r'\b\d{3}-\d{7}-\d{7}\b', body) or 'order placed' in body.lower():
-                break
-            await page.wait_for_timeout(250)
-        order = re.search(r"\b\d{3}-\d{7}-\d{7}\b", body)
-        lower = body.lower()
-        heading = page.get_by_role('heading', name=re.compile(r'order placed|order confirmed|thank you', re.I))
-        confirmed = (any(text in lower for text in ("order placed", "order has been placed", "order confirmed", "thank you, your order"))
-                     or await heading.count() > 0) and ('thank' in lower or 'placed' in lower or 'confirmed' in lower)
-        if not confirmed:
+        try:
+            result = await self.wait_state(page, 'confirmation')
+        except Attention:
+            # No order ID plus success evidence is an uncertain outcome, not a
+            # failed order or permission to submit again.
             return None
-        if order:
-            return order[0]
-        # A success heading without a retailer order ID is an uncertain outcome.
-        # Invented IDs cannot support deduplication or reconciliation.
-        return None
+        return result.get('order')
 
     async def free_shipping(self, page):
         options = page.locator("label").filter(has_text=re.compile(r"FREE.*(?:delivery|shipping)|(?:delivery|shipping).*FREE", re.I))
@@ -1379,12 +1400,12 @@ class Amazon:
             radio = option.locator("input[type=radio]")
             if await radio.count() == 1 and await radio.is_visible():
                 await radio.check()
-                await page.wait_for_timeout(700)
                 break
+        await self.wait_state(page, 'shipping')
         rows = page.locator("#subtotals-marketplace-table tr").filter(has_text=re.compile(r"shipping|delivery", re.I))
         text = " ".join(await rows.all_inner_texts())
         charges = re.findall(r"\$\s*([\d,.]+)", text)
-        if not text or not ("free" in text.lower() or charges and all(float(x.replace(",", "")) == 0 for x in charges)):
+        if not text or not (all(float(x.replace(",", "")) == 0 for x in charges) if charges else "free" in text.lower()):
             raise Attention("Free shipping could not be verified; select a free option in the browser")
 
     async def verify_cvv(self, page, cvv):
@@ -1406,7 +1427,7 @@ class Amazon:
             return False
         await behavior.fill(page, field, cvv)
         await behavior.click(page, button)
-        await page.wait_for_timeout(800)
+        await self.wait_state(page, 'cvv')
         return True
 
     async def payment_verification(self, page):
