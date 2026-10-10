@@ -18,6 +18,8 @@ class Engine:
         self.store = store
         self.amazon = Amazon(store)
         self.jobs = {}
+        from .monitors import MonitorRegistry
+        self.monitors = MonitorRegistry(self)
         self.account_locks = {}
         self.browser_slots = asyncio.Semaphore((store.get('settings', 'settings') or {}).get('max_running_tasks', 10))
         self.wakes = {}
@@ -110,7 +112,9 @@ class Engine:
         if self.stopping_all:
             raise ValueError("All tasks are stopping; try again after the stop completes")
         if id in self.jobs:
-            return
+            if not self.jobs[id].done():
+                return
+            self.jobs.pop(id, None)
         task = self.store.get("tasks", id)
         if not task:
             raise ValueError("Task not found")
@@ -129,14 +133,14 @@ class Engine:
             account = self.store.get("accounts", task["account_id"])
             if not account or not (account.get("session") or account.get("password")):
                 raise ValueError("Save an account session or provide credentials for automatic login first")
-            if task["account_id"] in getattr(self.amazon, "logins", {}):
-                raise ValueError("Close or save this account's login browser before starting tasks")
             if account.get("retailer", "amazon") != group.get("retailer", "amazon"):
                 raise ValueError("Account and task group must use the same retailer")
             if task.get("checkout_mode") == "automatic" and account["region"] != "US":
                 raise ValueError("Automatic order submission currently supports Amazon US")
+        from .monitors import monitor_items
+        monitor_items(self.store, group, task)
         self.wakes[id] = asyncio.Event()
-        self.status(id, "starting", "Starting simulation" if task["simulation"] else "Opening Amazon browser")
+        self.status(id, "starting", "Starting simulation" if task["simulation"] else "Starting stock monitor; task on standby")
         self.jobs[id] = asyncio.create_task(self.run(id))
 
     async def stop(self, id):

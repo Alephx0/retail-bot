@@ -63,7 +63,7 @@ document.addEventListener('click',async event=>{
     if(b.dataset.group)return;
     if(b.dataset.copy){await navigator.clipboard.writeText(b.dataset.copy);toast('Monitor input copied');return;}
     if(b.dataset.filter){historyFilter=b.dataset.filter;render();return;}
-    if(b.dataset.task){b.disabled=true;await api(`tasks/${b.dataset.task}/${b.dataset.op}`,'POST');await refresh();return;}
+    if(b.dataset.task){b.disabled=true;if(b.dataset.op==='start')await saveMonitorDraft();await api(`tasks/${b.dataset.task}/${b.dataset.op}`,'POST');await refresh();return;}
     if(b.dataset.account){b.disabled=true;await api(`accounts/${b.dataset.account}/${b.dataset.op}`,'POST');await refresh();if(b.dataset.op==='login'){toast('Complete sign-in in the browser window. Your session saves automatically once verified.');}else toast('Session saved');return;}
     const action=b.dataset.action;
     if(action==='back'){groupId=null;selected.clear();render();}
@@ -75,6 +75,7 @@ document.addEventListener('click',async event=>{
     if(action==='demo'){const result=await api('demo/load','POST');groupId=result.group_id;await refresh();toast('Simulation tasks created. Select Start all to try them.');}
     if(action==='delete'){if(!confirm('Delete this record? Associated tasks must be removed first.'))return;await api(`${b.dataset.kind}/${b.dataset.id}`,'DELETE');selected.delete(b.dataset.id);await refresh();}
     if(action==='bulk'){
+      if(b.dataset.op==='start')await saveMonitorDraft();
       const tasks=state.tasks.filter(t=>t.group_id===groupId&&(!selected.size||selected.has(t.id)));
       if(b.dataset.op==='delete'&&!confirm(`Delete ${tasks.length} tasks?`))return;
       let errors=[];

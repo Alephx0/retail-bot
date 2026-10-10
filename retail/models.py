@@ -19,11 +19,11 @@ def inputs(text: str) -> list[dict]:
         if len(parts) > 3:
             raise ValueError("Use ASIN;max price;offer ID, one product per line")
         asin = parts[0].upper()
-        if parts[0].startswith("https://"):
+        if parts[0].lower().startswith(('https://', 'http://')):
             parsed = urlparse(parts[0])
-            if parsed.hostname not in set(DOMAINS.values()) | {d.removeprefix('www.') for d in DOMAINS.values()}:
+            if parsed.username or parsed.password or parsed.hostname not in set(DOMAINS.values()) | {d.removeprefix('www.') for d in DOMAINS.values()}:
                 raise ValueError("Product URLs must use Amazon US, UK, or Canada")
-            match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:/|$)", parsed.path, re.I)
+            match = re.search(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})(?:/|$)", parsed.path, re.I)
             asin = match[1].upper() if match else ""
         if not re.fullmatch(r"[A-Z0-9]{10}", asin):
             raise ValueError(f"Invalid ASIN: {parts[0]}")
@@ -46,6 +46,14 @@ def inputs(text: str) -> list[dict]:
     if len(result) > 20:
         raise ValueError("Maximum 20 products per group")
     return result
+
+
+def canonical_inputs(text):
+    """Store canonical IDs while retaining legacy per-product price/offer limits."""
+    items = inputs(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return '\n'.join(item['asin'] + (';' + line.split(';', 1)[1] if ';' in line else '')
+                     for item, line in zip(items, lines))
 
 
 def proxy_config(value: str) -> dict | None:
@@ -237,7 +245,7 @@ class Group(BaseModel):
     def prices(self):
         if not self.input_list_id and self.products.strip():
             if self.retailer == "amazon":
-                inputs(self.products)
+                self.products = canonical_inputs(self.products)
             elif not self.products.strip():
                 raise ValueError("Add at least one product input")
         if self.max_price is not None and self.max_price < self.min_price:
@@ -247,6 +255,7 @@ class Group(BaseModel):
 
 class Task(BaseModel):
     group_id: str
+    monitor_asin: str = Field(default='', pattern=r'^(?:[A-Z0-9]{10})?$')
     account_id: str = ""
     proxy_id: str = ""
     simulation: bool = True
@@ -439,7 +448,7 @@ class InputList(BaseModel):
     @model_validator(mode="after")
     def valid(self):
         if self.retailer == "amazon":
-            inputs(self.products)
+            self.products = canonical_inputs(self.products)
         return self
 
 

@@ -27,18 +27,18 @@ def transition(previous, status):
     if previous in ('FAILED','STOPPED') and state not in ('INITIALIZING','STOPPED','FAILED'):
         raise ValueError('A stopped task must be initialized before it can run')
     forward={
-        'INITIALIZING':{'AUTHENTICATING','READY','IN_QUEUE'},
+        'INITIALIZING':{'AUTHENTICATING','READY','IN_QUEUE','OUT_OF_STOCK'},
         'AUTHENTICATING':{'READY'},
         'IN_QUEUE':{'AUTHENTICATING','READY'},
         'READY':{'MONITORING','PRODUCT_FOUND','OUT_OF_STOCK'},
         'MONITORING':{'PRODUCT_FOUND','OUT_OF_STOCK'},
-        'PRODUCT_FOUND':{'CARTING','OUT_OF_STOCK'},
+        'PRODUCT_FOUND':{'CARTING','OUT_OF_STOCK','IN_QUEUE'},
         'CARTING':{'CARTED','SUCCESS'}, # simulations do not submit
         'CARTED':{'CHECKOUT','PAYMENT_CONFIRMATION','SUCCESS'},
         'CHECKOUT':{'PAYMENT_CONFIRMATION','SUCCESS'},
         'PAYMENT_CONFIRMATION':{'SUCCESS'},
         'SUCCESS':{'READY','INITIALIZING'},
-        'OUT_OF_STOCK':{'MONITORING','READY'},
+        'OUT_OF_STOCK':{'MONITORING','READY','PRODUCT_FOUND'},
     }
     # A login challenge can interrupt any pre-submission browser step.
     branches={'FAILED','STOPPED','RETRY_WAIT','MANUAL_ACTION_REQUIRED','AUTHENTICATING'}

@@ -71,7 +71,7 @@ def test_headless_take_control_uses_existing_paused_page(tmp_path):
     asyncio.run(scenario())
 
 
-def test_excess_accounts_queue_without_opening_more_contexts(tmp_path):
+def test_shared_monitor_keeps_checkout_context_capacity_available(tmp_path):
     class Page:
         def __init__(self, context):
             self.context = context
@@ -140,14 +140,15 @@ def test_excess_accounts_queue_without_opening_more_contexts(tmp_path):
             await asyncio.sleep(.01)
         await engine.start(tasks[1]['id'])
         for _ in range(100):
-            if store.get('tasks', tasks[1]['id'])['status'] == 'in_queue':
+            if store.get('tasks', tasks[1]['id'])['status'] == 'waiting':
                 break
             await asyncio.sleep(.01)
-        assert store.get('tasks', tasks[1]['id'])['status'] == 'in_queue'
+        assert store.get('tasks', tasks[1]['id'])['status'] == 'waiting'
+        assert all(not lock.locked() for lock in engine.account_locks.values())
         assert adapter.max_contexts == 1
         adapter.release_first.set()
         await asyncio.wait_for(asyncio.gather(*list(engine.jobs.values())), 10)
-        assert adapter.max_contexts == 1
+        assert adapter.max_contexts == 2  # One shared monitor plus one checkout worker.
         assert all(store.get('tasks', t['id'])['status'] == 'completed' for t in tasks)
         await engine.close()
         store.db.close()

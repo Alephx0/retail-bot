@@ -66,6 +66,14 @@ not merely a different window style. All five font/navigator/screen/location/
 timezone controls are available in both modes. See the [native backend notes](native-fingerprint-backend.md)
 for installation and browser-specific tradeoffs.
 
+For the validated JavaScript configuration, choose **Chrome** as Browser
+application in Settings, or **Google Chrome** as the account Browser identity.
+JavaScript compatibility does not automatically select Chrome. Bundled Chromium
+153 scored 0.70 Elevated in the follow-up account comparison, while installed
+Chrome 154 scored 0.20 Low with the same account seed, all eight toggles and GPU
+variation active. These are measured browser-build differences, not guaranteed
+scores. Explicit browser selections remain available.
+
 Choose a browser identity globally in **Settings > Browser**, or override it for
 an account. Edge, Brave and Opera launch the real installed application, preserving
 its native brand, client hints and version. Optional executable paths are global.

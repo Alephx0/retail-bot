@@ -93,6 +93,12 @@ def create_app(data_dir=None):
 
     def validate_task(valid, id=None):
         group = require("groups", valid["group_id"])
+        if valid.get('monitor_asin'):
+            from .monitors import monitor_items
+            try:
+                monitor_items(store(), group, valid)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
         account = require("accounts", valid["account_id"]) if valid["account_id"] else None
         if not valid["simulation"]:
             if not account or not (account.get("session") or account.get("password")):
@@ -139,6 +145,8 @@ def create_app(data_dir=None):
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
         result["events"] = store().all("events")[-150:][::-1]
         result["active"] = list(app.state.engine.jobs)
+        result['monitors'] = app.state.engine.monitors.snapshot()
+        result['task_browser_ids'] = list(app.state.engine.pages)
         result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
         result['extension_catalog'] = CATALOG
         result['settings'] = [public('settings', {**Settings().model_dump(), **(store().get('settings', 'settings') or {})})]
@@ -209,6 +217,8 @@ def create_app(data_dir=None):
                 raise HTTPException(409, "Stop tasks using this record before editing")
         if kind == "proxies" and app.state.proxy_health.busy(id):
             raise HTTPException(409, "Wait for the proxy check to finish before editing")
+        if kind == 'proxies' and any(m.group.get('monitor_proxy_id') == id for m in app.state.engine.monitors.active.values()):
+            raise HTTPException(409, 'Stop tasks monitoring through this proxy group before editing')
         if kind == "input_lists" and id and any(g.get("input_list_id") == id and any(t["group_id"] == g["id"] and t["id"] in app.state.engine.jobs for t in store().all("tasks")) for g in store().all("groups")):
             raise HTTPException(409, "Stop tasks using this input list before editing")
         if kind == "accounts":

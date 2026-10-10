@@ -67,3 +67,8 @@ body.settings-open #toast{top:85px;bottom:auto;pointer-events:none}
 .account-fingerprint-fields { margin: 16px 0; }
 .fingerprint-value { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 380px; }
 @media (max-width: 600px) { .fingerprint-site-row { grid-template-columns: 1fr; } }
+
+.monitor-status-row{display:grid;gap:6px;padding:10px 0;border-bottom:1px solid var(--line)}
+.monitor-status-row button{text-align:left;white-space:normal;height:auto;padding:8px}.monitor-status-row small{display:block;margin-top:4px}.monitor-log{max-height:55vh;overflow:auto;min-width:320px}.monitor-log p{padding:8px 0;border-bottom:1px solid var(--line)}
+
+.task-panel td .actions{flex-wrap:wrap}.task-panel [data-task-monitor]{min-width:0;width:100%;font-size:11px;padding:8px}

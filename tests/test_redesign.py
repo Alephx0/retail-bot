@@ -181,6 +181,9 @@ def test_cancelling_queued_task_does_not_release_another_accounts_lock(tmp_path)
     class Adapter:
         async def context(self,*args):return Context()
         async def ensure_session(self,*args):await asyncio.Event().wait()
+        async def inspect(self,*args):
+            return {'asin':'B012345678','title':'Fixture','price':20,'available':True,
+                    'amazon_seller':True,'condition':'new','offer_id':''}
         async def close(self):pass
     async def scenario():
         store=Store(tmp_path);engine=Engine(store);engine.amazon=Adapter()
