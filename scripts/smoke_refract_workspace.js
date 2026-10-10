@@ -5,6 +5,10 @@ async page => {
   await page.unrouteAll({behavior:'wait'});
   await page.setViewportSize({width:1440,height:1000});await page.goto('http://127.0.0.1:8785');
   await page.waitForFunction(()=>stateLoaded);
+  check(await page.locator('.nav').evaluateAll(nodes=>nodes.every(node=>{
+    const svg=node.querySelector('svg'),box=svg.getBoundingClientRect();
+    return box.width>=20&&box.height>=20&&getComputedStyle(svg.parentElement).clipPath==='none';
+  })),'Every icon remains visible after hydration in the desktop rail');
   await page.evaluate(async()=>{for(const id of state.active)await api('tasks/'+id+'/stop','POST');await refresh(true);});
   const fixture=await page.evaluate(async()=>{
     const a=await api('accounts','POST',{name:'Search Alpha',email:'alpha@example.invalid'}),b=await api('accounts','POST',{name:'Search Beta',email:'beta@example.invalid'});

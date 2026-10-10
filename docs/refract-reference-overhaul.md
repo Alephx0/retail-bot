@@ -170,3 +170,33 @@ correctness still depends on supported retailer layouts, authenticated sessions
 and human verification where required. Real purchases and external provider
 credentials were not exercised. No production-readiness or checkout-throughput
 claim is inferred from a passing UI test or the overview benchmark.
+
+
+## Closer reference layout (October 10 follow-up)
+
+Matched the local reference's actual proportions: 70px icon-only desktop rail,
+225px group cards with 66px initials, 290px task sidebar, compact table rows and
+borderless row actions. The group title now sits inside the task pane; status
+filters sit in the sidebar. The workspace fits the available desktop height,
+including any trace-recording notice, with independent sidebar/table scrolling.
+Mobile restores navigation labels and stacks the workspace without page overflow.
+
+Shared colors, outlined controls, preference switches, dialog sizing, assignment
+tabs, settings columns and dashboard metric cards now follow the reference more
+closely. Proxy lists use cards backed by existing APIs and public host/port data;
+credentials stay in the vault. Existing operations, four group settings tabs,
+profile assignment, monitor controls, and additional navigation remain available.
+No engine, persistence, authentication or purchasing logic changed.
+
+Validation: all four Playwright MCP suites passed (15 task-workspace scenarios,
+9 profile/settings scenarios, 5 assignment-recovery scenarios, and 6 workspace
+scenario groups). Checks include simulated start/stop, independent task settings,
+frozen runs, preview races, keyboard behavior and 1024/760/390px layouts. Added
+an icon visibility assertion after hydration. A controlled proxy fixture also
+passed card edit/delete and narrow-layout checks without external network tests.
+Desktop, modal and mobile screenshots were visually inspected; artifacts use the
+`closer-` prefix. JavaScript syntax and whitespace checks passed. The backend
+regression suite was not repeated for this presentation-only follow-up.
+
+The running instance on localhost:8787 serves these static assets after refresh;
+its saved records were not modified during the visual review.
