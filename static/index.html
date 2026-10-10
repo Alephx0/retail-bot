@@ -1,36 +1,22 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Retail Desk · Automation workspace</title><link rel="stylesheet" href="/static/style.css"><script src="/static/features.js" defer></script><script src="/static/app.js" defer></script><script src="/static/workspace.js" defer></script><script src="/static/task-monitors.js" defer></script><script src="/static/redesign.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="data:,"><title>Retail Desk · Automation workspace</title><link rel="stylesheet" href="/static/style.css"><script src="/static/icons.js" defer></script><script src="/static/features.js" defer></script><script src="/static/app.js" defer></script><script src="/static/account-workspace.js" defer></script><script src="/static/redesign.js" defer></script></head>
 <body>
 <script src="/static/ai-settings.js" defer></script>
 <script src="/static/settings.js" defer></script>
 <script src="/static/account-fingerprints.js" defer></script>
 <script src="/static/fingerprint-profile-editor.js" defer></script>
-<aside class="sidebar">
-  <a class="brand" href="/"><span class="logo">r<span>↗</span></span> retail<span class="brand-light">desk</span></a>
-  <div class="workspace"><span class="workspace-icon">J</span><div>Local workspace<small>Personal · on this device</small></div><span class="dot"></span></div>
-  <div class="nav-label">WORKSPACE</div>
-  <nav aria-label="Main navigation">
-    <button data-view="home" class="nav active"><span>&#8962;</span> Home</button>
-    <button data-view="tasks" class="nav"><span>&#9638;</span> Task Groups <b id="nav-count">0</b></button>
-    <button data-view="accounts" class="nav"><span>&#9678;</span> Accounts</button>
-    <button data-view="profiles" class="nav"><span>&#9635;</span> Profiles</button>
-    <button data-view="proxies" class="nav"><span>&#8644;</span> Proxies</button>
-    <button data-view="input_lists" class="nav"><span>&#8801;</span> Input Lists</button>
-    <button data-view="manager" class="nav"><span>&#9672;</span> Account Manager</button>
-  </nav>
-  <div class="sidebar-bottom"><div class="local-note"><span class="dot"></span> Local engine<small>Encrypted storage · Multi-retailer</small></div><button data-view="settings" class="nav"><span>⚙</span> Settings</button><div class="version">RETAIL DESK <span>v0.4.0</span></div></div>
-</aside>
-<main>
-  <header><div class="crumb">Workspace <span>/</span> <strong id="crumb">Task groups</strong></div><div class="header-right"><button data-feature="stop-all" class="stop-all">Stop all</button><span id="connection" class="connection">● Connected</span><span class="avatar">L</span></div></header>
+<script src="/static/task-groups.js" defer></script>
+<script src="/static/group-workspace.js" defer></script><script src="/static/group-settings.js" defer></script><script src="/static/task-assignment.js" defer></script><script src="/static/task-monitors.js" defer></script><script src="/static/task-editor.js" defer></script><script src="/static/task-workspace.js" defer></script><script src="/static/resources.js" defer></script>
+<aside class="sidebar"><a class="brand" href="/"><span class="brand-mark" data-icon="layers"></span>Retail Desk</a><div class="workspace"><span class="dot"></span>Local workspace</div><nav aria-label="Main navigation"><button data-view="task_groups" class="nav"><span data-icon="layers"></span>Task groups<b id="nav-count">0</b></button><button data-view="home" class="nav"><span data-icon="layout-dashboard"></span>Overview</button><button data-view="accounts" class="nav"><span data-icon="users"></span>Accounts</button><button data-view="checkouts" class="nav"><span data-icon="shopping-cart"></span>Orders</button><button data-view="events" class="nav"><span data-icon="activity"></span>Activity</button><button data-view="tools" class="nav"><span data-icon="sliders-horizontal"></span>Tools</button></nav><div class="sidebar-bottom"><button data-view="settings" class="nav"><span data-icon="settings-2"></span>Settings</button><div class="local-note">Private by default<small>Encrypted storage on this device</small></div></div></aside><main>
+  <header><div class="crumb">Workspace <span>/</span> <strong id="crumb">Task groups</strong></div><div class="header-right"><button data-feature="stop-all" class="stop-all"><span data-icon="square"></span>Stop all</button><span id="connection" class="connection">Connecting...</span></div></header>
   <div class="content">
-    <div class="page-heading"><div><div class="eyebrow">YOUR AUTOMATION WORKSPACE</div><h1 id="title">Task groups</h1><p id="subtitle">Every product. Every task. One place to stay in control.</p></div><button id="primary" class="primary">＋ Create group</button></div>
-    <section class="stats" aria-label="Workspace statistics"><div><span>Total tasks</span><strong id="stat-tasks">0</strong><small>Across your task groups</small></div><div><span>Running now <i class="dot"></i></span><strong id="stat-running">0</strong><small>Monitoring and processing</small></div><div><span>Live confirmations</span><strong id="stat-orders">0</strong><small>Verified retailer responses</small></div><div><span>Accounts ready</span><strong id="stat-accounts">0</strong><small>Saved account sessions</small></div></section>
+    <div class="page-heading"><div><h1 id="title">Task groups</h1><p id="subtitle">One objective. Your accounts, working together.</p></div><button id="primary" class="primary">＋ Create group</button></div>
     <p id="trace-recording" class="notice amber" hidden>Browser trace recording is enabled. Traces can contain account details. Manage recording in Settings → Data &amp; privacy.</p>
-    <section id="screen"></section>
+    <section id="screen" aria-label="Workspace content"><p role="status">Loading workspace...</p></section>
     <footer><span><i class="dot"></i> Runs on your device</span><span>Retail automation <b>•</b> Your accounts, your controls</span></footer>
   </div>
 </main>
-<dialog id="modal"><form id="editor"><div class="modal-head"><h2 id="modal-title"></h2><button type="button" data-close class="icon-button" aria-label="Close">×</button></div><div id="fields"></div><p id="form-error" role="alert"></p><div class="modal-actions"><button type="button" data-close>Cancel</button><button type="submit" class="primary">Save</button></div></form></dialog>
+<dialog id="modal" aria-labelledby="modal-title"><form id="editor"><div class="modal-head"><h2 id="modal-title"></h2><button type="button" data-close class="icon-button" aria-label="Close"><span data-icon="x"></span></button></div><div id="fields"></div><p id="form-error" role="alert"></p><div class="modal-actions"><button type="button" data-close>Cancel</button><button type="submit" class="primary">Save</button></div></form></dialog>
 <div id="toast" role="status"></div>
 </body></html>

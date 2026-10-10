@@ -65,6 +65,8 @@ class TaskRunner:
             task = {**saved_task, **Task.model_validate(saved_task).model_dump(mode="json")}
             saved_group = self.store.get("groups", task["group_id"])
             group = {**saved_group, **Group.model_validate(saved_group).model_dump()}
+            if task.get('max_total') is not None:
+                group['max_total'] = task['max_total']
             adapter=self.engine.adapter_for(group["retailer"]) if not task["simulation"] else None
             cart=CartService(adapter)
             checkout_service=CheckoutService(adapter)
@@ -127,6 +129,7 @@ class TaskRunner:
                         if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
                         await account_lock.acquire()
                         lock_acquired=True
+                        self.engine.check_pending_order(task['account_id'])
                         if task['checkout_mode'] in ('review', 'automatic'):
                             policy_account = self.store.get('accounts', task['account_id'])
                             current = datetime.now(timezone.utc)

@@ -21,7 +21,7 @@ function canonicalMonitorInput(text) {
 
 function monitorAsins(group) {
   if (!group) return [];
-  try { return [...new Set(canonicalMonitorInput(groupProducts(group)).split('\n').filter(Boolean).map(x => x.split(';')[0]))]; }
+  try { return [...new Set(canonicalMonitorInput(group.input_list_id?state.input_lists.find(x=>x.id===group.input_list_id)?.products||'':group.products||'').split('\n').filter(Boolean).map(x => x.split(';')[0]))]; }
   catch { return []; }
 }
 
@@ -61,23 +61,6 @@ function refreshMonitorStatus() {
     if (record) body.innerHTML = `<p>${esc(record.connection)} · ${record.simulation ? 'Simulation' : esc(record.region)}</p>` +
       record.log.slice().reverse().map(entry => `<p><time>${esc(time(entry.at))}</time> · <strong>${esc(entry.status)}</strong><br>${esc(entry.message)}</p>`).join('');
   });
-}
-
-async function saveMonitorDraft() {
-  const form = document.querySelector('#group-settings');
-  if (!form) return;
-  const group = state.groups.find(g => g.id===form.dataset.id);
-  if (!group) return;
-  const data = formData(form);
-  if (group.retailer==='amazon') data.products = canonicalMonitorInput(data.products);
-  form.elements.products.value = data.products;
-  for (const key of ['delay_ms','max_total','max_errors','min_discount','min_savings','min_price','retry_delay_ms','quantity','max_checkouts']) {
-    if (key in data) data[key] = Number(data[key]);
-  }
-  data.max_price = data.max_price==='' ? null : Number(data.max_price);
-  const saved = await api('groups/' + group.id, 'PUT', data);
-  Object.assign(group, saved);
-  delete form.dataset.dirty;
 }
 
 document.addEventListener('focusout', event => {

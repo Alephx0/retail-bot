@@ -33,6 +33,7 @@ function settingsChanges() {
   return changes;
 }
 function settingsDirty() { return Object.keys(settingsChanges()).length > 0; }
+function settingsRuntimeActive(){return !!state.active?.length||(state.task_groups||[]).some(g=>tgActive(g.run));}
 function settingHelp(text) { return `<p class="setting-help">${text}</p>`; }
 function settingCard(title, help, content) {
   return `<div class="setting-card"><h3>${title}</h3>${help ? settingHelp(help) : ''}${content}</div>`;
@@ -48,7 +49,7 @@ function settingsView() {
   ensureSettingsDraft();
   if (!settingsSections.some(x => x[0] === settingsTab)) settingsTab = 'general';
   const s = settingsDraft;
-  const general = settingCard('Monitoring defaults', 'Applies to new task groups. Existing groups keep their own interval.',
+  const general = settingCard('Monitoring defaults', 'Used by groups that inherit workspace defaults. Active runs keep their starting interval.',
     secondsField('default_monitor_delay', 'Check interval (seconds)', s.default_monitor_delay ?? 4500, 3.5, 3600)) +
     settingCard('Resource usage', 'Extra tasks queue when all browser workers are busy. Higher limits use more memory.',
       input('max_running_tasks', 'Maximum active browser workers', s.max_running_tasks ?? 10, 'number', 'min="1" max="50" required') +
@@ -148,7 +149,8 @@ function activateSettingsTab(key, focus = false) {
 function updateSettingsStatus() {
   const form = $('#settings-form');
   if (!form || !settingsDraft) return;
-  const s = settingsDraft, saved = state.settings[0] || {}, running = !!state.active?.length;
+  const s = settingsDraft, saved = state.settings[0] || {}, running = settingsRuntimeActive();
+  $('#trace-recording').hidden=!saved.trace_enabled;
   const dirty = settingsDirty();
   document.querySelector('.settings-navigation [role=tablist]').setAttribute('aria-orientation', matchMedia('(max-width:740px)').matches ? 'horizontal' : 'vertical');
   form.querySelector('[data-settings-status]').textContent = settingsSaving ? 'Saving…' : dirty ? 'Unsaved changes · applies across sections' : (settingsSavedMessage || 'All changes saved');
@@ -220,7 +222,7 @@ async function saveSettings(form) {
   }
   const patch = settingsChanges();
   if (!Object.keys(patch).length) return;
-  if (state.active?.length) {
+  if (settingsRuntimeActive()) {
     const locked = stoppedSettings.find(key => key in patch);
     if (locked) return settingsFieldError('Stop running tasks before saving this change. Your draft is kept.',form.elements[locked]);
   }

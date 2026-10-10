@@ -27,6 +27,7 @@ class Engine:
         self.pages = {}
         self.live_view_locks = {}
         self.stopping_all = False
+        self.stopping_tasks = set()
         self.diagnostics = Diagnostics(store)
 
     def status(self, id, status, message, **metadata):
@@ -50,6 +51,8 @@ class Engine:
             self.store.event(id, status, message)
 
     async def boot(self):
+        if getattr(self,"legacy_read_only",False):
+            return  # Saved legacy plans are available for explicit, backed-up migration.
         for task in self.store.all("tasks"):
             if task.get("status") not in ("idle", "stopped", "scheduled", "completed", "error"):
                 self.status(task["id"], "stopped", "Stopped after application restart; review Amazon cart before restarting")
@@ -68,6 +71,14 @@ class Engine:
 
     async def schedule(self):
         while True:
+            coordinator = getattr(self, 'group_coordinator', None)
+            if coordinator:
+                try:
+                    await coordinator.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.store.event('task-groups', 'scheduler_error', 'Saved plan scheduling recovered from an error')
             local = datetime.now().astimezone()
             for group in self.store.all("groups"):
                 due = occurrences(group.get("schedule", {}), local)
@@ -109,7 +120,9 @@ class Engine:
                 self.store.event(task["id"], "notification_error", "Discord notification could not be delivered")
 
     async def start(self, id):
-        if self.stopping_all:
+        if getattr(self,"legacy_read_only",False):
+            raise ValueError("Import this saved plan from Task Groups before starting it")
+        if self.stopping_all or id in self.stopping_tasks:
             raise ValueError("All tasks are stopping; try again after the stop completes")
         if id in self.jobs:
             if not self.jobs[id].done():
@@ -119,6 +132,11 @@ class Engine:
         if not task:
             raise ValueError("Task not found")
         group = self.store.get("groups", task["group_id"])
+        if group and (group.get('task_group_id') or (getattr(self,'group_coordinator',None) and any(g.get('legacy_id')==group['id'] for g in self.group_coordinator.repo.all('group')))):
+            raise ValueError('This group has migrated. Start it in the new Task Groups workspace.')
+        coordinator = getattr(self, 'group_coordinator', None)
+        if coordinator and task.get('account_id') and coordinator.repo.claimed(task['account_id']):
+            raise ValueError('This account is reserved or busy in a task group')
         if not group or not (group.get("products", "").strip() or group.get("input_list_id")):
             raise ValueError("Configure the group monitor input before starting tasks")
         settings = self.store.get("settings", "settings") or {}
@@ -128,6 +146,7 @@ class Engine:
         if submission and not task["simulation"]:
             raise ValueError("This task already has an order submission record. Review order history; create a new task only for an intentional new purchase.")
         if not task["simulation"]:
+            self.check_pending_order(task['account_id'])
             if not RETAILERS[group.get("retailer", "amazon")].get("automation"):
                 raise ValueError("This retailer's live adapter is planned; Amazon automation is being implemented first")
             account = self.store.get("accounts", task["account_id"])
@@ -143,21 +162,32 @@ class Engine:
         self.status(id, "starting", "Starting simulation" if task["simulation"] else "Starting stock monitor; task on standby")
         self.jobs[id] = asyncio.create_task(self.run(id))
 
+    def check_pending_order(self, account_id):
+        if any(s.get('account_id') == account_id and s.get('status') != 'confirmed'
+               for s in self.store.all('submissions')):
+            raise ValueError('Verify this account\'s pending order before starting another purchase task')
+
     async def stop(self, id):
-        job = self.jobs.get(id)
-        if job:
-            job.cancel()
-            await asyncio.gather(job, return_exceptions=True)
-        self.jobs.pop(id, None)
-        self.wakes.pop(id, None)
-        self.status(id, "stopped", "Stopped")
+        self.stopping_tasks.add(id)
+        try:
+            job = self.jobs.get(id)
+            if job:
+                job.cancel()
+                await asyncio.gather(job, return_exceptions=True)
+            self.jobs.pop(id, None)
+            self.wakes.pop(id, None)
+            self.status(id, "stopped", "Stopped")
+        finally:
+            self.stopping_tasks.discard(id)
 
     async def stop_all(self):
         self.stopping_all = True
         try:
+            coordinator = getattr(self, 'group_coordinator', None)
+            group_count = await coordinator.stop_all() if coordinator else 0
             ids = {task["id"] for task in self.store.all("tasks") if task.get("status") == "scheduled" or task["id"] in self.jobs}
             await asyncio.gather(*(self.stop(id) for id in ids))
-            return len(ids)
+            return len(ids) + group_count
         finally:
             self.stopping_all = False
 
@@ -210,6 +240,9 @@ class Engine:
         elif scope == 'accounts':
             context = self.amazon.logins.get(id)
             pages = context.pages if context else []
+        elif scope == 'group_attempts' and getattr(self, 'group_coordinator', None):
+            page = self.group_coordinator.pages.get(id)
+            pages = [page] if page else []
         else:
             raise ValueError('Unknown browser scope')
         return next((page for page in reversed(pages) if not page.is_closed()), None)
@@ -233,6 +266,11 @@ class Engine:
             task = self.store.get('tasks', id)
             if not task or task.get('status') not in ('attention', 'review') or id not in self.wakes or self.wakes[id].is_set():
                 raise ValueError('Take Control is available only while this task is paused')
+        if scope == 'group_attempts':
+            attempt = self.group_coordinator.repo.require('attempt', id)
+            run = self.group_coordinator.repo.require('run', attempt['run_id'])
+            if attempt['state'] not in ('waiting_user', 'reconciliation_required') or (attempt['state']=='waiting_user' and run['state']!='watching'):
+                raise ValueError('Browser input is available only for manual review or reconciliation')
         kind = action.get('kind')
         if kind == 'click':
             size = page.viewport_size or await page.evaluate('({width: innerWidth, height: innerHeight})')

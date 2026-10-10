@@ -263,7 +263,7 @@ def test_checkout_rechecks_price_before_single_submission():
             adapter = Amazon(None)
             with pytest.raises(Attention): await adapter.submit_order(page)
             await adapter.checkout_snapshot(page, 'B012345678', 1, 25)
-            await page.locator('#total').evaluate("e=>e.textContent='$30.00'")
+            await page.locator('#total').evaluate("e=>e.textContent='$24.00'")
             with pytest.raises(Attention): await adapter.submit_order(page)
             assert not await page.evaluate('Boolean(window.orders)', isolated_context=False)
             await page.locator('#total').evaluate("e=>e.textContent='$21.20'")
