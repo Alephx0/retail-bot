@@ -100,6 +100,8 @@ def test_shared_watchers_leave_account_free_and_close_on_last_stop(tmp_path):
             await engine.start(first['id'])
             await engine.start(second['id'])
             await until(lambda: len(engine.monitors.active)==2 and all(m.sequence for m in engine.monitors.active.values()))
+            await until(lambda: all(store.get('tasks', t['id'])['status'] == 'waiting' for t in (first, second))
+                        and not engine.account_locks[account['id']].locked())
             monitor_contexts = [c for c in engine.amazon.contexts if c.identity['id'].startswith('monitor-')]
             assert len(monitor_contexts)==2
             assert len(engine.amazon.authentications)==4  # Both tasks verify sign-in and task connections.
@@ -150,7 +152,7 @@ def test_monitor_reports_inventory_without_authorizing_restricted_purchases(tmp_
             assert message in monitor.message
             assert not engine.amazon.carts
             assert sum(not c.closed for c in engine.amazon.contexts) == 1  # Only the watcher stays open.
-            assert len(engine.amazon.authentications) == (4 if availability == 'available' else 2)
+            assert len(engine.amazon.authentications) == 2  # Reuse the verified browser for immediately available stock.
             assert store.all('feed')[0]['availability_status'] == availability
             assert not store.all('feed')[0]['available']
             assert not engine.account_locks[account['id']].locked()
@@ -204,7 +206,8 @@ def test_start_verifies_session_then_stock_wakes_only_assigned_accounts(tmp_path
         try:
             await engine.start(first['id'])
             await until(lambda: engine.amazon.authentications)
-            assert not engine.monitors.active  # Sign-in must finish before monitoring.
+            assert engine.monitors.active  # Read-only stock scans can run during sign-in.
+            assert not engine.amazon.carts  # Session verification still gates purchase actions.
             sign_in.set()
             await engine.start(second['id'])
             await until(lambda: len(engine.monitors.active) == 2 and all(m.sequence >= 2 for m in engine.monitors.active.values()), timeout=10)
@@ -242,11 +245,37 @@ def test_one_account_waiting_for_login_does_not_block_another(tmp_path):
             await until(lambda: store.get('tasks', first['id'])['status']=='authenticating')
             await engine.start(second['id'])
             await until(lambda: engine.monitors.active and all(m.sequence for m in engine.monitors.active.values()))
+            await until(lambda: store.get('tasks', second['id'])['status'] == 'waiting'
+                        and not engine.account_locks[other['id']].locked())
             assert engine.account_locks[account['id']].locked()
             assert not engine.account_locks[other['id']].locked()
             await engine.stop(first['id'])
             assert not engine.account_locks[account['id']].locked()
             assert engine.browser_slots._value == 10
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
+def test_stock_during_signin_reuses_verified_browser_without_early_carting(tmp_path):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        engine.amazon.stock.add('B012345678')
+        gate = asyncio.Event()
+        engine.amazon.account_gate = gate
+        task = task_record(store, group, account, monitor_asin='B012345678', use_account_proxy=True)
+        try:
+            await engine.start(task['id'])
+            await until(lambda: engine.monitors.active and all(m.sequence for m in engine.monitors.active.values()))
+            assert not engine.amazon.carts
+            gate.set()
+            await until(lambda: task['id'] not in engine.jobs)
+            assert store.get('tasks', task['id'])['status'] == 'completed'
+            assert engine.amazon.authentications == [account['id']]
+            assert len([c for c in engine.amazon.contexts if c.identity['id'] == account['id']]) == 1
+            assert engine.amazon.carts == [(account['id'], 'B012345678')]
+            assert all(c.closed for c in engine.amazon.contexts)
         finally:
             await engine.close()
             store.db.close()
@@ -300,6 +329,7 @@ def test_restock_wakes_task_and_revalidates_stock_in_account(tmp_path):
         try:
             await engine.start(task['id'])
             await until(lambda: engine.monitors.active and all(m.sequence for m in engine.monitors.active.values()))
+            await until(lambda: not engine.account_locks[account['id']].locked())
             assert not engine.amazon.carts
             assert not engine.account_locks[account['id']].locked()
             monitor = next(iter(engine.monitors.active.values()))

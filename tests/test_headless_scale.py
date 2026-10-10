@@ -1,5 +1,25 @@
 import asyncio
 
+
+def test_task_cleanup_does_not_wait_for_an_unrelated_browser():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from retail.runner import TaskRunner
+
+    async def scenario():
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        own = asyncio.create_task(asyncio.sleep(0))
+        context = SimpleNamespace(close=AsyncMock(), _retail_close_task=own)
+        adapter = SimpleNamespace(profile_close_tasks={own, unrelated})
+        try:
+            await asyncio.wait_for(TaskRunner(None).close_context(adapter, context), 1)
+            assert own.done() and not unrelated.done()
+            context.close.assert_awaited_once()
+        finally:
+            unrelated.cancel()
+            await asyncio.gather(unrelated, return_exceptions=True)
+    asyncio.run(scenario())
+
 import pytest
 from patchright.async_api import async_playwright
 

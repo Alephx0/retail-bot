@@ -159,7 +159,7 @@ class Engine:
         from .monitors import monitor_items
         monitor_items(self.store, group, task)
         self.wakes[id] = asyncio.Event()
-        self.status(id, "starting", "Starting simulation" if task["simulation"] else "Verifying account session before monitoring")
+        self.status(id, "starting", "Starting simulation" if task["simulation"] else "Preparing account browser and stock monitors")
         self.jobs[id] = asyncio.create_task(self.run(id))
 
     def check_pending_order(self, account_id):

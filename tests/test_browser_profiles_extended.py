@@ -211,6 +211,37 @@ def test_normal_profile_preserves_newer_storage_after_initial_session_import(tmp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('incognito', [True, False])
+def test_headed_browser_restores_origins_after_loading_extensions(tmp_path, incognito):
+    async def scenario():
+        store = Store(tmp_path)
+        extension = tmp_path / 'extension'; extension.mkdir()
+        (extension / 'manifest.json').write_text(json.dumps({'manifest_version': 3, 'name': 'Startup fixture', 'version': '1.0'}))
+        store.put('browser_extensions', {'path': str(extension)}, 'fixture-extension')
+        store.put('settings', {'show_browser_window': True, 'browser_incognito': incognito,
+                              'browser_extension_ids': ['fixture-extension']}, 'settings')
+        cookie = {'name': 'fixture-session', 'value': 'saved', 'domain': 'startup.test', 'path': '/',
+                  'expires': 2147483647, 'httpOnly': False, 'secure': True, 'sameSite': 'Lax'}
+        account = store.put('accounts', {**Account(name='Startup').model_dump(), 'session': {
+            'cookies': [cookie], 'origins': [{'origin': 'https://startup.test',
+                                            'localStorage': [{'name': 'session-marker', 'value': 'preserved'}]}]}})
+        adapter = Amazon(store)
+        try:
+            async with asyncio.timeout(15):
+                context = await adapter.context(account)
+                await context.route('**/*', lambda route: route.fulfill(body='<h1>Local fixture</h1>', content_type='text/html'))
+                page = await context.new_page()
+                await page.goto('https://startup.test/')
+                assert await page.evaluate("localStorage.getItem('session-marker')") == 'preserved'
+                assert any(c['name'] == 'fixture-session' and c['value'] == 'saved' for c in await context.cookies())
+                assert await page.evaluate('!!chrome.runtime', isolated_context=False)
+                await context.close()
+        finally:
+            await adapter.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
 def test_preserved_gpu_keeps_real_api_functions_and_native_launch_flags(tmp_path):
     values = {'gpu': 'Actual renderer', 'gpu_choice': 'native', 'webgl_noise': 0,
               'webgpu_limits': 'native'}

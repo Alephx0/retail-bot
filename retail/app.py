@@ -36,7 +36,7 @@ MODELS = {"accounts": Account, "groups": Group, "proxies": ProxyList, "tasks": T
           "ai_connections": AIConnection, "browser_extensions": BrowserExtension}
 
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, *, warm_browser=False):
     @asynccontextmanager
     async def lifespan(app):
         folder = Path(data_dir or os.environ.get("RETAIL_DATA", ROOT / "data"))
@@ -55,12 +55,18 @@ def create_app(data_dir=None):
         for record in app.state.store.all("proxy_health"):
             if record.get("status") == "testing":
                 app.state.store.put("proxy_health", {**record, "status": "interrupted"})
+        warmup = None
         try:
             await app.state.group_coordinator.boot(schedule=False)
             await app.state.engine.boot()
+            if warm_browser:
+                warmup = asyncio.create_task(app.state.engine.amazon.prewarm())
             yield
         finally:
             try:
+                if warmup:
+                    warmup.cancel()
+                    await asyncio.gather(warmup, return_exceptions=True)
                 await app.state.group_coordinator.close()
                 await app.state.engine.close()
                 await app.state.proxy_health.close()
@@ -887,4 +893,4 @@ def create_app(data_dir=None):
     return app
 
 
-app = create_app()
+app = create_app(warm_browser=True)

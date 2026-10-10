@@ -22,9 +22,9 @@ class TaskRunner:
         await context.close()
         # Persistent profile owners close asynchronously on the context close
         # event. Drain those owners before another task reuses the account path.
-        owners = list(getattr(adapter, 'profile_close_tasks', ()))
-        if owners:
-            await asyncio.gather(*owners, return_exceptions=True)
+        owner = getattr(context, '_retail_close_task', None)
+        if owner:
+            await asyncio.gather(owner, return_exceptions=True)
 
     async def wait_for_backoff(self, id, exc, event_count):
         """Back off without shortening a retailer's Retry-After instruction."""
@@ -96,6 +96,11 @@ class TaskRunner:
                         return
             items = monitor_items(self.store, group, task)
             account = self.store.get('accounts', task['account_id']) or {'region': 'US'}
+            # Stock reads are independent of sign-in. Start them concurrently;
+            # account verification still gates every purchasing action.
+            monitors = self.monitors.subscribe(task, group, items, account['region'])
+            seen_observations = {}
+            startup_products = None
             async def prepare_account():
                 nonlocal account_lock, lock_acquired, slot_acquired, account, context
                 account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
@@ -132,32 +137,29 @@ class TaskRunner:
                         account = await self.verify_account_session(id, adapter, login_context, account, login_page)
                     finally:
                         await self.close_context(adapter, login_context)
+                self.status(id, 'authenticating', 'Opening account browser; session verification follows')
                 context = await adapter.context(account, connection, task["solver_id"])
                 context._retail_task_id = id
                 login_page = await context.new_page()
                 await self.hide_if_background(adapter, login_page)
                 login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
                 self.pages[id] = [login_page]
+                context._retail_task_login_page = login_page
                 account = await self.verify_account_session(id, adapter, context, account, login_page)
                 self.status(id, 'ready', 'Account session verified')
                 return True
 
-            # Verify and save the session before joining any stock watcher. Free
-            # its browser slot and account lease while waiting for inventory.
+            # Keep a verified browser for already available stock, but never
+            # occupy a checkout worker while waiting on a slow stock monitor.
             if not task['simulation']:
                 if not await prepare_account():
                     return
-                await self.diagnostics.finish_trace(id, context)
-                await self.close_context(adapter, context)
-                context = None
-                self.pages.pop(id, None)
-                account_lock.release()
-                lock_acquired = False
-                self.browser_slots.release()
-                slot_acquired = False
-
-            monitors = self.monitors.subscribe(task, group, items, account['region'])
-            seen_observations = {}
+                try:
+                    startup_products = await asyncio.wait_for(self.monitors.observations(monitors, seen_observations), .1)
+                except asyncio.TimeoutError:
+                    pass
+                retain_context = task['checkout_mode'] != 'monitor' and any(
+                    stock_observation(product)[0] == 'available' for product in startup_products or [])
             pages = []
             self.status(id,"waiting","Standby: waiting for monitor stock observations")
             attempts, successes = 0, 0
@@ -186,7 +188,10 @@ class TaskRunner:
                     self.status(id, "waiting", "Standby: waiting for restock from assigned monitor")
                 checkout_page = None
                 try:
-                    products = await self.monitors.observations(monitors, seen_observations)
+                    products = startup_products
+                    startup_products = None
+                    if products is None:
+                        products = await self.monitors.observations(monitors, seen_observations)
                     chosen = None
                     for index, (product, item) in enumerate(zip(products, items)):
                         if group.get("notify_offer") and product.get("offer_id") and product["offer_id"] not in seen_offers:
@@ -218,7 +223,8 @@ class TaskRunner:
 
                     checkout_page = None
                     if not task["simulation"]:
-                        checkout_page = await context.new_page()
+                        checkout_page = getattr(context, '_retail_task_login_page', None) or await context.new_page()
+                        context._retail_task_login_page = None
                         if checkout_page not in pages:
                             await self.hide_if_background(adapter, checkout_page)
                         self.pages[id] = [*pages, checkout_page] if checkout_page not in pages else pages

@@ -287,3 +287,30 @@ Playwright MCP rechecked stock badges, restrictions, logs and product-feed
 consistency at 1440px and 390px. JavaScript syntax and diff whitespace checks
 passed. No live purchases were made. Existing server processes must restart to
 load the updated Python backend; reloading a browser tab alone is insufficient.
+
+## Browser startup regression and latency correction
+
+Reproduced the reported startup stall with the selected Chrome extensions and
+saved session. A clean session launched; restoring the saved origins before
+loading unpacked extensions stalled Chrome's extension initialization. Teardown
+then masked the failure with `TargetClosedError`. Extensions now initialize before
+session restoration, in both incognito and first-import persistent profiles.
+Extension initialization has a five-second timeout per extension and cleanup
+preserves the useful error. Persistent profiles still retain newer local data.
+
+The production application warms the selected task browser and headless hardware
+probe at startup, without account navigation or purchasing. Read-only stock scans
+now run alongside sign-in. A verified browser and its already-loaded product page
+are reused for stock available at startup; workers still close and release their
+account lease when waiting for restock. Waiting on an initial monitor is bounded
+to 100ms. Context cleanup waits only for its own browser, not unrelated accounts.
+Authentication and a fresh account offer check still gate every cart action.
+
+Local measurements with the user's saved-session shape and four selected
+extensions: corrected cold browser/page startup **7.8s**, warmed startup **3.9s**.
+These are individual local measurements, excluding retailer navigation/sign-in;
+they are not a two-second end-to-end guarantee. The original configuration did
+not complete within the 15-second reproduction deadline. Tests use local page
+fixtures and never place orders. Added coverage includes headed startup with
+saved cookies/localStorage in both profile modes, prewarming, account verification
+before carting, browser reuse, cancellation and independent context cleanup.

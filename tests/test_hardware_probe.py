@@ -8,6 +8,7 @@ import pytest
 from retail.amazon import Amazon
 from retail.fingerprint_profiles import inspect_hardware
 from patchright.async_api import async_playwright
+from retail.store import Store
 
 
 def test_background_probe_is_shared_by_concurrent_accounts_and_keyed_by_binary(monkeypatch):
@@ -87,4 +88,22 @@ def test_real_background_probe_reads_hardware_and_closes_local_page():
             finally:
                 await browser.close()
 
+    asyncio.run(scenario())
+
+
+def test_prewarm_uses_live_task_browser_settings_without_account_navigation(tmp_path):
+    async def scenario():
+        store = Store(tmp_path)
+        adapter = Amazon(store)
+        adapter.ready = AsyncMock()
+        adapter.hardware_profile = AsyncMock()
+        await adapter.prewarm()
+        adapter.ready.assert_not_called()
+        account = store.put('accounts', {'fingerprint_overrides': {'browser_identity': 'chrome'}})
+        store.put('tasks', {'account_id': account['id'], 'simulation': False})
+        await adapter.prewarm()
+        assert adapter.ready.await_args.args[0]['browser_identity'] == 'chrome'
+        adapter.hardware_profile.assert_awaited_once()
+        assert not adapter.context_accounts
+        store.db.close()
     asyncio.run(scenario())

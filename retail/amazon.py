@@ -234,6 +234,23 @@ class Amazon:
                 self.identity_hardware[key] = hardware
             return self.identity_hardware[key]
 
+    async def prewarm(self):
+        """Pay the local engine/probe cost before the first live task starts."""
+        tasks = [task for task in self.store.all('tasks') if not task.get('simulation', True)]
+        if not tasks:
+            return
+        account = self.store.get('accounts', tasks[0].get('account_id', ''))
+        if not account:
+            return
+        try:
+            settings = account_fingerprint_settings(self.store.get('settings', 'settings') or {}, account)
+            if settings.get('cdp_attach'):
+                return
+            await self.ready(settings)
+            await self.hardware_profile(settings)
+        except Exception:
+            self.store.event('', 'browser_warmup', 'Browser warmup unavailable; task startup will retry')
+
     async def context(self, account, proxy=None, solver_id="", *, interactive=False):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
         identity_launch = browser_options(settings)
@@ -292,6 +309,7 @@ class Amazon:
         worker_port = None
         profile_directory = None
         temporary_profile = None
+        saved_state = None
         launch = None
         persistent = not settings.get('browser_incognito', True)
         different_browser = self.browser_key != (settings.get('browser_identity', 'default'), settings.get('browser_channel', 'chromium'))
@@ -328,14 +346,14 @@ class Amazon:
                 saved_state = options.pop('storage_state', None)
                 context = await self.driver.chromium.launch_persistent_context(profile_directory, **launch, **options)
                 owned_browser = context.browser
-                # Import an existing app session once. Replacing storage on every
-                # launch would erase newer cookies/data saved by normal browsing.
-                if saved_state and not initialized.exists():
-                    await context.set_storage_state(saved_state)
-                initialized.touch()
+                # Import once, after extensions are ready. Never overwrite
+                # newer storage from the persistent profile on later launches.
+                if initialized.exists():
+                    saved_state = None
             else:
                 if launch is not None:
                     owned_browser = await self.driver.chromium.launch(**launch)
+                saved_state = options.pop('storage_state', None)
                 context = await (owned_browser or self.browser).new_context(**options)
             if owned_browser:
                 self.profile_browsers.add(owned_browser)
@@ -349,9 +367,23 @@ class Amazon:
                             if str(Path(item['path']).resolve()).casefold() not in allowed:
                                 await extension_session.send('Extensions.uninstall', {'id': item['id']})
                     for path in extensions:
-                        await extension_session.send('Extensions.loadUnpacked', {'path': path, 'enableInIncognito': settings.get('browser_incognito', True)})
+                        try:
+                            await asyncio.wait_for(extension_session.send('Extensions.loadUnpacked', {'path': path, 'enableInIncognito': settings.get('browser_incognito', True)}), 5)
+                        except asyncio.TimeoutError as exc:
+                            raise ValueError('A browser extension did not finish loading. Check the selected extensions before restarting the task.') from exc
                 finally:
-                    await extension_session.detach()
+                    # Cleanup must not replace a useful startup error (or task
+                    # cancellation) with TargetClosedError.
+                    try:
+                        await extension_session.detach()
+                    except Exception:
+                        pass
+            # Loading extensions after session restoration can hang Chrome's
+            # incognito extension initialization. This ordering is intentional.
+            if saved_state:
+                await context.set_storage_state(saved_state)
+            if persistent:
+                initialized.touch()
         except BaseException:
             if owned_browser:
                 await owned_browser.close()
@@ -380,6 +412,7 @@ class Amazon:
                             if temporary_profile:
                                 temporary_profile.cleanup()
                 task = asyncio.create_task(close_owned())
+                context._retail_close_task = task
                 self.profile_close_tasks.add(task)
                 def finished(done):
                     self.profile_close_tasks.discard(done)
