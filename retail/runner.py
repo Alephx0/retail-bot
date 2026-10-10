@@ -7,6 +7,7 @@ from .store import now
 from .adapters import CartService, CheckoutService
 from .monitors import MonitorUnavailable, monitor_items
 from .timing import jittered_sleep, exponential_backoff_with_jitter
+from .performance import stage, timed, elapsed
 
 
 class TaskRunner:
@@ -18,6 +19,7 @@ class TaskRunner:
         if isinstance(adapter, Amazon) and not settings.get('show_browser_window', False):
             await adapter.hide(page)
 
+    @timed('Close account browser')
     async def close_context(self, adapter, context):
         await context.close()
         # Persistent profile owners close asynchronously on the context close
@@ -67,6 +69,10 @@ class TaskRunner:
         return account
 
     async def run(self, id):
+        with self.engine.performance.scope('task', id):
+            await self._run(id)
+
+    async def _run(self, id):
         account_lock = None
         lock_acquired = False
         slot_acquired = False
@@ -101,12 +107,14 @@ class TaskRunner:
             monitors = self.monitors.subscribe(task, group, items, account['region'])
             seen_observations = {}
             startup_products = None
+            @timed('Account preparation')
             async def prepare_account(start_item=None):
                 nonlocal account_lock, lock_acquired, slot_acquired, account, context
                 start_item = start_item or items[0]
                 account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
                 if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
-                await account_lock.acquire()
+                with stage('Account lease wait'):
+                    await account_lock.acquire()
                 lock_acquired=True
                 self.engine.check_pending_order(task['account_id'])
                 if task['checkout_mode'] in ('review', 'automatic'):
@@ -119,7 +127,8 @@ class TaskRunner:
                         return False
                 if self.browser_slots.locked():
                     self.status(id, 'in_queue', 'Waiting for an available browser worker')
-                await self.browser_slots.acquire()
+                with stage('Browser worker wait'):
+                    await self.browser_slots.acquire()
                 slot_acquired=True
                 while task['account_id'] in getattr(adapter, 'logins', {}):
                     self.status(id, 'in_queue', 'Waiting for the account login browser to close')
@@ -129,7 +138,8 @@ class TaskRunner:
                 connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)
                 if account_proxy and account_proxy != connection:
                     self.status(id, 'authenticating', 'Preparing account session on its sign-in connection')
-                    login_context = await adapter.context(account, account_proxy, task["solver_id"])
+                    with stage('Sign-in browser setup'):
+                        login_context = await adapter.context(account, account_proxy, task["solver_id"])
                     try:
                         login_page = await login_context.new_page()
                         await self.hide_if_background(adapter, login_page)
@@ -139,9 +149,11 @@ class TaskRunner:
                     finally:
                         await self.close_context(adapter, login_context)
                 self.status(id, 'authenticating', 'Opening account browser; session verification follows')
-                context = await adapter.context(account, connection, task["solver_id"])
+                with stage('Account browser setup'):
+                    context = await adapter.context(account, connection, task["solver_id"])
                 context._retail_task_id = id
-                login_page = await context.new_page()
+                with stage('Account page setup'):
+                    login_page = await context.new_page()
                 await self.hide_if_background(adapter, login_page)
                 login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{start_item['asin']}" if group['retailer'] == 'amazon' else None
                 self.pages[id] = [login_page]
@@ -150,13 +162,17 @@ class TaskRunner:
                 self.status(id, 'ready', 'Account session verified')
                 return True
 
-            # Keep a verified browser for already available stock, but never
-            # occupy a checkout worker while waiting on a slow stock monitor.
+            # Give the concurrent first scan a short grace period. Closing an
+            # already verified browser after just 100ms can force another full
+            # launch/sign-in when stock arrives a fraction of a second later.
+            # Out-of-stock returns immediately; slow scans release the slot.
             if not task['simulation']:
                 if not await prepare_account():
                     return
                 try:
-                    startup_products = await asyncio.wait_for(self.monitors.observations(monitors, seen_observations), .1)
+                    with stage('Initial stock handoff'):
+                        startup_products = await asyncio.wait_for(self.monitors.observations(monitors, seen_observations),
+                                                                  .1 if task['checkout_mode'] == 'monitor' else 1.0)
                 except asyncio.TimeoutError:
                     pass
                 retain_context = task['checkout_mode'] != 'monitor' and any(
@@ -192,7 +208,8 @@ class TaskRunner:
                     products = startup_products
                     startup_products = None
                     if products is None:
-                        products = await self.monitors.observations(monitors, seen_observations)
+                        with stage('Waiting for stock observation'):
+                            products = await self.monitors.observations(monitors, seen_observations)
                     chosen = None
                     for index, (product, item) in enumerate(zip(products, items)):
                         if group.get("notify_offer") and product.get("offer_id") and product["offer_id"] not in seen_offers:
@@ -216,6 +233,7 @@ class TaskRunner:
                         self.status(id, "waiting", message)
                         continue
                     self.status(id,"product_found","Stock detected; checking the assigned account offer")
+                    elapsed('Stock signal age at task selection', monitors[chosen].observed_at)
                     product = products[chosen]
                     if not task['simulation'] and context is None:
                         if not await prepare_account(items[chosen]):
@@ -230,7 +248,8 @@ class TaskRunner:
                             await self.hide_if_background(adapter, checkout_page)
                         self.pages[id] = [*pages, checkout_page] if checkout_page not in pages else pages
                         # Recheck in the checkout session immediately before carting.
-                        fresh = await adapter.inspect(checkout_page, items[chosen], account["region"])
+                        with stage('Account offer verification'):
+                            fresh = await adapter.inspect(checkout_page, items[chosen], account["region"])
                         if not eligible(fresh, items[chosen], group, defer_unknown_seller=True):
                             self.status(id, 'waiting', 'Product changed before carting: ' + '; '.join(rejection_reasons(fresh, items[chosen], group)))
                             if checkout_page not in pages:
@@ -267,7 +286,8 @@ class TaskRunner:
                         if used_buy_now:
                             quantity = task['quantity']
                         else:
-                            quantity = await cart.add(checkout_page, items[chosen], task["quantity"])
+                            with stage('Cart action and verification'):
+                                quantity = await cart.add(checkout_page, items[chosen], task["quantity"])
                     except AuthenticationRequired:
                         raise
                     except CartRejected as exc:
@@ -285,7 +305,8 @@ class TaskRunner:
                     if task["checkout_mode"] in ("automatic", "quote"):
                         self.status(id, "checkout", "Validating cart, quantity and final order total")
                         try:
-                            snapshot = await checkout_service.review(checkout_page,items[chosen],quantity,group,{**task, 'use_buy_now': used_buy_now})
+                            with stage('Checkout review and total verification'):
+                                snapshot = await checkout_service.review(checkout_page,items[chosen],quantity,group,{**task, 'use_buy_now': used_buy_now})
                         except AuthenticationRequired:
                             raise
                         except Attention as exc:
@@ -301,13 +322,15 @@ class TaskRunner:
                         if snapshot:
                             self.store.put("submissions", {**snapshot, "task_id": id, "account_id": account["id"], "retailer": group["retailer"], "status": "submitting", "at": now()}, "submission-" + id)
                             self.status(id, "submitting", "Submitting order once; automatic retries disabled")
-                            await checkout_service.submit(checkout_page)
+                            with stage('Submit order once'):
+                                await checkout_service.submit(checkout_page)
                     else:
                         ready = 'Checkout ready via Buy Now' if used_buy_now else 'Cart ready'
                         await self.pause(id, "review", f"{ready} ({quantity} requested). Review shipping, tax and the {group['max_total']:.2f} budget in Amazon. Complete checkout there, then Resume to inspect the result.")
                     if account.get("cvv") and await adapter.payment_verification(checkout_page):
                         await adapter.verify_cvv(checkout_page, account["cvv"])
-                    order = await checkout_service.verify(checkout_page)
+                    with stage('Verify order confirmation'):
+                        order = await checkout_service.verify(checkout_page)
                     if not order:
                         await self.pause(id, "attention", "Order confirmation could not be verified. Check Your Orders before doing anything else. Resume stops this task without recording a success.")
                         self.status(id, "stopped", "Checkout unverified; check Amazon order history")

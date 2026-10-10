@@ -87,12 +87,41 @@ document.addEventListener('change', async event => {
   catch (error) { toast(error.message); field.value = state.tasks.find(t => t.id===id)?.monitor_asin || ''; }
   finally { field.disabled = false; field.blur(); }
 });
+function performancePanel() {
+  return '<details data-performance><summary>Step timings</summary><p class="help">Recent timings for this application session. Parent steps include their substeps; do not add the rows together. Waiting and polling pauses are intentional. Stock signal age includes time spent preparing the account.</p><button type="button" data-performance-refresh>Refresh timings</button><div data-performance-body aria-live="polite"></div></details>';
+}
+
+function bindPerformance(modal, kind, id) {
+  const panel = modal.querySelector('[data-performance]');
+  const button = panel.querySelector('[data-performance-refresh]');
+  const body = panel.querySelector('[data-performance-body]');
+  let loaded = false;
+  const duration = ms => `${(ms / 1000).toFixed(3)} s`;
+  async function update() {
+    if (button.disabled) return;
+    button.disabled = true;
+    if (!loaded) body.textContent = 'Loading timings…';
+    try {
+      const data = await api(`performance?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
+      if (!modal.isConnected) return;
+      const active = data.active.map(row => `<li>${esc(row.stage)}: ${duration(row.duration_ms)} elapsed</li>`).join('');
+      body.innerHTML = (active ? `<p>In progress</p><ul>${active}</ul>` : '') + (data.summary.length ?
+        `<div class="table-wrap"><table><thead><tr><th>Step</th><th>Latest</th><th>Average</th><th>Longest</th><th>Count</th></tr></thead><tbody>${data.summary.map(row => `<tr><td>${esc(row.stage)}${row.errors ? `<small>${row.errors} failed</small>` : ''}</td><td>${duration(row.last_ms)}</td><td>${duration(row.mean_ms)}</td><td>${duration(row.max_ms)}</td><td>${row.count}</td></tr>`).join('')}</tbody></table></div>` : '<p class="help">No completed timings yet. Start the task, then refresh here. Timings reset when the application restarts.</p>');
+      loaded = true;
+    } catch (error) { body.textContent = error.message; }
+    finally { button.disabled = false; }
+  }
+  panel.addEventListener('toggle', () => { if (panel.open && !loaded) update(); });
+  button.onclick = update;
+}
+
 document.addEventListener('click', event => {
   const button = event.target.closest('[data-monitor-log]');
   if (!button) return;
   const record = (state.monitors || []).find(m => m.id===button.dataset.monitorLog);
   if (!record) return;
-  const modal = dialog(`<h2>${esc(record.asin)} monitor activity</h2><p class="help">Latest 100 status changes for this monitor run.</p><div class="monitor-log" data-monitor-log-body="${esc(record.id)}"></div><button type="button" data-close-monitor-log>Close</button>`);
+  const modal = dialog(`<h2>${esc(record.asin)} monitor activity</h2><p class="help">Latest 100 status changes for this monitor run.</p><div class="monitor-log" data-monitor-log-body="${esc(record.id)}"></div>${performancePanel()}<button type="button" data-close-monitor-log>Close</button>`);
+  bindPerformance(modal, 'monitor', record.id);
   modal.querySelector('[data-close-monitor-log]').onclick = () => modal.close();
   refreshMonitorStatus();
 });

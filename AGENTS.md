@@ -10,6 +10,7 @@
 - Verify live task account sessions before purchasing; independent read-only stock scans may run during sign-in. Reuse the verified browser for immediately available stock, and release workers while waiting for restock. Treat anonymous inventory as a wake-up signal, then recheck purchase eligibility in the assigned account before carting. Respect Retry-After in full; never treat a sign-in or delivery restriction as an inventory stockout.
 - Keep encrypted credentials in the existing vault. Group plans contain references, never copied credentials. Migrations must preserve original records and have tested recovery.
 - Prefer bounded asynchronous operations and compact read models. Measure before adding infrastructure. Do not duplicate authoritative state in the frontend.
+- Shared inventory monitors use read-only stock inspection without AI purchase-control recovery. Keep account offer checks before carting. Use bounded, on-demand stage timings to diagnose latency; distinguish nested timings, intentional waits, and live network variability from controlled benchmarks.
 
 ## Product and interface
 

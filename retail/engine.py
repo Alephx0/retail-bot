@@ -11,11 +11,13 @@ from .scheduling import occurrences
 from .task_state import transition
 from .diagnostics import Diagnostics
 from .proxy_pool import ProxyPool
+from .performance import Performance, timed
 
 
 class Engine:
     def __init__(self, store):
         self.store = store
+        self.performance = Performance()
         self.amazon = Amazon(store)
         self.jobs = {}
         from .monitors import MonitorRegistry
@@ -196,6 +198,7 @@ class Engine:
             raise ValueError("Task is not running")
         self.wakes[id].set()
 
+    @timed('Waiting for user review')
     async def pause(self, id, status, message):
         self.wakes[id].clear()
         self.status(id, status, message)

@@ -29,6 +29,7 @@ from .browser_visibility import set_visible
 from .browser_runtime import browser_options, extension_paths
 from .fingerprint_profiles import generated, inspect_hardware
 from .account_consistency import AccountBrowserProfiles
+from .performance import stage, timed
 
 
 def money(text: str) -> float | None:
@@ -127,6 +128,7 @@ class Amazon:
                 retry_after_seconds=retry_after,
             )
 
+    @timed('Page navigation')
     async def navigate(self, page, url: str, **kwargs):
         response = await page.goto(url, **kwargs)
         self._raise_for_response(response)
@@ -166,6 +168,7 @@ class Amazon:
         page._retail_agent_attempts = attempts
         return await self.agent.resolve(page, action, set(DOMAINS.values()), AMAZON_ACTIONS)
 
+    @timed('Browser engine readiness')
     async def ready(self, settings=None):
         async with self.launch_lock:
             if not self.driver:
@@ -218,6 +221,7 @@ class Amazon:
         from .proxy_pool import ProxyPool
         return ProxyPool(self.store).choose(account.get("proxy_list_id", ""), account["id"])
 
+    @timed('Browser hardware profile')
     async def hardware_profile(self, settings=None):
         settings = settings if settings is not None else (self.store.get('settings', 'settings') or {})
         # Measure an unmodified engine, including for native profiles. Never put
@@ -251,6 +255,7 @@ class Amazon:
         except Exception:
             self.store.event('', 'browser_warmup', 'Browser warmup unavailable; task startup will retry')
 
+    @timed('Browser context setup')
     async def context(self, account, proxy=None, solver_id="", *, interactive=False):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
         identity_launch = browser_options(settings)
@@ -368,7 +373,8 @@ class Amazon:
                                 await extension_session.send('Extensions.uninstall', {'id': item['id']})
                     for path in extensions:
                         try:
-                            await asyncio.wait_for(extension_session.send('Extensions.loadUnpacked', {'path': path, 'enableInIncognito': settings.get('browser_incognito', True)}), 5)
+                            with stage('Load browser extension'):
+                                await asyncio.wait_for(extension_session.send('Extensions.loadUnpacked', {'path': path, 'enableInIncognito': settings.get('browser_incognito', True)}), 5)
                         except asyncio.TimeoutError as exc:
                             raise ValueError('A browser extension did not finish loading. Check the selected extensions before restarting the task.') from exc
                 finally:
@@ -381,7 +387,8 @@ class Amazon:
             # Loading extensions after session restoration can hang Chrome's
             # incognito extension initialization. This ordering is intentional.
             if saved_state:
-                await context.set_storage_state(saved_state)
+                with stage('Restore account session'):
+                    await context.set_storage_state(saved_state)
             if persistent:
                 initialized.touch()
         except BaseException:
@@ -452,7 +459,8 @@ class Amazon:
                 for script in scripts:
                     await context.add_init_script(script)
                 if managed_workers:
-                    worker_profiles = await WorkerProfiles.start(owned_browser, worker_port, '\n'.join(scripts))
+                    with stage('Initialize browser workers'):
+                        worker_profiles = await WorkerProfiles.start(owned_browser, worker_port, '\n'.join(scripts))
                     context._retail_worker_profiles = worker_profiles
             saved_storage = account.get('session_storage', {})
             domain = DOMAINS[account['region']]
@@ -598,6 +606,7 @@ class Amazon:
         if await page.locator('#auth-error-message-box:visible, #auth-warning-message-box:visible').count():
             raise AuthenticationRequired('Amazon could not complete sign-in. Review the account details in the task browser, then Resume.')
 
+    @timed('Account sign-in')
     async def authenticate(self, page, account):
         """Fill only the current account's Amazon sign-in fields, with bounded steps."""
         for _ in range(6):
@@ -678,6 +687,7 @@ class Amazon:
         await context.close()
         del self.logins[account["id"]]
 
+    @timed('Verify account session')
     async def ensure_session(self, context, account, page):
         """Prepare and verify a login in the same context the checkout will use."""
         # On Resume, inspect the existing challenge first. Navigating away from
@@ -712,11 +722,13 @@ class Amazon:
         current = self.store.get("accounts", account["id"])
         if current:
             await self.check_browser_health(page, account)
-            current.update(session=await context.storage_state(indexed_db=True), session_storage=await self.capture_session_storage(page),
-                           logged_in=True, session_saved_at=now(), last_login=now())
-            self.store.put("accounts", current)
-            self.store.put("sessions", {"account_id":account['id'],"retailer":account.get('retailer','amazon'),"status":"ready","last_login":now(),"network":account.get('proxy_list_id','')}, 'session-'+account['id'])
+            with stage('Save verified session'):
+                current.update(session=await context.storage_state(indexed_db=True), session_storage=await self.capture_session_storage(page),
+                               logged_in=True, session_saved_at=now(), last_login=now())
+                self.store.put("accounts", current)
+                self.store.put("sessions", {"account_id":account['id'],"retailer":account.get('retailer','amazon'),"status":"ready","last_login":now(),"network":account.get('proxy_list_id','')}, 'session-'+account['id'])
 
+    @timed('Verify browser health')
     async def check_browser_health(self, page, account):
         try:
             await self.profiles.check(page, account)
@@ -766,6 +778,7 @@ class Amazon:
             return re.split(r'\s+and (?:fulfilled|ships|shipped)|\s+Returns\b', match[1], flags=re.I)[0].strip().rstrip('.')
         return ''
 
+    @timed('Page access checks')
     async def check(self, page):
         account = self.context_accounts.get(page.context, {})
         if urlparse(page.url).hostname in DOMAINS.values():
@@ -858,40 +871,73 @@ class Amazon:
         if "/ap/signin" in page.url or await page.locator("#ap_password").count():
             raise AuthenticationRequired("Session expired. Sign in in the task browser, then Resume.")
 
-    async def inspect(self, page, item, region):
+    async def inspect_stock(self, page, item, region):
+        """Read inventory without AI recovery or checkout-control resolution."""
+        return await self.inspect(page, item, region, inventory_only=True)
+
+    @timed('Product inspection total')
+    async def inspect(self, page, item, region, *, inventory_only=False):
         target = f"https://{DOMAINS[region]}/dp/{item['asin']}"
         reuse_initial = getattr(page, '_retail_initial_product', None) == target and page.url == target
         page._retail_initial_product = None
         response = None if reuse_initial else await self.navigate(page, target, wait_until="domcontentloaded", timeout=45000)
         await self.check(page)
-        title = await self.text(page, "#productTitle")
+        return await self.read_product(page, item, inventory_only=inventory_only)
+
+    @timed('Read product details')
+    async def read_product(self, page, item, *, inventory_only=False):
+        # One browser round trip for passive product fields. Keep action
+        # resolution and seller verification separate; they have stricter rules.
+        details = await page.evaluate('''() => {
+            const first = selector => (document.querySelector(selector)?.innerText || '').trim();
+            const visibleText = selector => [...document.querySelectorAll(selector)]
+                .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
+                .map(e => e.innerText).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const metadata = document.querySelectorAll("meta[property='product:price:amount'], meta[itemprop='price']");
+            const images = document.querySelectorAll('#landingImage');
+            return {
+                title: first('#productTitle'),
+                price: first('#corePrice_feature_div .a-price .a-offscreen, #corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #priceblock_ourprice'),
+                metadata: metadata.length === 1 ? metadata[0].getAttribute('content') || '' : '',
+                original: first('#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen, #corePrice_feature_div .a-text-price .a-offscreen'),
+                offer: document.querySelector("input[name='offerListingID'], input[name='offeringID.1']")?.getAttribute('value') || '',
+                condition: first('#condition, #condition-value').toLowerCase(),
+                used: !!document.querySelector('#usedBuySection') && !document.querySelector('#newBuyBoxPrice, #newBuyBox'),
+                image: images.length === 1 ? images[0].getAttribute('src') || '' : '',
+                stock: visibleText('#availability, #availabilityInsideBuyBox_feature_div, #outOfStock'),
+                purchase: visibleText('#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #deliveryBlockMessage')
+            };
+        }''')
+        title = details['title']
         if not title:
             heading=page.get_by_role("heading",level=1)
             if await heading.count()==1: title=(await heading.inner_text()).strip()
         if not title:
             raise ValueError("Product page is unavailable or its layout is unsupported")
-        price = money(await self.text(page, "#corePrice_feature_div .a-price .a-offscreen, #corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #priceblock_ourprice"))
+        price = money(details['price'])
         if price is None:
             # Structured product metadata is a bounded fallback for layout
             # changes. Final checkout still verifies its own price and total.
-            metadata = page.locator("meta[property='product:price:amount'], meta[itemprop='price']")
-            if await metadata.count() == 1:
-                raw = await metadata.get_attribute('content') or ''
-                if re.fullmatch(r'\d{1,7}(?:\.\d{1,2})?', raw):
-                    price = float(raw)
-        original = money(await self.text(page, "#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen, #corePrice_feature_div .a-text-price .a-offscreen"))
+            raw = details['metadata']
+            if re.fullmatch(r'\d{1,7}(?:\.\d{1,2})?', raw):
+                price = float(raw)
+        original = money(details['original'])
         seller = await self.seller_text(page, product_page=True)
-        offer_loc = page.locator("input[name='offerListingID'], input[name='offeringID.1']").first
-        offer = await offer_loc.get_attribute("value") if await offer_loc.count() else ""
-        condition = (await self.text(page, "#condition, #condition-value")).lower()
-        used = bool(await page.locator("#usedBuySection").count()) and not bool(await page.locator("#newBuyBoxPrice, #newBuyBox").count())
         agent_error = ''
         try:
-            cart = await resolve(page,"ADD_TO_CART")
+            if inventory_only:
+                # A read-only stock signal needs neither an action locator nor
+                # a model request. A strict native control is a fallback when
+                # the page has no explicit inventory label.
+                cart = page.locator('#add-to-cart-button, input[name="submit.add-to-cart"]').or_(
+                    page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['ADD_TO_CART'], re.I)))
+            else:
+                with stage('Resolve purchase control'):
+                    cart = await resolve(page,"ADD_TO_CART")
         except InteractionError:
             # Stock checks do not spend an AI request each polling cycle.
             cart = page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['ADD_TO_CART'], re.I))
-            if self.agent and (self.store.get('settings', 'settings') or {}).get('agent_mode') in ('recovery', 'agent'):
+            if not inventory_only and self.agent and (self.store.get('settings', 'settings') or {}).get('agent_mode') in ('recovery', 'agent'):
                 buttons = page.locator('button,input[type=submit],input[type=button],[role=button]')
                 labels = await buttons.evaluate_all("els => els.slice(0,150).map(e => e.getAttribute('aria-label') || (e.matches('input') ? e.value : e.innerText) || '')")
                 observed = getattr(page, '_retail_monitor_attempts', set())
@@ -899,7 +945,8 @@ class Amazon:
                     observed.add(page.url)
                     page._retail_monitor_attempts = observed
                     try:
-                        cart = await self.agent.resolve(page, 'ADD_TO_CART', set(DOMAINS.values()), AMAZON_ACTIONS)
+                        with stage('Purchase-control AI recovery'):
+                            cart = await self.agent.resolve(page, 'ADD_TO_CART', set(DOMAINS.values()), AMAZON_ACTIONS)
                     except InteractionError as exc:
                         agent_error = str(exc)
         unique = await cart.count() == 1 if hasattr(cart, 'count') else True
@@ -907,15 +954,7 @@ class Amazon:
         # Inventory and permission to buy are different. Grocery pages can say
         # "In Stock" while replacing the purchase controls with sign-in or a
         # delivery-location restriction. Ignore navigation and hidden templates.
-        evidence = await page.evaluate('''() => {
-            const text = selector => [...document.querySelectorAll(selector)]
-                .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
-                .map(e => e.innerText).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
-            return {
-                stock: text('#availability, #availabilityInsideBuyBox_feature_div, #outOfStock'),
-                purchase: text('#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #deliveryBlockMessage')
-            };
-        }''')
+        evidence = details
         stock_text = evidence['stock']
         out_of_stock = bool(re.search(r'currently unavailable|out of stock|not in stock', stock_text))
         in_stock = bool(re.search(r'\bin stock\b', stock_text)) and not out_of_stock
@@ -931,10 +970,10 @@ class Amazon:
             restrictions.append('Add-to-cart control could not be verified')
         availability_message = '; '.join([stock_message, *restrictions])
         return {"asin": item["asin"], "title": title, "price": price,
-                "original_price": original, "offer_id": offer or "",
-                "image": await page.locator("#landingImage").get_attribute("src") if await page.locator("#landingImage").count()==1 else "",
+                "original_price": original, "offer_id": details['offer'],
+                "image": details['image'],
                 "amazon_seller": bool(re.fullmatch(r"Amazon(?:\.com|\.co\.uk|\.ca)?(?: Services(?:,? Inc\.?)?|\.com Services LLC)?", seller, re.I)),
-                "seller": seller or "Unknown", "condition": "used" if used or "used" in condition else "new",
+                "seller": seller or "Unknown", "condition": "used" if details['used'] or "used" in details['condition'] else "new",
                 "available": available, 'availability_status': stock_status,
                 'availability_message': availability_message, 'agent_error': agent_error}
 
@@ -1023,6 +1062,7 @@ class Amazon:
             raise Attention("Cart product or quantity could not be verified; inspect the cart before restarting")
         return actual
 
+    @timed('Buy Now and checkout navigation')
     async def buy_now(self, page, quantity, asin):
         """Use Buy Now when offered; return False before mutation if unavailable."""
         if urlparse(page.url).hostname not in DOMAINS.values():

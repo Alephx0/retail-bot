@@ -36,7 +36,8 @@ function taskWorkspace(){
 }
 function taskDetails(t){
   const active=state.active.includes(t.id);
-  const d=dialog(`<h2>Task details</h2><p>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')} · ${t.simulation?'Simulation':'Live'}</p><p>${badge(t.status)} ${esc(t.message||'')}</p><p class="help">Quantity ${t.quantity} · ${esc(taskBehavior[t.checkout_mode])} · ${t.max_total==null?'Uses group order limit':'Order limit '+t.max_total}</p><div class="actions">${active&&!t.simulation?'<button data-task-view>View browser</button>':''}<button data-task-edit ${active?'disabled':''}>Edit task</button><button data-task-copy>Duplicate task</button><button data-task-remove class="danger">Delete task</button></div><div class="modal-actions"><button data-task-close>Close</button></div>`);
+  const d=dialog(`<h2>Task details</h2><p>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')} · ${t.simulation?'Simulation':'Live'}</p><p>${badge(t.status)} ${esc(t.message||'')}</p><p class="help">Quantity ${t.quantity} · ${esc(taskBehavior[t.checkout_mode])} · ${t.max_total==null?'Uses group order limit':'Order limit '+t.max_total}</p><div class="actions">${active&&!t.simulation?'<button data-task-view>View browser</button>':''}<button data-task-edit ${active?'disabled':''}>Edit task</button><button data-task-copy>Duplicate task</button><button data-task-remove class="danger">Delete task</button></div>${performancePanel()}<div class="modal-actions"><button data-task-close>Close</button></div>`);
+  bindPerformance(d, 'task', t.id);
   d.querySelector('[data-task-close]').onclick=()=>d.close();
   d.querySelector('[data-task-edit]').onclick=()=>{d.close();editAccountTask(t);};
   d.querySelector('[data-task-view]')?.addEventListener('click',()=>{d.close();openBrowserView('tasks',t.id,true);});

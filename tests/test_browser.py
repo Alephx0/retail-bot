@@ -64,7 +64,8 @@ def test_amazon_response_guard_distinguishes_rate_limit_and_access_denied():
     Amazon._raise_for_response(Response(200))
 
 
-def test_stock_is_distinct_from_purchase_controls_and_delivery_restrictions():
+@pytest.mark.parametrize('inventory_only', [False, True])
+def test_stock_is_distinct_from_purchase_controls_and_delivery_restrictions(inventory_only):
     from retail.models import Group, eligible, rejection_reasons
     from retail.task_groups.domain import qualifying
 
@@ -97,7 +98,7 @@ def test_stock_is_distinct_from_purchase_controls_and_delivery_restrictions():
                 html = base + '<nav>Sign in to get started</nav><div id="rightCol">' + fragment + '</div>'
                 # Locally fulfilled product page; no retailer calls or purchases.
                 await page.route('https://www.amazon.com/**', lambda route: route.fulfill(body=html, content_type='text/html'))
-                product = await adapter.inspect(page, item, 'US')
+                product = await adapter.inspect(page, item, 'US', inventory_only=inventory_only)
                 assert product['availability_status'] == status
                 assert product['available'] is can_buy
                 assert all(message in product['availability_message'] for message in messages)

@@ -4,10 +4,12 @@ import hashlib
 import time
 import uuid
 from collections import deque
+from contextlib import AsyncExitStack
 
 from .amazon import Attention, BackoffRequired
 from .models import inputs, stock_observation
 from .store import now
+from .performance import stage
 
 
 class MonitorUnavailable(ValueError):
@@ -69,6 +71,10 @@ class ProductMonitor:
                 'task_ids': sorted(self.subscribers)}
 
     async def run(self):
+        with self.registry.engine.performance.scope('monitor', self.id):
+            await self._run()
+
+    async def _run(self):
         engine = self.registry.engine
         context = None
         errors = backoffs = 0
@@ -80,8 +86,9 @@ class ProductMonitor:
                 proxy = engine.proxy(self.group.get('monitor_proxy_id', ''), self.id) or ''
                 if self.group.get('monitor_proxy_id') and not proxy:
                     raise ValueError('The selected monitor proxy group has no usable route')
-                context = await adapter.context(self.identity, proxy, '')
-                page = await context.new_page()
+                with stage('Monitor browser setup'):
+                    context = await adapter.context(self.identity, proxy, '')
+                    page = await context.new_page()
                 if not (engine.store.get('settings', 'settings') or {}).get('show_browser_window', False):
                     if hasattr(adapter, 'hide'):
                         await adapter.hide(page)
@@ -99,14 +106,20 @@ class ProductMonitor:
                                    'price': price, 'original_price': 100, 'available': True,
                                    'seller': 'Amazon (simulation)', 'amazon_seller': True, 'condition': 'new'}
                     else:
-                        async with self.registry.scan_slots, self.registry.group_slots[self.group['id']]:
-                            product = await adapter.inspect(page, self.item, self.region)
+                        with stage('Monitor check total'):
+                            async with AsyncExitStack() as slots:
+                                with stage('Monitor concurrency wait'):
+                                    await slots.enter_async_context(self.registry.scan_slots)
+                                    await slots.enter_async_context(self.registry.group_slots[self.group['id']])
+                                scan = getattr(adapter, 'inspect_stock', adapter.inspect)
+                                product = await scan(page, self.item, self.region)
                     self.product = product
                     self.observed_at = time.monotonic()
                     self.sequence += 1
                     errors = backoffs = 0
-                    engine.store.put('feed', dict(product, at=now(), simulation=self.simulation,
-                                                 group_id=self.group['id'], retailer=self.group['retailer']), self.id)
+                    with stage('Save stock observation'):
+                        engine.store.put('feed', dict(product, at=now(), simulation=self.simulation,
+                                                     group_id=self.group['id'], retailer=self.group['retailer']), self.id)
                     stock, message = stock_observation(product)
                     self.update({'available': 'in_stock', 'unavailable': 'out_of_stock', 'unknown': 'stock_unknown'}[stock],
                                 message + f'; next check in {delay:g}s')
@@ -126,7 +139,8 @@ class ProductMonitor:
                         raise ValueError('Monitor stopped after repeated browser/network failures')
                     delay = min(60, delay * 2 ** (errors - 1))
                     self.update('retrying', f'Browser/network error; retry {errors}/{self.group["max_errors"]} in {delay:g}s')
-                await asyncio.sleep(delay)
+                with stage('Polling pause'):
+                    await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -135,7 +149,8 @@ class ProductMonitor:
         finally:
             if context:
                 try:
-                    await context.close()
+                    with stage('Close monitor browser'):
+                        await context.close()
                 except Exception:
                     pass
             engine.store.delete('browser_profiles', 'browser-profile-' + self.id)

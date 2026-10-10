@@ -282,6 +282,41 @@ def test_stock_during_signin_reuses_verified_browser_without_early_carting(tmp_p
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('cancel', [False, True])
+def test_first_scan_just_after_login_reuses_context_and_cancels_cleanly(tmp_path, cancel):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        engine.amazon.stock.add('B012345678')
+        gate = asyncio.Event()
+        original = engine.amazon.inspect
+        async def scan(page, item, region):
+            if page.context.identity['id'].startswith('monitor-'):
+                await gate.wait()
+            return await original(page, item, region)
+        engine.amazon.inspect_stock = scan
+        task = task_record(store, group, account, monitor_asin='B012345678', use_account_proxy=True)
+        try:
+            await engine.start(task['id'])
+            await until(lambda: engine.amazon.authentications)
+            await asyncio.sleep(.2)  # Later than the former 100ms handoff cutoff.
+            assert not engine.amazon.carts
+            if cancel:
+                await engine.stop(task['id'])
+            else:
+                gate.set()
+                await until(lambda: task['id'] not in engine.jobs)
+                assert store.get('tasks', task['id'])['status'] == 'completed'
+                assert engine.amazon.authentications == [account['id']]
+            assert len([c for c in engine.amazon.contexts if c.identity['id'] == account['id']]) == 1
+            assert all(c.closed for c in engine.amazon.contexts)
+            assert engine.browser_slots._value == 10
+            assert not engine.account_locks[account['id']].locked()
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
 def test_restock_session_opens_the_selected_product_without_extra_navigation(tmp_path):
     async def scenario():
         store, group, account, engine = fixture(tmp_path)
@@ -507,6 +542,14 @@ def test_browser_monitor_input_start_assignment_and_live_log(tmp_path):
                 await expect(page.locator('dialog[open]')).to_contain_text('monitor activity')
                 await expect(page.locator('[data-monitor-log-body]')).to_contain_text('device network')
                 await expect(page.locator('[data-monitor-log-body]')).to_contain_text('Checking stock')
+                await page.get_by_text('Step timings', exact=True).click()
+                await expect(page.locator('[data-performance-body]')).to_contain_text('Save stock observation')
+                await page.locator('[data-performance-refresh]').click()
+                await expect(page.locator('[data-performance-refresh]')).to_be_focused()
+                await page.set_viewport_size({'width': 390, 'height': 844})
+                assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                await page.screenshot(path=str(tmp_path / 'monitor-timings-narrow.png'), full_page=True)
+                await page.set_viewport_size({'width': 1440, 'height': 1000})
                 await page.locator('[data-close-monitor-log]').click()
                 await page.locator(f'[data-work-task="{task["id"]}"][data-work-command=stop]').click()
                 selector = page.locator(f'[data-task-monitor="{task["id"]}"]')
@@ -517,6 +560,11 @@ def test_browser_monitor_input_start_assignment_and_live_log(tmp_path):
                 await expect(page.locator(f'[data-work-task="{task["id"]}"][data-work-command=stop]')).to_be_visible()
                 current = client.get('/api/state').json()
                 assert {m['asin'] for m in current['monitors'] if m['task_ids']}=={'B087654321'}
+                await page.locator(f'[data-work-details="{task["id"]}"]').click()
+                await page.get_by_text('Step timings', exact=True).click()
+                await expect(page.locator('[data-performance-body]')).to_contain_text('Waiting for stock observation')
+                await page.keyboard.press('Escape')
+                await expect(page.locator(f'[data-work-details="{task["id"]}"]')).to_be_focused()
                 await expect(page.locator(f'[data-task-monitor="{task["id"]}"]')).to_be_disabled()
                 await page.screenshot(path=str(tmp_path / 'monitor-workspace.png'), full_page=True)
                 assert not errors, errors

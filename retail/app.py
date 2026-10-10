@@ -167,6 +167,10 @@ def create_app(data_dir=None, *, warm_browser=False):
             value["has_webhook"] = bool(value.pop("webhook", ""))
         return value
 
+    @app.get('/api/performance')
+    async def performance(kind: str = '', id: str = ''):
+        return app.state.engine.performance.snapshot(kind, id)
+
     @app.get("/api/state")
     async def state():
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
