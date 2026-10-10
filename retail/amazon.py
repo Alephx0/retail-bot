@@ -71,8 +71,8 @@ class Amazon:
         self.store = store
         self.driver = None
         self.browser = None
-        self.hardware = None
         self.identity_hardware = {}
+        self.hardware_lock = asyncio.Lock()
         self.browser_key = None
         self.logins = {}
         self.fingerprint_tests = {}
@@ -171,7 +171,6 @@ class Amazon:
             if not self.driver:
                 self.driver = await async_playwright().start()
             if not self.browser or not self.browser.is_connected():
-                self.hardware = None
                 self.identity_hardware.clear()
                 settings = settings if settings is not None else (self.store.get("settings", "settings") or {})
                 self.browser_initially_visible = bool(settings.get('show_browser_window', True))
@@ -220,19 +219,20 @@ class Amazon:
         return ProxyPool(self.store).choose(account.get("proxy_list_id", ""), account["id"])
 
     async def hardware_profile(self, settings=None):
-        if settings is not None:
-            key = (settings.get('browser_identity', 'default'), settings.get('browser_channel', 'chromium'))
-            if settings.get('fingerprint_backend') != 'native' and key != self.browser_key:
-                if key not in self.identity_hardware:
-                    probe = await self.driver.chromium.launch(headless=True, **browser_options(settings))
-                    try:
-                        self.identity_hardware[key] = await inspect_hardware(probe)
-                    finally:
-                        await probe.close()
-                return self.identity_hardware[key]
-        if self.hardware is None:
-            self.hardware = await inspect_hardware(self.browser)
-        return self.hardware
+        settings = settings if settings is not None else (self.store.get('settings', 'settings') or {})
+        # Measure an unmodified engine, including for native profiles. Never put
+        # the local inspection page into the visible or user-owned CDP browser.
+        options = browser_options({**settings, 'fingerprint_backend': 'javascript'})
+        key = tuple(sorted(options.items()))
+        async with self.hardware_lock:
+            if key not in self.identity_hardware:
+                probe = await self.driver.chromium.launch(**options, headless=True)
+                try:
+                    hardware = await asyncio.wait_for(inspect_hardware(probe), timeout=30)
+                finally:
+                    await probe.close()
+                self.identity_hardware[key] = hardware
+            return self.identity_hardware[key]
 
     async def context(self, account, proxy=None, solver_id="", *, interactive=False):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
@@ -1281,7 +1281,6 @@ class Amazon:
             if self.driver:
                 await self.driver.stop()
             self.driver = self.browser = None
-            self.hardware = None
             self.identity_hardware.clear()
             self.logins.clear()
             self.fingerprint_tests.clear()

@@ -44,14 +44,15 @@ def test_manual_login_requests_visible_owner_without_changing_task_mode(tmp_path
             await task_page.set_content('<h1>Existing task</h1>')
             await adapter.login(account)
             login_context = adapter.logins[account['id']]
-            assert [options['headless'] for options in launches] == [True, False]
+            # Shared task browser, background hardware probe, visible sign-in.
+            assert [options['headless'] for options in launches] == [True, True, False]
             assert login_context.browser is not task_context.browser
             assert exposures == [(login_context.pages[0], True)]
             assert store.get('settings', 'settings')['show_browser_window'] is False
             assert adapter.browser_initially_visible is False
             assert adapter.browser_visible is False
             await adapter.login(account)
-            assert len(launches) == 2  # Reopening focuses the same sign-in window.
+            assert len(launches) == 3  # Reopening focuses the same sign-in window.
             owner = login_context.browser
             await login_context.close()
             if adapter.profile_close_tasks:

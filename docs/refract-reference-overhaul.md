@@ -200,3 +200,19 @@ regression suite was not repeated for this presentation-only follow-up.
 
 The running instance on localhost:8787 serves these static assets after refresh;
 its saved records were not modified during the visual review.
+
+## Background hardware inspection
+
+Account startup now measures hardware in a temporary headless browser instead
+of opening `profile.invalid` in the visible shared browser. Results are cached
+by resolved browser channel/executable; simultaneous account starts share one
+inspection. The temporary browser closes on success, failure, timeout or
+cancellation, and unsuccessful probes do not populate the cache. Native profiles
+still use an unmodified browser hardware baseline. No account browser mode or
+fingerprint toggles are changed.
+
+Validation: 20 targeted hardware, account sign-in, fingerprint and browser-profile
+tests passed. Local headless Chrome and Chromium both reported the RTX 3070,
+16 logical processors, browser memory value 32, and 272 font families, with no
+inspection contexts left open. This validates background collection on this
+machine; it is not a claim about third-party detection scores.
