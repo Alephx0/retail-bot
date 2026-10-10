@@ -6,7 +6,7 @@ import uuid
 from collections import deque
 
 from .amazon import Attention, BackoffRequired
-from .models import inputs
+from .models import inputs, stock_observation
 from .store import now
 
 
@@ -107,8 +107,9 @@ class ProductMonitor:
                     errors = backoffs = 0
                     engine.store.put('feed', dict(product, at=now(), simulation=self.simulation,
                                                  group_id=self.group['id'], retailer=self.group['retailer']), self.id)
-                    self.update('in_stock' if product.get('available') else 'out_of_stock',
-                                ('In stock' if product.get('available') else 'Out of stock') + f'; next check in {delay:g}s')
+                    stock, message = stock_observation(product)
+                    self.update({'available': 'in_stock', 'unavailable': 'out_of_stock', 'unknown': 'stock_unknown'}[stock],
+                                message + f'; next check in {delay:g}s')
                 except BackoffRequired as exc:
                     self.product = None
                     backoffs += 1

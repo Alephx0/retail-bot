@@ -120,6 +120,40 @@ def test_shared_watchers_leave_account_free_and_close_on_last_stop(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('availability,status,message', [
+    ('available', 'in_stock', 'In stock; Unavailable for the selected delivery location; Sign in required for this offer'),
+    ('unknown', 'stock_unknown', 'Stock could not be verified; Add-to-cart control could not be verified'),
+    ('unavailable', 'out_of_stock', 'Out of stock'),
+])
+def test_monitor_reports_inventory_without_authorizing_restricted_purchases(tmp_path, availability, status, message):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        task = task_record(store, group, account, monitor_asin='B012345678')
+
+        async def inspect(page, item, region):
+            return {**item, 'title': 'Restricted grocery', 'price': .99, 'available': False,
+                    'availability_status': availability, 'availability_message': message,
+                    'amazon_seller': True, 'seller': 'Amazon.com', 'condition': 'new'}
+
+        engine.amazon.inspect = inspect
+        try:
+            await engine.start(task['id'])
+            await until(lambda: message in store.get('tasks', task['id']).get('message', ''))
+            monitor = next(iter(engine.monitors.active.values()))
+            assert monitor.status == status
+            assert message in monitor.message
+            assert not engine.amazon.carts
+            assert len(engine.amazon.contexts) == 1  # Read-only anonymous monitor only.
+            assert store.all('feed')[0]['availability_status'] == availability
+            assert not store.all('feed')[0]['available']
+            assert not engine.account_locks[account['id']].locked()
+        finally:
+            await engine.close()
+            store.db.close()
+
+    asyncio.run(scenario())
+
+
 def test_task_assignment_ignores_stock_on_other_monitor(tmp_path):
     async def scenario():
         store, group, account, engine = fixture(tmp_path)

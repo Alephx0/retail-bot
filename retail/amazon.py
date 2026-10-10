@@ -815,15 +815,40 @@ class Amazon:
                     except InteractionError as exc:
                         agent_error = str(exc)
         unique = await cart.count() == 1 if hasattr(cart, 'count') else True
-        available = unique and await cart.is_visible() and await cart.is_enabled()
-        stock_text = (await self.text(page, '#availability')).lower()
-        stock_status = 'available' if available else 'unavailable' if any(x in stock_text for x in ('currently unavailable', 'out of stock')) else 'unknown'
+        cart_available = unique and await cart.is_visible() and await cart.is_enabled()
+        # Inventory and permission to buy are different. Grocery pages can say
+        # "In Stock" while replacing the purchase controls with sign-in or a
+        # delivery-location restriction. Ignore navigation and hidden templates.
+        evidence = await page.evaluate('''() => {
+            const text = selector => [...document.querySelectorAll(selector)]
+                .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
+                .map(e => e.innerText).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+            return {
+                stock: text('#availability, #availabilityInsideBuyBox_feature_div, #outOfStock'),
+                purchase: text('#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #deliveryBlockMessage')
+            };
+        }''')
+        stock_text = evidence['stock']
+        out_of_stock = bool(re.search(r'currently unavailable|out of stock|not in stock', stock_text))
+        in_stock = bool(re.search(r'\bin stock\b', stock_text)) and not out_of_stock
+        restrictions = []
+        if re.search(r'(?:cannot|can\'t|can not) be (?:shipped|delivered) to (?:your|the) (?:selected )?(?:delivery )?location', evidence['purchase']):
+            restrictions.append('Unavailable for the selected delivery location')
+        if 'sign in to get started' in evidence['purchase']:
+            restrictions.append('Sign in required for this offer')
+        available = cart_available and not out_of_stock and not restrictions
+        stock_status = 'unavailable' if out_of_stock else 'available' if in_stock or available else 'unknown'
+        stock_message = {'available': 'In stock', 'unavailable': 'Out of stock', 'unknown': 'Stock could not be verified'}[stock_status]
+        if not available and not restrictions and stock_status != 'unavailable':
+            restrictions.append('Add-to-cart control could not be verified')
+        availability_message = '; '.join([stock_message, *restrictions])
         return {"asin": item["asin"], "title": title, "price": price,
                 "original_price": original, "offer_id": offer or "",
                 "image": await page.locator("#landingImage").get_attribute("src") if await page.locator("#landingImage").count()==1 else "",
                 "amazon_seller": bool(re.fullmatch(r"Amazon(?:\.com|\.co\.uk|\.ca)?(?: Services(?:,? Inc\.?)?|\.com Services LLC)?", seller, re.I)),
                 "seller": seller or "Unknown", "condition": "used" if used or "used" in condition else "new",
-                "available": available, 'availability_status': stock_status, 'agent_error': agent_error}
+                "available": available, 'availability_status': stock_status,
+                'availability_message': availability_message, 'agent_error': agent_error}
 
     async def cart(self, page, quantity, asin):
         domain = urlparse(page.url).hostname

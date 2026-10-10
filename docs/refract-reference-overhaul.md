@@ -216,3 +216,29 @@ tests passed. Local headless Chrome and Chromium both reported the RTX 3070,
 16 logical processors, browser memory value 32, and 272 font families, with no
 inspection contexts left open. This validates background collection on this
 machine; it is not a claim about third-party detection scores.
+
+## Inventory versus purchase availability
+
+The Amazon monitor previously treated an absent/disabled Add to Cart control as
+out of stock, including grocery pages displaying In Stock with delivery-location
+and sign-in restrictions. Inspection now records inventory separately from the
+existing guarded `available` purchase signal. Visible product stock evidence,
+delivery restrictions and the grocery sign-in prompt produce an explanatory
+message. Hidden stock templates and the global navigation sign-in link do not
+determine stock. Unknown layouts report unverified stock rather than a stockout.
+
+Monitor rows, product observations, task waiting messages and compatibility-plan
+rejection messages preserve this distinction. Waiting tasks retain their specific
+reason between scans. Shared monitors remain anonymous; purchase eligibility is
+still false when purchase controls cannot be verified or delivery is restricted.
+This reporting fix does not sign in monitors, change addresses, or enable a new
+grocery checkout workflow.
+
+Validation: 81 browser-adapter, monitor, core, compatibility-plan and execution
+tests passed. Nine local product layouts cover the supplied screenshot's state,
+actual stockouts, unknown layouts, disabled controls, hidden templates and normal
+purchasable stock. Restricted/unknown observations do not open account checkout
+contexts or cart items. Playwright MCP verified monitor badges, restrictions,
+logs and product-feed consistency at desktop and narrow widths using intercepted
+read-only fixtures. Screenshots: `artifacts/monitor-availability-{1440,390}.png`.
+No live purchases were made. The running backend needs a restart to load the fix.

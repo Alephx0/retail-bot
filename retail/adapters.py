@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .store import now
+from .models import stock_observation
 
 
 class RetailerAdapter(Protocol):
@@ -40,7 +41,7 @@ class MonitorService:
         async def inspect(page,item):
             async with semaphore:
                 product=await self.adapter.inspect(page,item,region)
-                return MonitorEvent(retailer,item['asin'],product.get('offer_id',''),product.get('seller',''),product.get('price'),'available' if product.get('available') else 'unavailable',now(),product)
+                return MonitorEvent(retailer,item['asin'],product.get('offer_id',''),product.get('seller',''),product.get('price'),stock_observation(product)[0],now(),product)
         results=await asyncio.gather(*(inspect(p,i) for p,i in zip(pages,items)),return_exceptions=True)
         return results
 

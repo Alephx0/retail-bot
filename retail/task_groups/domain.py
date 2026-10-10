@@ -5,6 +5,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from ..models import stock_observation
 
 
 class Model(BaseModel):
@@ -227,6 +228,9 @@ def windows(schedule, current, days_ahead=8):
 
 def qualifying(product, target, plan):
     if not product.get('available'):
+        stock, message = stock_observation(product)
+        if stock != 'unavailable':
+            return False, 'purchase_unavailable' if stock == 'available' else 'stock_unknown', message
         return False, 'out_of_stock', 'Waiting for stock'
     if product.get('price') is None:
         return False, 'unknown_price', 'Price is not verified'

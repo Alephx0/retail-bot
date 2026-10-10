@@ -481,12 +481,26 @@ def eligible(product: dict, item: dict, group: dict, *, defer_unknown_seller=Fal
     return True
 
 
+def stock_observation(product):
+    """Inventory display only; `available` remains the guarded purchase signal."""
+    status = product.get('availability_status') or ('available' if product.get('available') else 'unavailable')
+    if status not in ('available', 'unavailable', 'unknown'):
+        status = 'unknown'
+    message = product.get('availability_message')
+    if not message:
+        message = {'available': 'In stock', 'unavailable': 'Item is out of stock',
+                   'unknown': 'Stock could not be verified; Add-to-cart control could not be verified'}[status]
+        if status == 'available' and not product.get('available'):
+            message += '; Add-to-cart control could not be verified'
+    return status, message
+
+
 def rejection_reasons(product, item, group):
     reasons = []
     if product.get('agent_error'):
         reasons.append('AI recovery: ' + product['agent_error'])
     if not product.get('available'):
-        reasons.append('Add-to-cart control could not be verified' if product.get('availability_status') == 'unknown' else 'Item is out of stock')
+        reasons.append(stock_observation(product)[1])
     price = product.get('price')
     if price is None:
         reasons.append('Product price could not be read')

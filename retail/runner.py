@@ -105,7 +105,10 @@ class TaskRunner:
                         self.browser_slots.release()
                         slot_acquired = False
                 retain_context = False
-                self.status(id, "waiting", "Standby: waiting for restock from assigned monitor")
+                # Keep the last stock/restriction explanation visible while
+                # waiting for a new observation instead of immediately erasing it.
+                if (self.store.get('tasks', id) or {}).get('status') != 'waiting':
+                    self.status(id, "waiting", "Standby: waiting for restock from assigned monitor")
                 checkout_page = None
                 try:
                     products = await self.monitors.observations(monitors, seen_observations)
