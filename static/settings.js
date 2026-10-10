@@ -2,7 +2,7 @@
 
 // Drafts stay in memory, including across navigation. Never persist secret fields
 // in localStorage or include them in unrelated connection requests.
-const settingsSections = [['general','General'], ['browser','Browser'], ['notifications','Notifications'], ['integrations','Connections'], ['data','Data & privacy']];
+const settingsSections = [['general','General'], ['browser','Browser & fingerprints'], ['notifications','Notifications'], ['integrations','Connections'], ['data','Data & privacy']];
 const stoppedSettings = ['max_running_tasks','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
 let settingsDraft = null, settingsBaseline = null, settingsSaving = false, settingsError = '', settingsSavedMessage = '';
 let installedBrowsers = null, browserLookupPending = false;
@@ -36,7 +36,7 @@ function settingsDirty() { return Object.keys(settingsChanges()).length > 0; }
 function settingsRuntimeActive(){return !!state.active?.length||(state.task_groups||[]).some(g=>tgActive(g.run));}
 function settingHelp(text) { return `<p class="setting-help">${text}</p>`; }
 function settingCard(title, help, content) {
-  return `<div class="setting-card"><h3>${title}</h3>${help ? settingHelp(help) : ''}${content}</div>`;
+  return `<div class="setting-card setting-row"><div class="setting-description"><h3>${title}</h3>${help ? settingHelp(help) : ''}</div><div class="setting-controls">${content}</div></div>`;
 }
 function secondsField(key, label, value, min, max) {
   return input(key, label, value === '' ? '' : value / 1000, 'number', `data-milliseconds min="${min}" max="${max}" step="0.1" required`);
@@ -107,7 +107,7 @@ function settingsView() {
       check('trace_enabled','Record browser traces for troubleshooting',s.trace_enabled ?? false) +
       '<p data-trace-status role="status"></p>' + settingHelp('Traces can contain account details. Keep recording off unless you need to investigate a problem.'));
   const nav = settingsSections.map(([key,label]) => `<button type="button" id="settings-tab-${key}" role="tab" aria-controls="settings-panel-${key}" aria-selected="${settingsTab === key}" tabindex="${settingsTab === key ? 0 : -1}" data-settings-tab="${key}" class="${settingsTab === key ? 'selected' : ''}">${label}</button>`).join('');
-  const html = `<div data-settings-shell class="settings-workspace"><div class="settings-navigation"><div role="tablist" aria-label="Settings sections" aria-orientation="vertical">${nav}</div><button type="button" data-context-view="troubleshooting">Troubleshooting ↗</button></div><form id="settings-form" novalidate><div class="settings-panels">${settingsPanel('general',general)}${settingsPanel('browser',browser)}${settingsPanel('notifications',notifications)}${settingsPanel('integrations',connections)}${settingsPanel('data',data)}</div><div class="settings-savebar"><p id="settings-error" role="alert" tabindex="-1">${esc(settingsError)}</p><div class="setting-actions"><span data-settings-status role="status"></span><button type="button" data-settings-discard>Discard changes</button><button class="primary" type="submit">Save changes</button></div></div></form></div>`;
+  const html = `<div data-settings-shell class="settings-workspace"><div class="settings-navigation"><div role="tablist" aria-label="Settings sections" aria-orientation="horizontal">${nav}</div><button type="button" data-context-view="troubleshooting">Troubleshooting ↗</button></div><form id="settings-form" novalidate><div class="settings-panels">${settingsPanel('general',general)}${settingsPanel('browser',browser)}${settingsPanel('notifications',notifications)}${settingsPanel('integrations',connections)}${settingsPanel('data',data)}</div><div class="settings-savebar"><p id="settings-error" role="alert" tabindex="-1">${esc(settingsError)}</p><div class="setting-actions"><span data-settings-status role="status"></span><button type="button" data-settings-discard>Discard changes</button><button class="primary" type="submit">Save changes</button></div></div></form></div>`;
   queueMicrotask(() => { updateSettingsStatus(); loadInstalledBrowsers(); });
   return html;
 }
@@ -152,7 +152,7 @@ function updateSettingsStatus() {
   const s = settingsDraft, saved = state.settings[0] || {}, running = settingsRuntimeActive();
   $('#trace-recording').hidden=!saved.trace_enabled;
   const dirty = settingsDirty();
-  document.querySelector('.settings-navigation [role=tablist]').setAttribute('aria-orientation', matchMedia('(max-width:740px)').matches ? 'horizontal' : 'vertical');
+  document.querySelector('.settings-navigation [role=tablist]').setAttribute('aria-orientation', 'horizontal');
   form.querySelector('[data-settings-status]').textContent = settingsSaving ? 'Saving…' : dirty ? 'Unsaved changes · applies across sections' : (settingsSavedMessage || 'All changes saved');
   form.querySelector('[type=submit]').disabled = settingsSaving || !dirty;
   form.querySelector('[data-settings-discard]').disabled = settingsSaving || !dirty;

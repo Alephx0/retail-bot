@@ -81,6 +81,24 @@ def test_pending_order_protects_account_even_after_task_deleted(tmp_path):
     store.db.close()
 
 
+def test_legacy_task_defaults_agree_in_full_and_compact_views_without_rewriting(tmp_path):
+    with TestClient(create_app(tmp_path), headers=HEADERS) as client:
+        group=client.post('/api/groups',json={'name':'Legacy','products':'B012345678'}).json()
+        store=client.app.state.store
+        legacy=store.put('tasks',{'group_id':group['id'],'quantity':2,'simulation':True,'status':'idle'})
+        explicit=store.put('tasks',{'group_id':group['id'],'checkout_mode':'monitor','max_total':42,'status':'idle'})
+        full=client.get('/api/state').json()['tasks']
+        compact=client.get('/api/task-workspace').json()['tasks']
+        assert full == compact
+        inherited=next(t for t in full if t['id']==legacy['id'])
+        assert inherited['checkout_mode']=='review' and inherited['max_total'] is None
+        assert inherited['quantity']==2 and inherited['monitor_asin']==''
+        saved=next(t for t in full if t['id']==explicit['id'])
+        assert saved['checkout_mode']=='monitor' and saved['max_total']==42
+        assert store.get('tasks',legacy['id'])==legacy
+        assert store.get('tasks',explicit['id'])==explicit
+
+
 def test_start_rejected_while_stop_cleanup_pending(tmp_path):
     async def scenario():
         store=Store(tmp_path);engine=Engine(store);entered=asyncio.Event();release=asyncio.Event()

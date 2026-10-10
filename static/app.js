@@ -12,7 +12,7 @@ async function api(path,method='GET',body){
   return data;
 }
 function toast(message){$('#toast').textContent=message;$('#toast').style.display='block';clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').style.display='none',6000);}
-const statusNames={idle:'Ready',starting:'Starting',monitoring:'Running',in_queue:'Queued',review:'Needs review',checkout:'Checking out',not_needed:'Goal reached',watching:'Running',preparing:'Starting',scheduled:'Scheduled',paused:'Paused',stopped:'Stopped',stopping:'Stopping',completed:'Successful',confirmed:'Successful',reserved:'Waiting',carting:'Checking out',reviewing:'Checking out',submitting:'Confirming order',waiting_user:'Needs review',reconciliation_required:'Verify outcome',read_error:'Needs attention',attention:'Needs attention',retrying:'Retrying',failed:'Failed',error:'Failed',cancelled:'Stopped',rejected:'Not eligible',quoted:'Price verified',eligible:'Available',out_of_stock:'Waiting for stock',waiting:'Waiting',ready:'Ready',disabled:'Disabled'};
+const statusNames={idle:'Ready',running:'Running',in_stock:'In stock',checking:'Checking stock',backing_off:'Waiting for retailer',starting:'Starting',monitoring:'Running',in_queue:'Queued',review:'Needs review',checkout:'Checking out',not_needed:'Goal reached',watching:'Running',preparing:'Starting',scheduled:'Scheduled',paused:'Paused',stopped:'Stopped',stopping:'Stopping',completed:'Successful',confirmed:'Successful',reserved:'Waiting',carting:'Checking out',reviewing:'Checking out',submitting:'Confirming order',waiting_user:'Needs review',reconciliation_required:'Verify outcome',read_error:'Needs attention',attention:'Needs attention',retrying:'Retrying',failed:'Failed',error:'Failed',cancelled:'Stopped',rejected:'Not eligible',quoted:'Price verified',eligible:'Available',out_of_stock:'Waiting for stock',waiting:'Waiting',ready:'Ready',disabled:'Disabled'};
 function badge(status='ready'){
   const color=['completed','confirmed','ready','saved','connected'].includes(status)?'success':['failed','error','reconciliation_required'].includes(status)?'error':['paused','attention','read_error','waiting_user','retrying'].includes(status)?'warning':['watching','running','preparing','carting','submitting'].includes(status)?'processing':'neutral';
   return `<span class="badge ${color}"><span class="status-dot"></span>${esc(statusNames[status]||String(status).replaceAll('_',' '))}</span>`;
@@ -40,12 +40,12 @@ async function refresh(force=false){
   }catch(error){$('#connection').textContent='Connection lost';$('#connection').dataset.connected='false';if(!stateLoaded)$('#screen').innerHTML=empty('circle-alert','Unable to connect','Check that the local engine is running.','<button data-refresh>Try again</button>');}
   finally{refreshPending=false;}
 }
-function navigate(next){view=next;groupId=null;search='';$('#screen').innerHTML='';render();refresh(true);}
+function navigate(next){view=next;groupId=null;search='';selected.clear();$('#screen').innerHTML='';render();refresh(true);}
 function hydrateIcons(){document.querySelectorAll('[data-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.icon);el.removeAttribute('data-icon');});}
 // Patch changed nodes in the runtime view, preserving focus and unchanged rows.
 function updateRegion(root,html){
   const template=document.createElement('template');template.innerHTML=html;
-  function key(node){if(node.nodeType!==Node.ELEMENT_NODE)return '';const attrs=[...node.attributes].filter(a=>a.name.startsWith('data-tg-')||a.name.startsWith('data-work-')||a.name==='data-preserve-draft'||a.name==='data-task-row'||a.name==='data-account-row');return attrs.map(a=>a.name+'='+a.value).join('|');}
+  function key(node){if(node.nodeType!==Node.ELEMENT_NODE)return '';const attrs=[...node.attributes].filter(a=>a.name.startsWith('data-tg-')||a.name.startsWith('data-work-')||a.name==='data-preserve-draft'||a.name==='data-task-row'||a.name==='data-account-row'||a.name==='data-monitor-row');return attrs.map(a=>a.name+'='+a.value).join('|');}
   function patch(parent,next){
     for(let i=0;i<next.childNodes.length;i++){
       const incoming=next.childNodes[i];let current=parent.childNodes[i];
@@ -61,7 +61,7 @@ function updateRegion(root,html){
       if(current.nodeType===Node.TEXT_NODE){current.nodeValue=incoming.nodeValue;continue;}
       if(current.nodeType!==Node.ELEMENT_NODE)continue;
       for(const attr of [...current.attributes])if(!incoming.hasAttribute(attr.name))current.removeAttribute(attr.name);
-      for(const attr of incoming.attributes)if(current.getAttribute(attr.name)!==attr.value)current.setAttribute(attr.name,attr.value);
+      for(const attr of incoming.attributes)if(!(attr.name==='value'&&current===document.activeElement)&&current.getAttribute(attr.name)!==attr.value)current.setAttribute(attr.name,attr.value);
       patch(current,incoming);
     }
     while(parent.childNodes.length>next.childNodes.length)parent.lastChild.remove();
@@ -87,6 +87,13 @@ function events(){return `<div class="panel">${state.events.length?table(['Time'
 function input(key,label,value='',type='text',extra=''){return `<label for="f-${key}">${label}</label><input id="f-${key}" name="${key}" type="${type}" value="${esc(value)}" ${extra}>`;}
 function check(key,label,value){return `<label><input type="checkbox" name="${key}" ${value?'checked':''}>${label}</label>`;}
 function select(key,label,values,value){return `<label for="f-${key}">${label}</label><select id="f-${key}" name="${key}">${values.map(([v,l])=>`<option value="${esc(v)}" ${v===value?'selected':''}>${esc(l)}</option>`).join('')}</select>`;}
+function scopeDialogFields(root){
+  const prefix='dialog-'+crypto.randomUUID(),ids=new Map();
+  for(const field of root.querySelectorAll('[id^="f-"]')){const old=field.id;field.id=prefix+'-'+old;ids.set(old,field.id);}
+  for(const element of root.querySelectorAll('[for],[aria-labelledby],[aria-describedby]')){
+    for(const attr of ['for','aria-labelledby','aria-describedby'])if(element.hasAttribute(attr))element.setAttribute(attr,element.getAttribute(attr).split(' ').map(id=>ids.get(id)||id).join(' '));
+  }
+}
 function exportCSV(){const columns=['at','asin','title','quantity','total','currency','status','simulation','order_id'];const cell=v=>'"'+String(v??'').replace(/^[=+@\-]/,"'"+'$&').replaceAll('"','""')+'"';const csv=[columns.join(','),...state.checkouts.map(row=>columns.map(c=>cell(row[c])).join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='retail-desk-checkouts.csv';a.click();URL.revokeObjectURL(url);}
 
 function openEditor(kind,id){
@@ -99,8 +106,9 @@ function openEditor(kind,id){
   $('#fields').innerHTML=kind==='accounts'?html:featureForm(kind,value,html);
   if(kind==='accounts')syncAccountFingerprintFields($('#editor'));
   $('#editor [type=submit]').textContent=kind==='accounts'?(id?'Save account':'Create Account'):'Save';
-  $('#modal').showModal();decorateResourceEditor(kind,id);
+  scopeDialogFields($('#fields'));$('#modal').showModal();decorateResourceEditor(kind,id);
 }
+$('#modal').addEventListener('close',()=>{if(!$('#modal').open){$('#fields').replaceChildren();editing=null;}});
 $('#editor').addEventListener('submit',async event=>{
   event.preventDefault();const form=event.currentTarget,data=formData(form),{kind,id}=editing;
   if(!serializeFeature(kind,id,data,form))return;

@@ -2,7 +2,7 @@
 async page => {
   const assert=(ok,message)=>{if(!ok)throw Error(message);},results=[],errors=[];
   page.on('pageerror',e=>errors.push(e.message));
-  await page.unrouteAll({behavior:'wait'});await page.goto('http://127.0.0.1:8783');
+  await page.unrouteAll({behavior:'wait'});await page.goto('http://127.0.0.1:8785');
   await page.waitForFunction(()=>document.querySelector('#connection').dataset.connected==='true');
   await page.locator('[data-work-open]').first().click();await page.locator('[data-work-add]').first().click();
   const form=page.locator('#assignment-editor'),button=form.locator('[type=submit]');

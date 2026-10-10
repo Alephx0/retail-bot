@@ -134,8 +134,12 @@ def create_app(data_dir=None):
             valid['created_at'] = now()
         return valid
 
+    # Older task records omit options introduced later. Read the same defaults
+    # as the runner without rewriting saved records or changing explicit values.
+    task_defaults = Task(group_id='').model_dump(mode='json')
+
     def public(kind, value):
-        value = dict(value)
+        value = {**task_defaults, **value} if kind == 'tasks' else dict(value)
         if kind == "accounts":
             value.pop("session", None)
             value['fingerprint_overrides'] = {k: v for k, v in value.get('fingerprint_overrides', {}).items() if v is not None}
@@ -586,7 +590,7 @@ def create_app(data_dir=None):
 
     @app.get('/api/task-workspace')
     async def task_workspace():
-        return {kind: store().all(kind) for kind in ('groups', 'tasks')} | {
+        return {kind: [public(kind, value) for value in store().all(kind)] for kind in ('groups', 'tasks')} | {
             'active': list(app.state.engine.jobs),
             'monitors': app.state.engine.monitors.snapshot(),
             'task_browser_ids': list(app.state.engine.pages),

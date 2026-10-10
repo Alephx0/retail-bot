@@ -1,5 +1,6 @@
 """Check contextual integrations without contacting external services."""
 import asyncio
+import os
 from uuid import uuid4
 from patchright.async_api import async_playwright
 
@@ -9,7 +10,7 @@ async def main():
         page=await browser.new_page(viewport={"width":1440,"height":1000})
         errors=[]
         page.on("pageerror",lambda e:errors.append(str(e)))
-        await page.goto("http://127.0.0.1:8766")
+        await page.goto(os.environ.get("RETAIL_TEST_URL","http://127.0.0.1:8785"))
         await page.locator("[data-view=settings]").click()
         await page.locator("[data-settings-tab=integrations]").click()
         await page.locator("[data-context-view=solvers]").click()
@@ -31,11 +32,13 @@ async def main():
         await page.locator("#editor button[type=submit]").click()
         await page.locator("tr").filter(has_text="Fixture Inbox").first.wait_for()
         await page.locator("[data-view=settings]").click()
-        await page.locator("[data-settings-tab=retailers]").click()
+        await page.locator("[data-settings-tab=general]").click()
+        await page.locator("[data-context-view=retailers]").click()
         assert await page.locator(".group-card").count()==11
+        await page.locator("[data-view=settings]").click()
         await page.locator("[data-settings-tab=data]").click()
         async with page.expect_download() as download:
-            await page.get_by_role("link",name="Download encrypted workspace backup").click()
+            await page.get_by_role("link",name="Download encrypted backup").click()
         assert (await download.value).suggested_filename.endswith(".zip")
         assert not errors,errors
         await browser.close()

@@ -3,8 +3,8 @@
 This branch restores the [original group and task workflow](docs/original-task-workflow.md)
 with the modern responsive interface. Create a group, add independent account tasks,
 then start all or selected tasks. Existing groups work directly. The newer purchasing
-plans retain their history and outcome controls under Tools. [AGENTS.md](AGENTS.md)
-defines the development standards.
+plans retain their history and outcome controls under Operations > Saved plans. [AGENTS.md](AGENTS.md)
+defines the development standards. The [reference-based overhaul report](docs/refract-reference-overhaul.md) covers the UI comparison, feature map, validation and performance measurements.
 
 A local retail automation workspace inspired by the public Refract and Stellar workflows. Version 0.4 adds a Home dashboard, canonical resource folders, profile/account assignment previews, contextual tabs, account session management, structured task states, and independent monitoring/cart/checkout services. This is an independent implementation, **not full parity with either commercial bot**.
 
@@ -21,7 +21,7 @@ python -m venv .venv
 .\.venv\Scripts\python run.py
 ```
 
-Open **http://127.0.0.1:8765**. Subsequent launches can use `start.ps1`. Keep the process running for schedules. Use `run.py` rather than Uvicorn reload mode on Windows, so Patchright has a subprocess-capable event loop. Optional arguments: `--port 8766 --data-dir artifacts/test-workspace`.
+Open **http://127.0.0.1:8765**. Subsequent launches can use `start.ps1`. Keep the process running for schedules. Use `run.py` rather than Uvicorn reload mode on Windows, so Patchright has a subprocess-capable event loop. Optional arguments: `--port 8785 --data-dir artifacts/test-workspace`.
 
 ## Implemented
 
@@ -46,7 +46,7 @@ Open **http://127.0.0.1:8765**. Subsequent launches can use `start.ps1`. Keep th
 3. Add an account with Amazon US, email, optional password and authenticator secret. Link its mailbox and CAPTCHA provider. **Open** in Accounts opens a visible sign-in browser directly, without a Take Control dialog. Complete remaining verification in that window; a fresh account-page check saves the session automatically. Managed sign-ins use a separate visible browser even when tasks are configured as headless. Existing externally connected browsers keep their own window mode. **Save session** remains a manual fallback. Take Control is reserved for active tasks.
 4. Set default shipping and payment methods on Amazon. Profiles do not override them.
 5. Create a task group with ASINs or a reusable input list. Formats: `ASIN`, `ASIN;max_price`, `ASIN;offer_id`, `ASIN;max_price;offer_id`. Amazon product URLs and decimal caps are accepted.
-6. Choose **Add tasks**, select one or more accounts, and choose quantity and task behavior. Account connections are used by default; task-specific choices remain available. Test proxy health from Tools if needed; this measures reachability, not retailer acceptance.
+6. Choose **Add tasks**, select one or more accounts, and choose quantity and task behavior. Account connections are used by default; task-specific choices remain available. Test proxy health from Proxies if needed; this measures reachability, not retailer acceptance.
 7. Start individual, selected or all tasks. Each task can be edited independently after stopping it. **Monitor only** never carts. **Cart + browser review** prepares checkout for manual confirmation. **Automatic checkout** may place a real order once started. Optional group schedules retain the same task settings.
 
 Automatic mode requires Amazon US and a recognized checkout layout with exactly the target ASIN, verified quantity, unit price, allowed seller/condition, an order total within the group budget and a recognized place-order button. The engine writes its submission intent before clicking. An uncertain response is never retried automatically. A task with a submission record cannot restart live; review Amazon order history before intentionally creating a new purchasing task.
@@ -113,15 +113,16 @@ WebGL profiles retain seeded model aliases within the real hardware family and p
 For dashboard tests, start an isolated workspace:
 
 ```powershell
-.\.venv\Scripts\python run.py --port 8766 --data-dir artifacts/test-workspace
+.\.venv\Scripts\python run.py --port 8785 --data-dir artifacts/test-workspace
 ```
 
 Then in another terminal:
 
 ```powershell
-$env:RETAIL_TEST_URL='http://127.0.0.1:8766'
+$env:RETAIL_TEST_URL='http://127.0.0.1:8785'
 .\.venv\Scripts\python scripts/smoke_ui.py
 .\.venv\Scripts\python scripts/smoke_features.py
+.\.venv\Scripts\python scripts/smoke_matching.py
 ```
 
 These create labeled fixtures in the isolated workspace and screenshots in `artifacts/`. No external services or purchases are used.
@@ -164,12 +165,12 @@ Native passkey/OS dialogs cannot be shown through a headless screenshot. For acc
 
 Reference behavior reviewed: [Refract monitor inputs](https://help.refractbot.com/general-setup/task-creation/monitor-setup-and-multi-input), [delays](https://help.refractbot.com/general-setup/task-creation/delays), [Amazon setup](https://help.refractbot.com/modules/amazon/amazon-setup-guide), and [Stellar guides](https://guides.stellaraio.com/stellar). Retailer adapters beyond Amazon, including Walmart queues and Target Shape, remain planned. Live retailer compatibility has not been validated with a real purchase.
 
-Run `python -m pytest -q` for fixture tests. `scripts/smoke_workspace.py` targets an isolated test server on port 8766 and creates simulation fixtures; do not point it at a production workspace.
+Run `python -m pytest tests -q` for fixture tests. `scripts/smoke_workspace.py` targets an isolated test server on port 8785 (or `RETAIL_TEST_URL`) and creates simulation fixtures; do not point it at a production workspace.
 
 
 ## Version 0.4 architecture and workflows
 
-Primary navigation is Task Groups, Overview, Accounts, Orders, Activity, Tools and Settings. Optional resources live in Tools. Settings retains General, Browser, Notifications, Connections and Data & privacy. Task groups use a compact settings sidebar and individual task table. See [the workflow guide](docs/original-task-workflow.md).
+Primary navigation is Overview, Tasks, Accounts, Proxies, Profiles, Operations, Tools and Settings. Operations has Orders, Monitors, Activity, Product observations and Saved plans tabs. Optional resources live in Tools; session and relationship utilities are in an Accounts tab. Settings retains General, Browser & fingerprints, Notifications, Connections and Data & privacy. Searchable task group cards open a compact settings sidebar and independent task table. Bulk controls target selected tasks, or visible tasks if no selection exists. See [the workflow guide](docs/original-task-workflow.md).
 
 `retail/resources.py` owns canonical resource memberships and account/profile relationships. `All` is a virtual view. Existing named account/profile groups migrate once without copying resources. Create New inside a folder adds membership; Import Existing adds references to existing records. Deleting a folder preserves its resources.
 

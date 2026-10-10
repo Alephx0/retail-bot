@@ -2,6 +2,8 @@
 node_modules/
 data/
 data-restored-tasks/
+data-refract-reference/
+data-refract-reference-final/
 __pycache__/
 .pytest_cache/
 artifacts/

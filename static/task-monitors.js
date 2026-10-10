@@ -55,11 +55,11 @@ function monitorStatuses(group) {
 function refreshMonitorStatus() {
   const group = state.groups.find(g => g.id===groupId);
   const box = document.querySelector('#monitor-statuses');
-  if (box && group) box.innerHTML = monitorStatuses(group);
+  if (box && group) updateRegion(box, monitorStatuses(group));
   document.querySelectorAll('[data-monitor-log-body]').forEach(body => {
     const record = (state.monitors || []).find(m => m.id===body.dataset.monitorLogBody);
-    if (record) body.innerHTML = `<p>${esc(record.connection)} · ${record.simulation ? 'Simulation' : esc(record.region)}</p>` +
-      record.log.slice().reverse().map(entry => `<p><time>${esc(time(entry.at))}</time> · <strong>${esc(entry.status)}</strong><br>${esc(entry.message)}</p>`).join('');
+    if (record) updateRegion(body, `<p>${esc(record.connection)} · ${record.simulation ? 'Simulation' : esc(record.region)}</p>` +
+      record.log.slice().reverse().map(entry => `<p><time>${esc(time(entry.at))}</time> · <strong>${esc(entry.status)}</strong><br>${esc(entry.message)}</p>`).join(''));
   });
 }
 

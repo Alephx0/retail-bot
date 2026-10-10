@@ -403,7 +403,10 @@ def test_amazon_agent_end_to_end_checkout_fixture(tmp_path, seller_missing):
                 assert current['status'] == 'completed', current
                 assert len(orders) == 1
                 assert len(store.all('checkouts')) == 1
-                assert [r['action'] for r in store.all('agent_runs')] == ['ADD_TO_CART', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'SUBMIT_ORDER']
+                # The shared anonymous monitor and account recheck each resolve
+                # availability without clicking; only the cart action adds an item.
+                assert [r['action'] for r in store.all('agent_runs')] == ['ADD_TO_CART', 'ADD_TO_CART', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'SUBMIT_ORDER']
+                assert cart_items == 1
                 assert store.get('submissions', 'submission-' + task['id'])['status'] == 'confirmed'
             finally:
                 await engine.close()

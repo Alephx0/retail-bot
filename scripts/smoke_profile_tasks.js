@@ -2,7 +2,7 @@
 async page => {
   const assert=(ok,message)=>{if(!ok)throw Error(message);},results=[],errors=[],tag=Date.now().toString(36);
   page.on('pageerror',e=>errors.push(e.message));
-  await page.setViewportSize({width:1440,height:1000});await page.goto('http://127.0.0.1:8783');
+  await page.setViewportSize({width:1440,height:1000});await page.goto('http://127.0.0.1:8785');
   await page.waitForFunction(()=>document.querySelector('#connection').dataset.connected==='true');
   const fixture=await page.evaluate(async tag=>{
     const post=async(path,value)=>{const response=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json','X-Retail-Client':'dashboard'},body:JSON.stringify(value)});const data=await response.json();if(!response.ok)throw Error(JSON.stringify(data));return data;};
@@ -40,7 +40,7 @@ async page => {
   const taskRow=page.locator('[data-task-row]').filter({hasText:fixture.profiles[0].name}).first();await taskRow.locator('[data-work-details]').click();await page.locator('[data-task-edit]').click();await page.locator('dialog[open] [name=profile_id]').selectOption(fixture.profiles[1].id);await page.getByRole('button',{name:'Save task',exact:true}).click();await page.locator('dialog[open]').waitFor({state:'hidden'});results.push('Existing task checkout profile remains editable');
   await page.locator('[data-work-add]').first().click();await editor.locator('[data-assignment-profile=profile_group]').click();await page.waitForFunction(()=>document.querySelector('.assignment-errors').textContent.includes('Choose a profile group'));assert(await editor.locator('[type=submit]').isDisabled(),'Empty profile group must block creation');await page.keyboard.press('Escape');results.push('Missing group selections cannot create accidental assignments');
   await page.setViewportSize({width:390,height:844});for(const key of ['general','monitoring','checkout','advanced']){await tab(key).click();assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Mobile tab overflow '+key);}
-  await page.locator('[data-work-add]').first().click();assert(await editor.evaluate(el=>el.scrollWidth<=el.clientWidth),'Mobile assignment overflow');await page.screenshot({path:'C:/Users/justi/Documents/Python/Retail Bot Overhaul/artifacts/overhaul/profile-assignment-mobile.png',fullPage:true});await page.keyboard.press('Escape');results.push('All tabs and assignment editor fit 390px');
-  await page.setViewportSize({width:1440,height:1000});await tab('monitoring').click();await page.screenshot({path:'C:/Users/justi/Documents/Python/Retail Bot Overhaul/artifacts/overhaul/group-tabs-desktop.png',fullPage:true});
+  await page.locator('[data-work-add]').first().click();assert(await editor.evaluate(el=>el.scrollWidth<=el.clientWidth),'Mobile assignment overflow');await page.screenshot({path:'C:/Users/justi/Documents/Python/Retail Bot/artifacts/profile-assignment-mobile.png',fullPage:true});await page.keyboard.press('Escape');results.push('All tabs and assignment editor fit 390px');
+  await page.setViewportSize({width:1440,height:1000});await tab('monitoring').click();await page.screenshot({path:'C:/Users/justi/Documents/Python/Retail Bot/artifacts/group-tabs-desktop.png',fullPage:true});
   assert(!errors.length,'Browser errors '+errors.join(';'));return {results,errors,groupId:fixture.group.id};
 }

@@ -33,13 +33,13 @@ Restored tasks on the same account queue behind its lock. Different accounts exe
 
 Task creation batches are atomic. Group duplication atomically copies group and tasks, clears schedules and execution state, and switches copies to simulation. Delete retains order and submission history. No destructive migration was introduced.
 
-The interface retains local Iconify Lucide assets, design tokens, native dialogs, focus restoration, responsive layouts and non-overlapping polling. `/api/task-workspace` returns only groups, tasks and active IDs during routine polling. Runtime patches preserve task identity and unsaved group drafts; drafts are replaced when navigating to a different group.
+The interface retains local Iconify Lucide assets, design tokens, native dialogs, focus restoration, responsive layouts and non-overlapping polling. `/api/task-workspace` returns groups, tasks, active IDs, monitor snapshots and browser IDs during routine polling. Runtime patches preserve task identity and unsaved group drafts; drafts are replaced when navigating to a different group.
 
 ## Verification
 
 `tests/test_original_task_workspace.py` covers task independence, inherited limits, atomic batch validation, safe duplication, configuration locks, idempotent start, effective limits during execution, pending submissions after deletion, and start/stop races. Existing goal-based execution tests remain applicable to compatibility plans.
 
-`scripts/smoke_task_workspace.js` runs against isolated fixtures on port 8783. Its 15 scenarios cover four-field group creation, multi-account tasks, independent settings, individual/bulk/selected controls, drafts, keyboard focus, isolated errors, schedules, simulated completion, safe duplication, deletion, navigation and a 390px layout. No live purchase is placed. Screenshots and logs are in ignored `artifacts/overhaul/`.
+`scripts/smoke_task_workspace.js` runs against isolated fixtures on port 8785. Its 15 scenarios cover four-field group creation, multi-account tasks, independent settings, individual/bulk/selected controls, drafts, keyboard focus, isolated errors, schedules, simulated completion, safe duplication, deletion, navigation and a 390px layout. No live purchase is placed. Screenshots and logs are in ignored `artifacts/`.
 
 Validation: **285 passed, 4 skipped** in 382 seconds, with one existing Starlette/httpx deprecation warning. All **15 Playwright scenarios passed**, with no JavaScript errors. The full suite also covers existing browser/fingerprint functionality. Logs are in `artifacts/overhaul/restored-full-suite.log`.
 

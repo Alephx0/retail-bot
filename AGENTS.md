@@ -19,6 +19,9 @@
 - Reuse `static/style.css` tokens for color, spacing, typography, surfaces and controls. Use restrained dark surfaces and semantic statuses with text, not color alone.
 - Prefer simplifying a workflow over adding navigation. Optional resources belong in Tools. Avoid redundant buttons, nested cards and repeated information.
 - Preserve keyboard focus during runtime updates, useful loading/error/empty states, responsive layout and readable contrast.
+- Follow the reference-based workspace: compact navigation rail, group cards, task information sidebar, account/profile folders, and horizontal settings tabs. Extra operational capabilities live in Operations or contextual Tools tabs; do not reintroduce duplicate destinations.
+- Search and status filters scope task bulk actions to visible tasks unless the user explicitly selects tasks. Keep the action label accurate, clear selection when its filter changes, and preserve focus while updating results.
+- Reference applications inform presentation only. Keep the retail engine, encrypted vault, and real integration APIs authoritative; never import mock execution, authentication bypass, or licensing code.
 
 ## Verification
 
