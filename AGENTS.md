@@ -7,6 +7,7 @@
 - One engine scheduling loop services original tasks and compatibility purchasing plans. The coordinator retains its durable journal and recovery for saved plans; do not start a second scheduler in the application. Shared account locks and browser limits apply to both.
 - Task execution captures its group/task configuration at startup. Stop tasks before changing their configuration or group settings.
 - Preserve atomic quota reservations, account leases, durable submission intent, idempotent confirmation and uncertain-outcome reconciliation. Never retry a possibly submitted order. Respect retailer rate limits and purchase restrictions.
+- Verify live task account sessions before monitoring. Treat anonymous inventory as a wake-up signal, then recheck purchase eligibility in the assigned account before carting. Respect Retry-After in full; never treat a sign-in or delivery restriction as an inventory stockout.
 - Keep encrypted credentials in the existing vault. Group plans contain references, never copied credentials. Migrations must preserve original records and have tested recovery.
 - Prefer bounded asynchronous operations and compact read models. Measure before adding infrastructure. Do not duplicate authoritative state in the frontend.
 

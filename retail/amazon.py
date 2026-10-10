@@ -14,7 +14,7 @@ from .native_fingerprint import launch_options as native_launch_options, needs_p
 from .worker_profiles import WorkerProfiles, debugging_port
 from .fingerprint_suite import build_profile as build_suite_profile
 from . import us_fingerprint, proxy_location, behavior
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from patchright.async_api import async_playwright
 
@@ -634,6 +634,8 @@ class Amazon:
             await self.authenticate(page, account)
             await self.check(page)
         await self.navigate(page, getattr(page, '_retail_start_url', None) or f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
+        if 'click the button below to continue shopping' in (await page.locator('body').inner_text()).lower():
+            await self.check(page)
         start_url = getattr(page, '_retail_start_url', None)
         # Product pages do not redirect signed-out shoppers automatically, unlike
         # Your Orders. Follow only Amazon's own sign-in link when needed.
@@ -748,11 +750,45 @@ class Amazon:
             )
 
         if "click the button below to continue shopping" in body:
-            raise ChallengeDetected(
-                "Amazon requires a Continue shopping confirmation. No automatic confirmation was attempted. "
-                "Complete it in the task browser, then Resume.",
-                kind="continue-shopping",
-            )
+            # A plain navigation confirmation is not a CAPTCHA. Click only its
+            # unique, exact control on Amazon, once per page lifetime. Never loop
+            # on a recurring interstitial or submit a form to another origin.
+            message = ('Amazon Continue shopping could not be completed automatically. '
+                       'Review the task browser, then Resume.')
+            if any(text in body for text in ("verify it's you", 'verify your identity', 'additional verification required')):
+                raise ChallengeDetected('Amazon requires identity verification; complete it in the task browser, then Resume.', kind='identity-verification')
+            url = urlparse(page.url)
+            controls = page.get_by_role('button', name=re.compile(r'^continue shopping$', re.I))
+            visible = [node for node in await controls.all() if await node.is_visible() and await node.is_enabled()]
+            if (url.scheme != 'https' or url.hostname not in DOMAINS.values()
+                    or getattr(page, '_retail_continue_attempted', False) or len(visible) != 1):
+                raise ChallengeDetected(message, kind='continue-shopping')
+            control = visible[0]
+            destination = await control.evaluate("e => e.hasAttribute('formaction') ? e.formAction : (e.form?.action || e.closest('a')?.href || location.href)")
+            target = urlparse(urljoin(page.url, destination))
+            if target.scheme != 'https' or target.netloc != url.netloc:
+                raise ChallengeDetected(message, kind='continue-shopping')
+            page._retail_continue_attempted = True
+            responses = []
+            def record_navigation(response):
+                if response.request.is_navigation_request() and response.frame == page.main_frame:
+                    responses.append(response)
+            page.on('response', record_navigation)
+            try:
+                await control.click(timeout=5000)
+                await page.wait_for_function("!document.body?.innerText.toLowerCase().includes('click the button below to continue shopping')", timeout=10000)
+            except Exception as exc:
+                for response in responses:
+                    self._raise_for_response(response)
+                raise ChallengeDetected(message, kind='continue-shopping') from exc
+            finally:
+                page.remove_listener('response', record_navigation)
+            for response in responses:
+                self._raise_for_response(response)
+            if urlparse(page.url).netloc != url.netloc:
+                raise Attention('Unexpected destination after Continue shopping; review the browser')
+            await self.check(page)
+            return
 
         if any(x in body for x in ("verify it's you", "verify your identity", "additional verification required")):
             raise ChallengeDetected(

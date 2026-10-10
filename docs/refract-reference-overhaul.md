@@ -84,8 +84,9 @@ Group creation still has four inputs. Repeated resource shortcuts in Tools were
 removed after promoting those resources to the rail. Existing schemas, IDs,
 account relationships and per-task inheritance are unchanged.
 
-Execution remains: task start → capture configuration → shared anonymous stock
-monitor → account lock and browser slot → authenticated account recheck → guarded
+Execution remains: task start → capture configuration → verify/save account session
+→ shared anonymous stock monitor → account lock and browser slot → authenticated
+account recheck → guarded
 cart/checkout → durable submission intent → confirmed or uncertain outcome.
 Saved purchasing plans retain their separate journal, but share the same engine
 scheduling loop, account exclusion and resource bounds. None of this was replaced
@@ -237,8 +238,52 @@ grocery checkout workflow.
 Validation: 81 browser-adapter, monitor, core, compatibility-plan and execution
 tests passed. Nine local product layouts cover the supplied screenshot's state,
 actual stockouts, unknown layouts, disabled controls, hidden templates and normal
-purchasable stock. Restricted/unknown observations do not open account checkout
-contexts or cart items. Playwright MCP verified monitor badges, restrictions,
+purchasable stock. At this checkpoint, restricted/unknown observations did not
+open account checkout contexts or cart items; the session-first flow below
+updates the in-stock case to recheck in the assigned account. Playwright MCP
+verified monitor badges, restrictions,
 logs and product-feed consistency at desktop and narrow widths using intercepted
 read-only fixtures. Screenshots: `artifacts/monitor-availability-{1440,390}.png`.
 No live purchases were made. The running backend needs a restart to load the fix.
+
+
+## Session-first stock monitoring and ordinary confirmation handling
+
+Live task startup now verifies the assigned account's session and uses its saved
+credentials to sign in when needed. Account locks and bounded browser workers
+also cover this startup step. Verified sessions remain in the encrypted vault;
+startup browsers and leases are released before waiting for inventory. This
+avoids holding a checkout worker per waiting account.
+
+Anonymous monitors continue checking out-of-stock products at the configured
+interval. An inventory-available observation wakes assigned tasks even if the
+anonymous offer requires sign-in. Each task reacquires its own account session
+and checks purchase controls, price, seller, quantity and delivery restrictions
+before carting. Rejected offers do not authorize cart or checkout actions.
+Product selection rotates across available assigned inputs. Monitor-only tasks
+verify their account at startup but never cart. Existing order journals and
+uncertain-submission protections remain authoritative.
+
+The plain Amazon Continue shopping page receives one attempt at its unique,
+visible, enabled button. The current origin and form destination must both be
+Amazon and match. Recurring prompts, CAPTCHA and identity verification pause
+for review. A local browser fixture covers the complete Continue → sign-in →
+product/session-save sequence; no external requests or real orders are used.
+
+Retailer Retry-After values are no longer shortened to 15 minutes. Sign-in also
+respects these cooldowns; repeated responses require review. Cooldown transitions
+use the existing retry state. User-facing labels now include Signing in,
+Checking offer and Waiting for retailer. No polling implementation can guarantee
+that Amazon will never rate-limit or challenge a session.
+
+
+Validation: **141 regression tests passed** across monitor, browser, login,
+checkout/navigation, concurrency, core, task-group, persistence/infrastructure,
+account-consistency and original-workspace suites. Follow-up browser fixtures
+also verified HTTP 429/403 and CAPTCHA responses after Continue shopping, and
+actual repeated fixture scans from out-of-stock to a signed-in task's cart/quote.
+Long Retry-After tests mock time; they do not wait 30 minutes or send real traffic.
+Playwright MCP rechecked stock badges, restrictions, logs and product-feed
+consistency at 1440px and 390px. JavaScript syntax and diff whitespace checks
+passed. No live purchases were made. Existing server processes must restart to
+load the updated Python backend; reloading a browser tab alone is insufficient.

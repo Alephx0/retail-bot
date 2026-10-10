@@ -111,7 +111,7 @@ def test_resume_authentication_rechecks_interrupted_checkout(tmp_path, interrupt
 
         async def ensure_session(self, *args):
             self.login_checks += 1
-            if self.login_checks == 2:
+            if self.login_checks == 3:
                 raise AuthenticationRequired('Session expired')
 
         async def inspect(self, *args):
@@ -154,11 +154,11 @@ def test_resume_authentication_rechecks_interrupted_checkout(tmp_path, interrupt
                 break
             await asyncio.sleep(.01)
         assert store.get('tasks', task['id'])['status'] == 'attention', store.get('tasks', task['id'])['message']
-        assert adapter.login_checks == 2
+        assert adapter.login_checks == 3
         engine.resume(task['id'])
         await asyncio.wait_for(asyncio.gather(*list(engine.jobs.values())), 10)
         assert store.get('tasks', task['id'])['status'] == 'completed'
-        assert adapter.login_checks == 3
+        assert adapter.login_checks == 4
         assert adapter.carts == 2
         assert adapter.submissions == 0
         assert store.all('quotes')[0]['total'] == 21

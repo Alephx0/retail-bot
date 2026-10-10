@@ -115,7 +115,7 @@ class ProductMonitor:
                     backoffs += 1
                     if backoffs >= 3:
                         raise Attention('Repeated retailer backoffs; stop and restart after reviewing the connection') from exc
-                    delay = min(900, max(exc.retry_after_seconds or 0, 30 * 2 ** (backoffs - 1)))
+                    delay = max(exc.retry_after_seconds or 0, min(900, 30 * 2 ** (backoffs - 1)))
                     self.update('backing_off', f'Retailer requested a cooldown; next check in {delay:g}s')
                 except Attention:
                     raise

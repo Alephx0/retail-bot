@@ -38,6 +38,7 @@ class Adapter:
         self.carts = []
         self.account_gate = None
         self.monitor_error = None
+        self.authentications = []
 
     async def context(self, identity, proxy='', solver=''):
         context = Context(identity)
@@ -45,7 +46,8 @@ class Adapter:
         self.routes.append(proxy)
         return context
 
-    async def ensure_session(self, *args):
+    async def ensure_session(self, context, account, page):
+        self.authentications.append(account['id'])
         if self.account_gate:
             await self.account_gate.wait()
 
@@ -69,8 +71,8 @@ class Adapter:
         pass
 
 
-async def until(predicate):
-    async with asyncio.timeout(4):
+async def until(predicate, timeout=4):
+    async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(.01)
 
@@ -98,18 +100,22 @@ def test_shared_watchers_leave_account_free_and_close_on_last_stop(tmp_path):
             await engine.start(first['id'])
             await engine.start(second['id'])
             await until(lambda: len(engine.monitors.active)==2 and all(m.sequence for m in engine.monitors.active.values()))
-            assert len(engine.amazon.contexts)==2
+            monitor_contexts = [c for c in engine.amazon.contexts if c.identity['id'].startswith('monitor-')]
+            assert len(monitor_contexts)==2
+            assert len(engine.amazon.authentications)==4  # Both tasks verify sign-in and task connections.
+            assert all(c.closed for c in engine.amazon.contexts if c not in monitor_contexts)
             assert not engine.account_locks[account['id']].locked()
             assert engine.browser_slots._value==10
-            assert engine.amazon.routes==['', '']
-            identities = [context.identity for context in engine.amazon.contexts]
+            assert [route for context, route in zip(engine.amazon.contexts, engine.amazon.routes)
+                    if context in monitor_contexts] == ['', '']
+            identities = [context.identity for context in monitor_contexts]
             assert len({x['fingerprint_seed'] for x in identities})==2
             assert all('password' not in x and 'session' not in x for x in identities)
             assert all(account_fingerprint_settings({}, x)['fingerprint_backend']=='fingerprint-suite' for x in identities)
             assert all(len(m.subscribers)==2 for m in engine.monitors.active.values())
             await engine.stop(first['id'])
             assert len(engine.monitors.active)==2
-            assert not any(c.closed for c in engine.amazon.contexts)
+            assert not any(c.closed for c in monitor_contexts)
             await engine.stop(second['id'])
             assert not engine.monitors.active
             assert all(c.closed for c in engine.amazon.contexts)
@@ -143,7 +149,8 @@ def test_monitor_reports_inventory_without_authorizing_restricted_purchases(tmp_
             assert monitor.status == status
             assert message in monitor.message
             assert not engine.amazon.carts
-            assert len(engine.amazon.contexts) == 1  # Read-only anonymous monitor only.
+            assert sum(not c.closed for c in engine.amazon.contexts) == 1  # Only the watcher stays open.
+            assert len(engine.amazon.authentications) == (4 if availability == 'available' else 2)
             assert store.all('feed')[0]['availability_status'] == availability
             assert not store.all('feed')[0]['available']
             assert not engine.account_locks[account['id']].locked()
@@ -168,6 +175,116 @@ def test_task_assignment_ignores_stock_on_other_monitor(tmp_path):
             assert engine.amazon.carts==[(account['id'], 'B012345678')]
             assert waiting['id'] in engine.jobs
             assert not engine.account_locks[account['id']].locked()
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
+def test_start_verifies_session_then_stock_wakes_only_assigned_accounts(tmp_path):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        group = store.put('groups', {**group, 'delay_ms': 3500})
+        second_account = store.put('accounts', {**account, 'id': 'second-account', 'name': 'Second'})
+        first = task_record(store, group, account, monitor_asin='B012345678', use_account_proxy=True)
+        second = task_record(store, group, second_account, monitor_asin='B087654321', use_account_proxy=True)
+        sign_in = asyncio.Event()
+        engine.amazon.account_gate = sign_in
+        inspected_accounts = []
+        async def inspect(page, item, region):
+            anonymous = page.context.identity['id'].startswith('monitor-')
+            in_stock = item['asin'] in engine.amazon.stock
+            if not anonymous:
+                inspected_accounts.append((page.context.identity['id'], item['asin']))
+            return {**item, 'title': 'Grocery', 'price': .99,
+                    'available': in_stock and not anonymous,
+                    'availability_status': 'available' if in_stock else 'unavailable',
+                    'amazon_seller': True, 'seller': 'Amazon.com', 'condition': 'new'}
+        engine.amazon.inspect = inspect
+        try:
+            await engine.start(first['id'])
+            await until(lambda: engine.amazon.authentications)
+            assert not engine.monitors.active  # Sign-in must finish before monitoring.
+            sign_in.set()
+            await engine.start(second['id'])
+            await until(lambda: len(engine.monitors.active) == 2 and all(m.sequence >= 2 for m in engine.monitors.active.values()), timeout=10)
+            assert engine.amazon.authentications == [account['id'], second_account['id']]
+            assert all(not lock.locked() for lock in engine.account_locks.values())
+            assert engine.browser_slots._value == 10
+            assert not engine.amazon.carts
+            engine.amazon.stock.add('B012345678')
+            # The next real monitor scan must wake the account, even though its
+            # anonymous product observation has no usable purchase control.
+            await until(lambda: first['id'] not in engine.jobs, timeout=10)
+            assert engine.amazon.carts == [(account['id'], 'B012345678')]
+            assert inspected_accounts == [(account['id'], 'B012345678')]
+            assert engine.amazon.authentications == [account['id'], second_account['id'], account['id']]
+            assert second['id'] in engine.jobs
+            assert store.get('tasks', first['id'])['status']=='completed'
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
+def test_one_account_waiting_for_login_does_not_block_another(tmp_path):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        other = store.put('accounts', {**account, 'id': 'other-account'})
+        first = task_record(store, group, account, use_account_proxy=True)
+        second = task_record(store, group, other, use_account_proxy=True)
+        async def verify(context, identity, page):
+            if identity['id'] == account['id']:
+                await asyncio.Event().wait()
+        engine.amazon.ensure_session = verify
+        try:
+            await engine.start(first['id'])
+            await until(lambda: store.get('tasks', first['id'])['status']=='authenticating')
+            await engine.start(second['id'])
+            await until(lambda: engine.monitors.active and all(m.sequence for m in engine.monitors.active.values()))
+            assert engine.account_locks[account['id']].locked()
+            assert not engine.account_locks[other['id']].locked()
+            await engine.stop(first['id'])
+            assert not engine.account_locks[account['id']].locked()
+            assert engine.browser_slots._value == 10
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
+def test_session_and_monitor_honor_long_retailer_cooldown(tmp_path):
+    from unittest.mock import AsyncMock, patch
+    from retail.amazon import BackoffRequired
+    from retail.monitors import ProductMonitor
+    from retail.runner import TaskRunner
+
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        task = task_record(store, group, account)
+        limited = BackoffRequired('Slow down', status=429, retry_after_seconds=1800)
+        context = Context(account)
+        engine.amazon.ensure_session = AsyncMock(side_effect=[limited, None])
+        try:
+            engine.status(task['id'], 'starting', 'Starting')
+            with patch('retail.runner.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                await TaskRunner(engine).verify_account_session(task['id'], engine.amazon, context, account, Page(context))
+                sleep.assert_awaited_once_with(1800)
+            assert engine.amazon.ensure_session.await_count == 2
+            saved = store.get('tasks', task['id'])
+            assert saved['retry_after_seconds'] == 1800
+            assert saved['status'] == 'authenticating'
+            assert not engine.amazon.carts
+
+            engine.monitors.group_slots[group['id']] = asyncio.Semaphore(1)
+            monitor = ProductMonitor(engine.monitors, 'fixture', group, monitor_items(store, group)[0], 'US', False)
+            engine.amazon.inspect = AsyncMock(side_effect=[limited, asyncio.CancelledError()])
+            with patch('retail.monitors.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                with pytest.raises(asyncio.CancelledError):
+                    await monitor.run()
+                sleep.assert_awaited_once_with(1800)
+            assert all(c.closed for c in engine.amazon.contexts)
+            assert not engine.amazon.carts
         finally:
             await engine.close()
             store.db.close()
@@ -245,7 +362,7 @@ def test_monitor_challenge_stops_without_carting_or_recreating_identity(tmp_path
             await until(lambda: task['id'] not in engine.jobs)
             assert store.get('tasks', task['id'])['status']=='error'
             assert not engine.amazon.carts
-            assert len(engine.amazon.contexts)==1
+            assert len([c for c in engine.amazon.contexts if c.identity['id'].startswith('monitor-')])==1
             assert engine.monitors.snapshot()[0]['status']=='attention'
             assert not engine.account_locks[account['id']].locked()
         finally:

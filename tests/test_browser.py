@@ -36,7 +36,8 @@ def test_amazon_browser_adapter_with_fixtures():
             with pytest.raises(ChallengeDetected, match='No automated solve was attempted'):
                 await adapter.check(page)
             await page.set_content('<body>Click the button below to continue shopping<button>Continue shopping</button></body>')
-            with pytest.raises(ChallengeDetected,match='Continue shopping confirmation'):
+            page._retail_continue_attempted = True
+            with pytest.raises(ChallengeDetected,match='Continue shopping could not'):
                 await adapter.check(page)
             await browser.close()
     asyncio.run(scenario())
@@ -110,4 +111,68 @@ def test_stock_is_distinct_from_purchase_controls_and_delivery_restrictions():
                 await page.unroute_all()
             await browser.close()
 
+    asyncio.run(scenario())
+
+
+def test_continue_shopping_is_bounded_and_does_not_click_challenges_or_foreign_forms():
+    async def scenario():
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            adapter = Amazon(None)
+            async def local(route):
+                await route.fulfill(content_type='text/html', body='<body>Fixture</body>')
+            cases = [
+                ('', '', True),
+                ('<input id="captchacharacters">Robot check', '', False),
+                ('Verify your identity', '', False),
+                ('<button>Continue shopping</button>', '', False),
+                ('', 'https://foreign.test/submit', False),
+            ]
+            for extra, action, allowed in cases:
+                page = await browser.new_page()
+                await page.route('**/*', local)
+                await page.goto('https://www.amazon.com/dp/B012345678')
+                await page.set_content(f'''<body>Click the button below to continue shopping
+                    <form action="{action}"><button onclick="event.preventDefault(); window.clicks++; document.body.innerHTML='<h1>Product</h1>'">Continue shopping</button></form>{extra}
+                    <script>window.clicks=0</script></body>''')
+                if allowed:
+                    await adapter.check(page)
+                    assert await page.evaluate('window.clicks', isolated_context=False) == 1
+                    # A repeated prompt on the same page must stop, not loop.
+                    await page.set_content('<body>Click the button below to continue shopping<button>Continue shopping</button></body>')
+                    with pytest.raises(ChallengeDetected):
+                        await adapter.check(page)
+                    assert await page.evaluate('window.clicks', isolated_context=False) == 1
+                else:
+                    with pytest.raises(ChallengeDetected):
+                        await adapter.check(page)
+                    assert await page.evaluate('window.clicks', isolated_context=False) == 0
+                await page.close()
+            await browser.close()
+    asyncio.run(scenario())
+
+
+def test_continue_navigation_preserves_rate_limit_and_challenge_guards():
+    async def scenario():
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            adapter = Amazon(None)
+            for status, body, error in [(429, 'Slow down', BackoffRequired),
+                                        (403, 'Access denied', AccessDenied),
+                                        (200, 'Robot check<input id="captchacharacters">', ChallengeDetected)]:
+                page = await browser.new_page()
+                async def local(route):
+                    from urllib.parse import urlparse
+                    if urlparse(route.request.url).path == '/continue-shopping':
+                        await route.fulfill(status=status, body=body, headers={'Retry-After': '1800'}, content_type='text/html')
+                    else:
+                        await route.fulfill(body='<body>Click the button below to continue shopping<form action="/continue-shopping"><button>Continue shopping</button></form></body>', content_type='text/html')
+                await page.route('**/*', local)
+                await page.goto('https://www.amazon.com/dp/B012345678')
+                with pytest.raises(error) as result:
+                    await adapter.check(page)
+                if status == 429:
+                    assert result.value.retry_after_seconds == 1800
+                await page.close()
+            await browser.close()
     asyncio.run(scenario())

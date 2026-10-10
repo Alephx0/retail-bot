@@ -145,7 +145,8 @@ def test_shared_monitor_keeps_checkout_context_capacity_available(tmp_path):
             await asyncio.sleep(.01)
         assert store.get('tasks', tasks[1]['id'])['status'] == 'waiting'
         assert all(not lock.locked() for lock in engine.account_locks.values())
-        assert adapter.max_contexts == 1
+        assert adapter.open_contexts == 1  # Sign-in preflights release their workers.
+        assert adapter.max_contexts == 2
         adapter.release_first.set()
         await asyncio.wait_for(asyncio.gather(*list(engine.jobs.values())), 10)
         assert adapter.max_contexts == 2  # One shared monitor plus one checkout worker.

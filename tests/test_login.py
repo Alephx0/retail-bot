@@ -84,3 +84,48 @@ def test_manual_login_is_saved_automatically_after_verification(tmp_path):
         store.db.close()
 
     asyncio.run(scenario())
+
+
+def test_product_start_continues_shopping_then_signs_in_and_saves_session(tmp_path):
+    async def scenario():
+        store = Store(tmp_path)
+        account = store.put('accounts', Account(name='Fixture', email='fixture@example.com', password='fixture-password').model_dump())
+        adapter = Amazon(store)
+        state = {'continued': False, 'signed_in': False}
+        paths = []
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            async def route_handler(route):
+                from urllib.parse import urlparse
+                path = urlparse(route.request.url).path
+                paths.append(path)
+                if path == '/continue-shopping':
+                    state['continued'] = True
+                if path == '/verified':
+                    state['signed_in'] = True
+                if not state['continued']:
+                    html = '<body>Click the button below to continue shopping<form action="/continue-shopping" method="post"><button>Continue shopping</button></form></body>'
+                elif path == '/ap/signin':
+                    html = '<form action="/password" method="post"><input id="ap_email" name="email"><button id="continue">Continue</button></form>'
+                elif path == '/password':
+                    html = '<form action="/verified" method="post"><input id="ap_password" name="password" type="password"><button id="signInSubmit">Sign in</button></form>'
+                else:
+                    label = 'Hello, Fixture' if state['signed_in'] else 'Hello, sign in'
+                    html = f'<a href="/ap/signin" id="nav-link-accountList"><span class="nav-line-1">{label}</span></a><div id="availability">In Stock</div>'
+                await route.fulfill(body=html, content_type='text/html')
+            await page.route('**/*', route_handler)
+            page._retail_start_url = 'https://www.amazon.com/dp/B012345678'
+            adapter.context_accounts[context] = account
+            await adapter.ensure_session(context, account, page)
+            assert state == {'continued': True, 'signed_in': True}
+            assert paths.count('/continue-shopping') == 1
+            assert '/ap/signin' in paths and '/password' in paths and '/verified' in paths
+            assert page.url == page._retail_start_url
+            saved = store.get('accounts', account['id'])
+            assert saved['logged_in'] and saved['session_saved_at']
+            assert 'cookies' in saved['session']
+            await browser.close()
+        store.db.close()
+    asyncio.run(scenario())

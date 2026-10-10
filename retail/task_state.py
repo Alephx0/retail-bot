@@ -15,6 +15,7 @@ STATES = {
     'review':('MANUAL_ACTION_REQUIRED','MANUAL_ACTION_REQUIRED'),
     'attention':('MANUAL_ACTION_REQUIRED','MANUAL_ACTION_REQUIRED'),
     'retrying':('RETRY_WAIT','RETRY_SCHEDULED'),
+    'backing_off':('RETRY_WAIT','RETAILER_COOLDOWN'),
     'error':('FAILED','TASK_FAILED'),
     'stopped':('STOPPED','TASK_STOPPED'),
 }

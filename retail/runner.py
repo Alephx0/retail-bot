@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from .account_consistency import PurchaseCooldown
 from .amazon import Amazon, Attention, AuthenticationRequired, ChallengeDetected, BackoffRequired, AccessDenied, CartRejected
-from .models import Group, Task, eligible, inputs, rejection_reasons, DOMAINS
+from .models import Group, Task, eligible, inputs, rejection_reasons, stock_observation, DOMAINS
 from .store import now
 from .adapters import CartService, CheckoutService
 from .monitors import MonitorUnavailable, monitor_items
@@ -27,9 +27,9 @@ class TaskRunner:
             await asyncio.gather(*owners, return_exceptions=True)
 
     async def wait_for_backoff(self, id, exc, event_count):
-        """Apply a bounded cooldown without consuming the generic error budget."""
+        """Back off without shortening a retailer's Retry-After instruction."""
         floor = 30 * (2 ** min(max(event_count - 1, 0), 3))
-        delay = min(900, max(exc.retry_after_seconds or 0, floor))
+        delay = max(exc.retry_after_seconds or 0, min(900, floor))
         self.status(
             id,
             'backing_off',
@@ -40,17 +40,31 @@ class TaskRunner:
         )
         await asyncio.sleep(delay)
 
-    async def recover_authentication(self, id, adapter, context, account, page):
-        """Keep this exact context alive; resume only after login is verified."""
+    async def verify_account_session(self, id, adapter, context, account, page):
+        """Verify or sign in on this connection, retaining it for manual review."""
+        backoffs = 0
         while True:
-            self.status(id, 'authenticating', 'Rechecking the interrupted account session')
+            self.status(id, 'authenticating', 'Verifying account session; signing in if needed')
             try:
                 await adapter.ensure_session(context, account, page)
-                page._retail_agent_attempts = set()  # Fresh DOM after login.
                 await self.hide_if_background(adapter, page)
                 return self.store.get('accounts', account['id']) or account
+            except BackoffRequired as exc:
+                backoffs += 1
+                await self.wait_for_backoff(id, exc, backoffs)
+                if backoffs >= 3:
+                    await self.pause(id, 'attention', 'Repeated retailer cooldowns during sign-in. Review the account connection before resuming.')
+                    backoffs = 0
+            except AccessDenied:
+                await self.pause(id, 'attention', 'Amazon denied access during sign-in. Check the visible browser and account connection; Resume rechecks the session.')
             except Attention as exc:
-                await self.pause(id, 'attention', str(exc) + ' Complete verification in View Browser, then Resume; the interrupted step will be rechecked.')
+                await self.pause(id, 'attention', str(exc))
+
+    async def recover_authentication(self, id, adapter, context, account, page):
+        """Keep this exact context alive; resume only after login is verified."""
+        account = await self.verify_account_session(id, adapter, context, account, page)
+        page._retail_agent_attempts = set()  # Fresh DOM after login.
+        return account
 
     async def run(self, id):
         account_lock = None
@@ -82,6 +96,66 @@ class TaskRunner:
                         return
             items = monitor_items(self.store, group, task)
             account = self.store.get('accounts', task['account_id']) or {'region': 'US'}
+            async def prepare_account():
+                nonlocal account_lock, lock_acquired, slot_acquired, account, context
+                account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
+                if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
+                await account_lock.acquire()
+                lock_acquired=True
+                self.engine.check_pending_order(task['account_id'])
+                if task['checkout_mode'] in ('review', 'automatic'):
+                    policy_account = self.store.get('accounts', task['account_id'])
+                    current = datetime.now(timezone.utc)
+                    eligible_at = PurchaseCooldown(self.store).eligible_at(
+                        task['account_id'], policy_account.get('purchase_cooldown_days', 0), current)
+                    if eligible_at > current:
+                        self.status(id, 'stopped', 'Account purchase cooldown: start again after ' + eligible_at.isoformat())
+                        return False
+                if self.browser_slots.locked():
+                    self.status(id, 'in_queue', 'Waiting for an available browser worker')
+                await self.browser_slots.acquire()
+                slot_acquired=True
+                while task['account_id'] in getattr(adapter, 'logins', {}):
+                    self.status(id, 'in_queue', 'Waiting for the account login browser to close')
+                    await asyncio.sleep(0.5)
+                account = self.store.get("accounts", task["account_id"])
+                account_proxy = account.get("proxy") or self.proxy(account.get("proxy_list_id", ""), account["id"])
+                connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)
+                if account_proxy and account_proxy != connection:
+                    self.status(id, 'authenticating', 'Preparing account session on its sign-in connection')
+                    login_context = await adapter.context(account, account_proxy, task["solver_id"])
+                    try:
+                        login_page = await login_context.new_page()
+                        await self.hide_if_background(adapter, login_page)
+                        login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
+                        self.pages[id] = [login_page]
+                        account = await self.verify_account_session(id, adapter, login_context, account, login_page)
+                    finally:
+                        await self.close_context(adapter, login_context)
+                context = await adapter.context(account, connection, task["solver_id"])
+                context._retail_task_id = id
+                login_page = await context.new_page()
+                await self.hide_if_background(adapter, login_page)
+                login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
+                self.pages[id] = [login_page]
+                account = await self.verify_account_session(id, adapter, context, account, login_page)
+                self.status(id, 'ready', 'Account session verified')
+                return True
+
+            # Verify and save the session before joining any stock watcher. Free
+            # its browser slot and account lease while waiting for inventory.
+            if not task['simulation']:
+                if not await prepare_account():
+                    return
+                await self.diagnostics.finish_trace(id, context)
+                await self.close_context(adapter, context)
+                context = None
+                self.pages.pop(id, None)
+                account_lock.release()
+                lock_acquired = False
+                self.browser_slots.release()
+                slot_acquired = False
+
             monitors = self.monitors.subscribe(task, group, items, account['region'])
             seen_observations = {}
             pages = []
@@ -89,6 +163,7 @@ class TaskRunner:
             attempts, successes = 0, 0
             rate_limit_events = 0
             seen_offers = set()
+            next_monitor = 0
             while True:
                 latest = self.store.get("groups", group["id"])
                 group["delay_ms"] = latest.get("delay_ms", 4500)
@@ -118,77 +193,28 @@ class TaskRunner:
                             seen_offers.add(product["offer_id"])
                             self.store.event(id, "offer_found", f"Offer ID found for {item['asin']}")
                             await self.notify(task, f"Offer ID found for {item['asin']}")
-                        if chosen is None and eligible(product, item, group, defer_unknown_seller=task['checkout_mode'] != 'monitor'):
+                    # Shared anonymous stock is a signal to inspect the offer in
+                    # the signed-in account, not permission to mutate a cart.
+                    # Rotate across available inputs so one rejected offer cannot
+                    # starve another assigned product.
+                    for offset in range(len(products)):
+                        index = (next_monitor + offset) % len(products)
+                        if (eligible(products[index], items[index], group) if task['simulation']
+                                else stock_observation(products[index])[0] == 'available'):
                             chosen = index
+                            next_monitor = (index + 1) % len(products)
+                            break
                     if chosen is None or task["checkout_mode"] == "monitor":
                         reasons = [f"{p['asin']}: " + '; '.join(rejection_reasons(p, i, group)) for p, i in zip(products, items) if rejection_reasons(p, i, group)]
                         message = ' | '.join(reasons)[:1600] or 'Monitor-only task: matching stock found; checkout is disabled for this task'
                         self.status(id, "waiting", message)
                         continue
-                    self.status(id,"product_found","Eligible product found")
+                    self.status(id,"product_found","Stock detected; checking the assigned account offer")
                     product = products[chosen]
-                    if not task["simulation"] and context is None:
-                        account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
-                        if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
-                        await account_lock.acquire()
-                        lock_acquired=True
-                        self.engine.check_pending_order(task['account_id'])
-                        if task['checkout_mode'] in ('review', 'automatic'):
-                            policy_account = self.store.get('accounts', task['account_id'])
-                            current = datetime.now(timezone.utc)
-                            eligible_at = PurchaseCooldown(self.store).eligible_at(
-                                task['account_id'], policy_account.get('purchase_cooldown_days', 0), current)
-                            if eligible_at > current:
-                                self.status(id, 'stopped', 'Account purchase cooldown: start again after ' + eligible_at.isoformat())
-                                return
-                        if self.browser_slots.locked():
-                            self.status(id, 'in_queue', 'Waiting for an available browser worker')
-                        await self.browser_slots.acquire()
-                        slot_acquired=True
-                        while task['account_id'] in getattr(adapter, 'logins', {}):
-                            self.status(id, 'in_queue', 'Waiting for the account login browser to close')
-                            await asyncio.sleep(0.5)
-                        account = self.store.get("accounts", task["account_id"])
-                        account_proxy = account.get("proxy") or self.proxy(account.get("proxy_list_id", ""), account["id"])
-                        connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)
-                        if account_proxy and account_proxy != connection:
-                            self.status(id, 'authenticating', 'Preparing account session on its sign-in connection')
-                            login_context = await adapter.context(account, account_proxy, task["solver_id"])
-                            try:
-                                login_page = await login_context.new_page()
-                                await self.hide_if_background(adapter, login_page)
-                                login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
-                                self.pages[id] = [login_page]
-                                while True:
-                                    try:
-                                        await adapter.ensure_session(login_context, account, login_page)
-                                        break
-                                    except AccessDenied:
-                                        await self.pause(id, 'attention', 'Amazon denied access during sign-in. Check the visible browser and account connection; Resume rechecks the session.')
-                                    except Attention as exc:
-                                        await self.pause(id, "attention", str(exc))
-                                account = self.store.get("accounts", account["id"])
-                            finally:
-                                await self.close_context(adapter, login_context)
-                        context = await adapter.context(account, connection, task["solver_id"])
-                        context._retail_task_id = id
-                        login_page = await context.new_page()
-                        await self.hide_if_background(adapter, login_page)
-                        login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
-                        self.pages[id] = [login_page]
-                        while True:
-                            self.status(id, "authenticating", "Preparing account session")
-                            try:
-                                await adapter.ensure_session(context, account, login_page)
-                                account = self.store.get("accounts", account["id"])
-                                await self.hide_if_background(adapter, login_page)
-                                self.status(id, 'ready', 'Account session ready; rechecking monitored product')
-                                self.status(id, 'product_found', 'Rechecking stock in the account session')
-                                break
-                            except AccessDenied:
-                                await self.pause(id, 'attention', 'Amazon denied access during sign-in. Check the visible browser and account connection; Resume rechecks the session.')
-                            except Attention as exc:
-                                await self.pause(id, "attention", str(exc))
+                    if not task['simulation'] and context is None:
+                        if not await prepare_account():
+                            return
+                        self.status(id, 'product_found', 'Rechecking stock in the account session')
 
                     checkout_page = None
                     if not task["simulation"]:
