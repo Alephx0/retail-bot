@@ -314,3 +314,36 @@ not complete within the 15-second reproduction deadline. Tests use local page
 fixtures and never place orders. Added coverage includes headed startup with
 saved cookies/localStorage in both profile modes, prewarming, account verification
 before carting, browser reuse, cancellation and independent context cleanup.
+
+## Measured task-start optimizations
+
+Sign-in now waits for the next supported form, account header, or review condition
+instead of sleeping 800ms after each email/password/OTP submission. A transient
+empty DOM is not success. Rejected credentials and CAPTCHA stop automatic input;
+stalled forms pause after a bounded wait. Final account verification, encrypted
+session capture and checkout guards still run. Restock preparation opens the
+selected product directly instead of the group's first product.
+
+Worker initialization now reads the allocated loopback HTTP endpoint through a
+bounded standard-library connection off the event loop. This avoids approximately
+274ms of measured TLS-client initialization for a connection that never uses TLS.
+It rejects redirects, oversized responses, remote hosts and mismatched ports.
+The existing browser-ownership check and worker initialization remain in place.
+
+Reproduce with `python scripts/benchmark_task_startup.py --samples 5`. Compare to
+`9668b27` using the same script. Windows, Chrome, warmed engine/hardware, synthetic
+account and locally fulfilled sign-in pages; no custom extensions or retailer
+requests. Five samples per metric, median milliseconds:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Warmed browser + page | 1160.9 | 836.6 |
+| Email/password fixture login | 1814.9 | 247.5 |
+
+These are component timings, not live task/checkout guarantees. They exclude cold
+hardware probing, custom extension costs, Amazon latency, MFA and manual review.
+The 64-test login/navigation/worker/checkout/monitor/concurrency suite passed;
+32 follow-up tests passed for core execution and selected-product restock, along
+with an additional real-browser OTP fixture. Fixtures cover delayed form swaps,
+bad passwords, CAPTCHA, cancellation, isolated worker realms, restarts, uncertain
+orders and bounded checkout concurrency. No real purchases were made.

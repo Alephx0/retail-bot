@@ -6,10 +6,10 @@ scripts, URLs, service-worker registrations, caches and CSP stay intact.
 import asyncio
 import json
 import socket
+from http.client import HTTPConnection
 from collections import Counter
 from urllib.parse import urlsplit
 
-import httpx
 from websockets.asyncio.client import connect
 
 
@@ -17,6 +17,27 @@ def debugging_port():
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         return listener.getsockname()[1]
+
+
+def debugger_endpoint(port):
+    """Read only the allocated loopback endpoint; no proxies or redirects."""
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('Invalid local debugger port')
+    connection = HTTPConnection('127.0.0.1', port, timeout=5)
+    try:
+        connection.request('GET', '/json/version')
+        response = connection.getresponse()
+        body = response.read(65537)
+        if response.status != 200 or len(body) > 65536:
+            raise RuntimeError('Local browser debugger returned an invalid response')
+        endpoint = json.loads(body)['webSocketDebuggerUrl']
+        parsed = urlsplit(endpoint)
+        if (parsed.scheme != 'ws' or parsed.hostname != '127.0.0.1' or parsed.port != port
+                or parsed.username or parsed.password):
+            raise RuntimeError('Worker profile endpoint must use the allocated loopback port')
+        return endpoint
+    finally:
+        connection.close()
 
 
 class WorkerProfiles:
@@ -43,13 +64,9 @@ class WorkerProfiles:
             expected = await session.send('Target.createTarget', {'url': 'about:blank'})
         finally:
             await session.detach()
-        async with httpx.AsyncClient(trust_env=False, timeout=5) as client:
-            response = await client.get(f'http://127.0.0.1:{port}/json/version')
-            response.raise_for_status()
-            endpoint = response.json()['webSocketDebuggerUrl']
-        parsed = urlsplit(endpoint)
-        if parsed.scheme != 'ws' or parsed.hostname != '127.0.0.1' or parsed.port != port:
-            raise RuntimeError('Worker profile endpoint must use the allocated loopback port')
+        # Avoid constructing a TLS client/certificate store for plain loopback
+        # HTTP. Keep socket I/O off the scheduling/event loop.
+        endpoint = await asyncio.to_thread(debugger_endpoint, port)
         instance = cls(await connect(endpoint, proxy=None, max_size=8 * 1024 * 1024), script)
         try:
             actual = await instance.send('Target.getTargetInfo', {'targetId': expected['targetId']})

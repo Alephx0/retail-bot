@@ -282,6 +282,34 @@ def test_stock_during_signin_reuses_verified_browser_without_early_carting(tmp_p
     asyncio.run(scenario())
 
 
+def test_restock_session_opens_the_selected_product_without_extra_navigation(tmp_path):
+    async def scenario():
+        store, group, account, engine = fixture(tmp_path)
+        task = task_record(store, group, account, use_account_proxy=True)
+        starts = []
+        verify = engine.amazon.ensure_session
+        async def capture(context, identity, page):
+            starts.append(page._retail_start_url)
+            await verify(context, identity, page)
+        engine.amazon.ensure_session = capture
+        try:
+            await engine.start(task['id'])
+            await until(lambda: store.get('tasks', task['id'])['status'] == 'waiting'
+                        and not engine.account_locks[account['id']].locked())
+            engine.amazon.stock.add('B087654321')
+            monitor = next(m for m in engine.monitors.active.values() if m.item['asin'] == 'B087654321')
+            monitor.product['available'] = True
+            monitor.sequence += 1
+            monitor.update('in_stock', 'Fixture restock')
+            await until(lambda: task['id'] not in engine.jobs)
+            assert starts == ['https://www.amazon.com/dp/B012345678', 'https://www.amazon.com/dp/B087654321']
+            assert engine.amazon.carts == [(account['id'], 'B087654321')]
+        finally:
+            await engine.close()
+            store.db.close()
+    asyncio.run(scenario())
+
+
 def test_session_and_monitor_honor_long_retailer_cooldown(tmp_path):
     from unittest.mock import AsyncMock, patch
     from retail.amazon import BackoffRequired

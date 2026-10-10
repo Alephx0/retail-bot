@@ -11,6 +11,42 @@ from retail.store import Store
 from fastapi.testclient import TestClient
 
 
+@pytest.mark.parametrize('case', ['valid', 'redirect', 'foreign', 'wrong_port', 'oversize'])
+def test_debugger_discovery_is_bounded_and_local(case):
+    import json
+    from retail.worker_profiles import debugger_endpoint
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            requests.append(self.path)
+            endpoint = f'ws://127.0.0.1:{self.server.server_port}/devtools/browser/fixture'
+            if case == 'foreign': endpoint = 'ws://example.com:80/devtools/browser/fixture'
+            if case == 'wrong_port': endpoint = 'ws://127.0.0.1:1/devtools/browser/fixture'
+            body = json.dumps({'webSocketDebuggerUrl': endpoint}).encode()
+            if case == 'oversize': body = b' ' * 65537
+            self.send_response(302 if case == 'redirect' else 200)
+            self.send_header('Location', 'http://example.com/')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        if case == 'valid':
+            assert debugger_endpoint(server.server_port).startswith(f'ws://127.0.0.1:{server.server_port}/')
+        else:
+            with pytest.raises(RuntimeError):
+                debugger_endpoint(server.server_port)
+        assert requests == ['/json/version']
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize('flag', ['canvas', 'webgl', 'webgpu'])
 def test_graphics_profiles_require_owned_browser(tmp_path, flag):
     with TestClient(create_app(tmp_path), headers={'X-Retail-Client': 'dashboard'}) as client:

@@ -101,8 +101,9 @@ class TaskRunner:
             monitors = self.monitors.subscribe(task, group, items, account['region'])
             seen_observations = {}
             startup_products = None
-            async def prepare_account():
+            async def prepare_account(start_item=None):
                 nonlocal account_lock, lock_acquired, slot_acquired, account, context
+                start_item = start_item or items[0]
                 account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
                 if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
                 await account_lock.acquire()
@@ -132,7 +133,7 @@ class TaskRunner:
                     try:
                         login_page = await login_context.new_page()
                         await self.hide_if_background(adapter, login_page)
-                        login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
+                        login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{start_item['asin']}" if group['retailer'] == 'amazon' else None
                         self.pages[id] = [login_page]
                         account = await self.verify_account_session(id, adapter, login_context, account, login_page)
                     finally:
@@ -142,7 +143,7 @@ class TaskRunner:
                 context._retail_task_id = id
                 login_page = await context.new_page()
                 await self.hide_if_background(adapter, login_page)
-                login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{items[0]['asin']}" if group['retailer'] == 'amazon' else None
+                login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{start_item['asin']}" if group['retailer'] == 'amazon' else None
                 self.pages[id] = [login_page]
                 context._retail_task_login_page = login_page
                 account = await self.verify_account_session(id, adapter, context, account, login_page)
@@ -217,7 +218,7 @@ class TaskRunner:
                     self.status(id,"product_found","Stock detected; checking the assigned account offer")
                     product = products[chosen]
                     if not task['simulation'] and context is None:
-                        if not await prepare_account():
+                        if not await prepare_account(items[chosen]):
                             return
                         self.status(id, 'product_found', 'Rechecking stock in the account session')
 

@@ -16,7 +16,7 @@ from .fingerprint_suite import build_profile as build_suite_profile
 from . import us_fingerprint, proxy_location, behavior
 from urllib.parse import urlparse, urljoin
 
-from patchright.async_api import async_playwright
+from patchright.async_api import async_playwright, TimeoutError as BrowserTimeoutError
 
 from .models import DOMAINS, proxy_config, Settings, account_fingerprint_settings
 from .identity import IdentityService
@@ -580,6 +580,24 @@ class Amazon:
             if self.login_watchers.get(account_id) is asyncio.current_task():
                 self.login_watchers.pop(account_id, None)
 
+    async def wait_for_signin_step(self, page, selector):
+        """Advance when the submitted form changes, without a fixed delay."""
+        try:
+            await page.wait_for_function('''selector => {
+                const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+                const oldVisible = [...document.querySelectorAll(selector)].some(visible);
+                const error = [...document.querySelectorAll('#auth-error-message-box, #auth-warning-message-box, #captchacharacters')].some(visible);
+                const next = [...document.querySelectorAll('#ap_email, #ap_password, #auth-mfa-otpcode, #cvf-input-code, #nav-link-accountList .nav-line-1')].some(visible);
+                const challenge = /verify your identity|verify it's you|additional verification required|robot check|click the button below to continue shopping/i.test(document.body?.innerText || '');
+                return error || challenge || (!oldVisible && next);
+            }''', arg=selector, timeout=10000)
+        except BrowserTimeoutError as exc:
+            raise AuthenticationRequired('Sign-in did not advance. Review the task browser, then Resume.') from exc
+        if await page.locator('#captchacharacters:visible').count():
+            raise ChallengeDetected('Amazon requires CAPTCHA verification. Complete it in the task browser, then Resume.', kind='captcha')
+        if await page.locator('#auth-error-message-box:visible, #auth-warning-message-box:visible').count():
+            raise AuthenticationRequired('Amazon could not complete sign-in. Review the account details in the task browser, then Resume.')
+
     async def authenticate(self, page, account):
         """Fill only the current account's Amazon sign-in fields, with bounded steps."""
         for _ in range(6):
@@ -588,9 +606,11 @@ class Amazon:
             if await page.locator("#ap_email:visible").count() and account.get("email"):
                 await behavior.fill(page, page.locator("#ap_email"), account["email"])
                 await behavior.click(page, page.locator("#continue"))
+                await self.wait_for_signin_step(page, '#ap_email')
             elif await page.locator("#ap_password:visible").count() and account.get("password"):
                 await behavior.fill(page, page.locator("#ap_password"), account["password"])
                 await behavior.click(page, page.locator("#signInSubmit"))
+                await self.wait_for_signin_step(page, '#ap_password')
             elif await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
                 try:
                     await self.fill_otp(page, account)
@@ -598,7 +618,6 @@ class Amazon:
                     return
             else:
                 return
-            await page.wait_for_timeout(800)
 
     async def fill_otp(self, page, account):
         if urlparse(page.url).hostname not in DOMAINS.values():
@@ -611,7 +630,7 @@ class Amazon:
         submit = page.locator("#auth-signin-button:visible, input[aria-labelledby='cvf-submit-otp-button-announce']:visible, #cvf-submit-otp-button input:visible").first
         if await submit.count():
             await behavior.click(page, submit)
-            await page.wait_for_timeout(800)
+            await self.wait_for_signin_step(page, '#auth-mfa-otpcode, #cvf-input-code')
 
     async def register(self, account):
         if not account.get("email") or not account.get("password"):
