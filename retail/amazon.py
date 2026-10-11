@@ -39,6 +39,19 @@ def money(text: str) -> float | None:
     return float(match[1].replace(",", "")) if match else None
 
 
+def same_product_page(actual, expected):
+    """Amazon may decorate/redirect a product URL without changing the ASIN."""
+    a, b = urlparse(actual), urlparse(expected or '')
+    if (a.scheme != 'https' or b.scheme != 'https' or a.netloc != b.netloc
+            or a.hostname not in DOMAINS.values() or a.username or a.password):
+        return False
+    def product(path):
+        match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})(?:/|$)', path, re.I)
+        return match[1].upper() if match else None
+    target = product(b.path)
+    return bool(target and product(a.path) == target)
+
+
 class Attention(Exception):
     pass
 
@@ -689,18 +702,21 @@ class Amazon:
     @timed('Verify account session')
     async def ensure_session(self, context, account, page):
         """Prepare and verify a login in the same context the checkout will use."""
+        page._retail_initial_product = None
+        start_url = getattr(page, '_retail_start_url', None)
         # On Resume, inspect the existing challenge first. Navigating away from
         # an MFA/passkey page can invalidate the user's in-progress verification.
-        if urlparse(page.url).hostname in DOMAINS.values() and ("/ap/" in urlparse(page.url).path or await page.locator("#ap_email, #ap_password, #auth-mfa-otpcode, #captchacharacters").count()):
+        resuming_auth = urlparse(page.url).hostname in DOMAINS.values() and ("/ap/" in urlparse(page.url).path or await page.locator("#ap_email, #ap_password, #auth-mfa-otpcode, #captchacharacters").count())
+        if resuming_auth:
             await self.authenticate(page, account)
             await self.check(page)
-        await self.navigate(page, getattr(page, '_retail_start_url', None) or f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
+        if not (resuming_auth and same_product_page(page.url, start_url)):
+            await self.navigate(page, start_url or f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until="domcontentloaded")
         if 'click the button below to continue shopping' in (await page.locator('body').inner_text()).lower():
             await self.check(page)
-        start_url = getattr(page, '_retail_start_url', None)
         # Product pages do not redirect signed-out shoppers automatically, unlike
         # Your Orders. Follow only Amazon's own sign-in link when needed.
-        label = await self.text(page, "#nav-link-accountList .nav-line-1")
+        label = await self.wait_session_header(page)
         if start_url and 'sign in' in label.lower():
             sign_in = page.locator('#nav-link-accountList')
             href = await sign_in.evaluate("e => e.href || ''") if await sign_in.count() == 1 else ''
@@ -709,15 +725,18 @@ class Amazon:
                 await self.navigate(page, href, wait_until='domcontentloaded')
             else:
                 raise AuthenticationRequired('Sign in in the task browser, then Resume. The product page shows a signed-out session.')
-        await self.authenticate(page, account)
+        if not label or 'sign in' in label.lower():
+            await self.authenticate(page, account)
         await self.check(page)
-        if start_url and page.url != start_url:
+        if start_url and not same_product_page(page.url, start_url):
             await self.navigate(page, start_url, wait_until='domcontentloaded')
             await self.check(page)
-        label = await self.text(page, "#nav-link-accountList .nav-line-1")
+        label = await self.wait_session_header(page)
         if not label or "sign in" in label.lower() or "/ap/" in page.url:
             raise AuthenticationRequired("Account sign-in is not verified. Complete login in this browser, then Resume.")
-        page._retail_initial_product = page.url if getattr(page, '_retail_start_url', None) == page.url else None
+        # Single-use, account-context-local navigation handoff; offer and access
+        # checks still read the live document immediately before carting.
+        page._retail_initial_product = start_url if same_product_page(page.url, start_url) else None
         current = self.store.get("accounts", account["id"])
         if current:
             await self.check_browser_health(page, account)
@@ -726,6 +745,25 @@ class Amazon:
                                logged_in=True, session_saved_at=now(), last_login=now())
                 self.store.put("accounts", current)
                 self.store.put("sessions", {"account_id":account['id'],"retailer":account.get('retailer','amazon'),"status":"ready","last_login":now(),"network":account.get('proxy_list_id','')}, 'session-'+account['id'])
+
+    @timed('Wait for account header')
+    async def wait_session_header(self, page):
+        """Wait for header hydration or an authentication interruption, not a reload."""
+        try:
+            handle = await page.wait_for_function('''() => {
+                const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+                const labels = [...document.querySelectorAll('#nav-link-accountList .nav-line-1')].filter(visible);
+                const label = labels.length === 1 ? labels[0].innerText.trim() : '';
+                const blocked = [...document.querySelectorAll('#ap_email,#ap_password,#auth-mfa-otpcode,#cvf-input-code,#captchacharacters')].some(visible)
+                    || /access denied|robot check|verify your identity|verify it's you|additional verification required|click the button below to continue shopping/i.test(document.body?.innerText || '');
+                return blocked || location.pathname.startsWith('/ap/') ? {label:''} : label ? {label} : false;
+            }''')
+            try:
+                return (await handle.json_value())['label']
+            finally:
+                await handle.dispose()
+        except BrowserTimeoutError as exc:
+            raise AuthenticationRequired('Account header did not become ready. Review sign-in in this browser, then Resume.') from exc
 
     @timed('Verify browser health')
     async def check_browser_health(self, page, account):
@@ -780,24 +818,35 @@ class Amazon:
     @timed('Page access checks')
     async def check(self, page):
         account = self.context_accounts.get(page.context, {})
+        async def snapshot():
+            return await page.evaluate('''() => {
+                const visible = s => [...document.querySelectorAll(s)].some(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
+                return {body:(document.body?.innerText || '').slice(0,30000).toLowerCase(),
+                    otpVisible:visible('#auth-mfa-otpcode,#cvf-input-code'),
+                    captcha:visible('#captchacharacters'),
+                    otp:!!document.querySelector('#auth-mfa-otpcode,#cvf-input-code'),
+                    password:!!document.querySelector('#ap_password')};
+            }''')
+        observed = await snapshot()
         if urlparse(page.url).hostname in DOMAINS.values():
             # Account-owned OTP may still be filled automatically. Retailer
             # anti-bot/image challenges are never solved here; they are
             # detected and escalated for manual review.
-            if await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
+            if observed['otpVisible'] and account.get("auto_otp"):
                 try:
                     await self.fill_otp(page, account)
                 except ValueError:
                     pass
+                observed = await snapshot()
 
-        body = (await page.locator("body").inner_text())[:30000].lower()
+        body = observed['body']
         path = urlparse(page.url).path.lower()
 
         if "access denied" in body:
             raise AccessDenied("Access Denied; account or connection was refused")
 
         if (
-            await page.locator("#captchacharacters:visible").count()
+            observed['captcha']
             or "validatecaptcha" in path
             or any(x in body for x in (
                 "enter the characters you see",
@@ -865,9 +914,9 @@ class Amazon:
         if "no default address" in body:
             raise Attention("No Default Address: select a default shipping address in your Amazon account")
 
-        if await page.locator("#auth-mfa-otpcode, #cvf-input-code").count():
+        if observed['otp']:
             raise AuthenticationRequired("Amazon needs account verification. Complete it in the task browser, then Resume.")
-        if "/ap/signin" in page.url or await page.locator("#ap_password").count():
+        if "/ap/signin" in page.url or observed['password']:
             raise AuthenticationRequired("Session expired. Sign in in the task browser, then Resume.")
 
     async def inspect_stock(self, page, item, region):
@@ -877,7 +926,7 @@ class Amazon:
     @timed('Product inspection total')
     async def inspect(self, page, item, region, *, inventory_only=False):
         target = f"https://{DOMAINS[region]}/dp/{item['asin']}"
-        reuse_initial = getattr(page, '_retail_initial_product', None) == target and page.url == target
+        reuse_initial = getattr(page, '_retail_initial_product', None) == target and same_product_page(page.url, target)
         page._retail_initial_product = None
         response = None if reuse_initial else await self.navigate(page, target, wait_until="domcontentloaded", timeout=45000)
         await self.check(page)

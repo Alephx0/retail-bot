@@ -5,6 +5,7 @@ import time
 from ..browser_recovery import execution_deadline
 
 from ..amazon import Attention
+from ..models import DOMAINS
 from .domain import cents, qualifying, effective_plan
 from .repository import Conflict, MUTATED
 
@@ -87,6 +88,7 @@ class Executor:
                 if hasattr(adapter, 'recovery'):
                     await adapter.recovery.install(page)
                 self.repo.stage(id,'preparing','Verifying account session and offer')
+                page._retail_start_url = f"https://{DOMAINS[plan['region']]}/dp/{target['product_id']}"
                 await adapter.ensure_session(session['context'],account,page)
                 item={'asin':target['product_id'],'max_price':target['max_unit_cents']/100,'offer_id':target['offer_id']}
                 product=await adapter.inspect(page,item,plan['region'])
