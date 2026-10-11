@@ -1269,7 +1269,8 @@ class Amazon:
                         if(!visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true') return false;
                         const labelled=(e.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id=>document.getElementById(id)?.textContent || '').join(' ');
                         const label=(e.getAttribute('aria-label') || labelled.trim() || e.value || e.textContent || '').trim();
-                        return /^submit\\.delete(?:\\.|$)/.test(e.getAttribute('name') || '') || /^delete(?:\\s.*)?$/i.test(label);
+                        return /^submit\\.delete(?:-active)?(?:\\.|$)/.test(e.getAttribute('name') || '')
+                            || e.getAttribute('data-action')==='delete-active' || /^delete(?:\\s.*)?$/i.test(label);
                     });
                     const actions=candidates.filter(e=>!candidates.some(child=>child!==e && e.contains(child)));
                     return actions.length>1 ? {error:'ambiguous'} : actions[0] || false;

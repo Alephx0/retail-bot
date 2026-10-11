@@ -11,6 +11,40 @@ from retail.store import Store
 from scripts.cart_fixture import CartFixture, TARGET, OTHER
 
 
+@pytest.mark.parametrize('identification',['supplied_html','name','data_action'])
+def test_delete_active_removes_all_unrelated_items_and_keeps_target(identification):
+    async def scenario():
+        # Preserve the supplied Amazon attributes, including HTML-encoded text.
+        control='''<input name="submit.delete-active.88fca6ff-9075-4287-a4b3-c1075b9d5591" value="Delete" data-action="delete-active" aria-label="Delete Rizos Curls Multivitamin Leave-In Heat Protection Up to 450&amp;deg;F &amp;ndash; Strengthen, Repair &amp;amp; Add Shine to Straight, Wavy, Curly, Coily Hair Types 1a&amp;ndash;4c &amp;ndash; Sulfate &amp;amp; Paraben Free" type="submit" class="a-color-link" data-feature-id="item-delete-button">'''
+        unrelated=[OTHER,'B000000002','B000000003']
+        rows=''.join(f'<div data-asin="{asin}" data-quantity="{2 if asin==TARGET else 1}">{control}{control.replace("<input ","<input hidden ",1)}</div>' for asin in [OTHER,TARGET,*unrelated[1:]])
+        body=f'<form><div id="sc-active-cart">{rows}</div><div id="sc-saved-cart"><div data-asin="B000000004" data-quantity="1">{control}</div></div></form>'
+        body+='''<script>window.deleted=[];
+            document.addEventListener('submit',e=>{e.preventDefault();
+                const row=e.submitter.closest('[data-asin]');deleted.push(row.dataset.asin);
+                row.remove();
+                // Amazon rerenders remaining rows after cart changes.
+                const active=document.querySelector('#sc-active-cart');active.innerHTML=active.innerHTML;
+            });</script>'''
+        async with async_playwright() as driver:
+            browser=await driver.chromium.launch()
+            page=await browser.new_page()
+            await page.route('**/*',lambda r:r.fulfill(body=body,content_type='text/html'))
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
+            if identification!='supplied_html':
+                await page.locator('input').evaluate_all('''(controls,mode)=>controls.forEach(e=>{
+                    e.value='Remove';e.setAttribute('aria-label','Remove item');
+                    e.removeAttribute(mode==='name'?'data-action':'name');
+                })''',identification)
+            adapter=Amazon(None)
+            assert await adapter.cart(page,2,TARGET)==2
+            assert await adapter.get_cart(page)==[{'asin':TARGET,'quantity':2}]
+            assert await page.evaluate('deleted',isolated_context=False)==unrelated
+            assert await page.locator('#sc-saved-cart [data-asin]').count()==1
+            await browser.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('layout',['hidden_copy','labelled_icon','nested_role','delayed','disabled_copy'])
 def test_delete_uses_single_actionable_control(layout):
     async def scenario():
