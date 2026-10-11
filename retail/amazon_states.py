@@ -31,12 +31,14 @@ PAGE_STATE = r"""args => {
     if (args.state === 'confirmation' || args.state === 'submission')
         return confirmed || (payment ? {payment: true} : false);
 
-    if (args.state === 'cart' || args.state === 'quantity') {
+    if (args.state === 'cart' || args.state === 'quantity' || args.state === 'cart_items' || args.state === 'cart_removed') {
         const selector = document.querySelector('#sc-active-cart') ? '#sc-active-cart [data-asin]' :
             '[data-asin][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *)';
         const lines = nodes(selector);
         const matching = lines.filter(e => e.getAttribute('data-asin') === args.asin);
         const quantity = e => e.getAttribute('data-quantity') ?? e.querySelector("select[name='quantity']")?.value;
+        if (args.state === 'cart_removed') return !busy && !!document.querySelector('#sc-active-cart') && matching.length === 0;
+        if (args.state === 'cart_items') return !busy && matching.length > 0 && matching.every(e => /^\d+$/.test(quantity(e) || ''));
         const valid = matching.length === 1 && quantity(matching[0]) === String(args.quantity);
         if (args.state === 'quantity') return !busy && lines.length === 1 && valid;
         const count = text(document.querySelector('#nav-cart-count'));
@@ -45,7 +47,9 @@ PAGE_STATE = r"""args => {
         const current = {count, added};
         if (args.snapshot) return current;
         const before = args.before;
-        return !busy && (valid || (added && added !== before.added) ||
+        const cartPage = /^\/gp\/cart\/(?:view(?:\.html)?|desktop\/go-to-cart\.html)\/?$/.test(location.pathname);
+        const cartTarget = cartPage && matching.length > 0 && matching.every(e => /^\d+$/.test(quantity(e) || ''));
+        return !busy && (cartTarget || (added && added !== before.added) ||
             (/^\d+$/.test(count) && /^\d+$/.test(before.count) && Number(count) > Number(before.count)));
     }
 

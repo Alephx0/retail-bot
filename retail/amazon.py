@@ -989,95 +989,100 @@ class Amazon:
                 raise Attention(result['error'])
             return result
 
+    @timed('Add target and reconcile cart')
     async def cart(self, page, quantity, asin):
         domain = urlparse(page.url).hostname
         if domain not in DOMAINS.values():
             raise Attention("Unexpected page. Review the browser before continuing.")
-        product_url = page.url
-        # Check the active cart before any mutation. Amazon increments quantity
-        # when the same ASIN is added again; retries and pre-existing items must
-        # not silently turn a one-item request into a two-item order.
-        await self.navigate(page, f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
-        await self.check(page)
-        existing = await self.get_cart(page)
-        if any(line['asin'] != asin for line in existing):
-            await self.save_unrelated_cart_items(page, asin)
-            existing = await self.get_cart(page)
-        if not existing:
-            cart_count = await self.text(page, '#nav-cart-count')
-            if cart_count.isdigit() and int(cart_count) > 0:
-                raise CartRejected('Amazon reports items in the cart, but their product identities could not be verified')
-        matches = [line for line in existing if line['asin'] == asin]
-        if len(matches) > 1:
-            raise CartRejected("The target appears more than once in the cart; inspect Amazon before checkout")
-        if existing and len(existing) != 1:
-            raise CartRejected("Other items are already in the active cart. Clear or save those items in Amazon before automatic checkout")
-        if matches:
-            if matches[0]['quantity'] == quantity:
-                return quantity
-            # A supported native cart quantity picker can safely normalize a
-            # pre-existing target. Verify the resulting DOM state after the
-            # change; never add the target again to adjust quantity.
-            row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
-            picker = row.locator("select[name='quantity']")
-            if await row.count() == 1 and await picker.count() == 1:
-                choices = await picker.locator('option').evaluate_all("els => els.map(e => e.value)")
-                if str(quantity) in choices:
-                    await picker.select_option(str(quantity))
-                    await self.wait_state(page, 'quantity', asin=asin, quantity=quantity)
-                    updated = await self.get_cart(page)
-                    if len(updated) == 1 and updated[0]['asin'] == asin and updated[0]['quantity'] == quantity:
-                        return quantity
-            if (await row.count() == 1 and matches[0]['quantity'] is not None
-                    and 1 <= quantity <= 30 and 1 <= matches[0]['quantity'] <= 30):
-                direction = 'Increase' if quantity > matches[0]['quantity'] else 'Decrease'
-                step = 1 if direction == 'Increase' else -1
-                for expected in range(matches[0]['quantity'] + step, quantity + step, step):
-                    control = row.get_by_role('button', name=re.compile(rf'^{direction} (?:item quantity$|quantity by one, Quantity is \d+)', re.I))
-                    if await control.count() != 1 or not await control.is_visible() or not await control.is_enabled():
-                        break
-                    await behavior.click(page, control)
-                    try:
-                        await page.wait_for_function("([asin, qty]) => {const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.getAttribute('data-asin')===asin); return rows.length===1 && rows[0].getAttribute('data-quantity')===String(qty)}", arg=[asin, expected], timeout=3000)
-                    except Exception:
-                        break
+        if not re.fullmatch(r'[A-Z0-9]{10}', asin) or not 1 <= quantity <= 30:
+            raise CartRejected('Invalid product or quantity')
+        cart_url = f"https://{domain}/gp/cart/view.html"
+        # The account's product/offer was already verified by the caller. Add
+        # once, then reconcile the resulting cart instead of leaving and
+        # reloading the product for a preflight inspection.
+        if not self.is_cart_page(page):
+            await self.select_product_quantity(page, quantity)
+            before = await page.evaluate(PAGE_STATE, {'state': 'cart', 'snapshot': True, 'asin': asin, 'quantity': quantity})
+            if before.get('error'):
+                await self.check(page)
+                raise Attention(before['error'])
+            with stage('Add target acknowledgement'):
+                try:
+                    await behavior.click(page, await self.resolve_action(page, "ADD_TO_CART"))
+                except InteractionError as exc:
+                    raise Attention(str(exc)) from exc
+                await self.wait_state(page, 'cart', asin=asin, quantity=quantity, before=before)
+            # Amazon sometimes sends Add directly to the cart. Reuse it.
+            if not self.is_cart_page(page):
+                with stage('Open cart after add'):
+                    await self.navigate(page, cart_url, wait_until="domcontentloaded")
+        with stage('Reconcile target cart'):
+            # Do not wait for the requested quantity yet: an existing target
+            # may have been incremented. Wait for committed identifiable rows.
+            await self.wait_state(page, 'cart_items', asin=asin)
+            await self.check(page)
+            lines = await self.get_cart(page)
+            matching = [line for line in lines if line['asin'] == asin]
+            if len(matching) != 1:
+                raise Attention('The target could not be uniquely identified in the cart; review before restarting')
+            if any(line['asin'] != asin for line in lines):
+                await self.remove_unrelated_cart_items(page, asin, lines)
+            await self.normalize_cart_quantity(page, asin, quantity, matching[0])
+            lines = await self.get_cart(page)
+            if lines != [{'asin': asin, 'quantity': quantity}]:
+                raise Attention('Cart product or quantity could not be verified; inspect the cart before restarting')
+        return quantity
+
+    @staticmethod
+    def is_cart_page(page):
+        return bool(re.fullmatch(r'/gp/cart/(?:view(?:\.html)?|desktop/go-to-cart\.html)/?', urlparse(page.url).path))
+
+    async def select_product_quantity(self, page, quantity):
+        choice = await page.evaluate('''() => {
+            const pickers = document.querySelectorAll('select#quantity');
+            return {count:pickers.length, value:pickers[0]?.value,
+                values:[...(pickers[0]?.options || [])].filter(e => !e.disabled).map(e => e.value)};
+        }''')
+        if not choice['count'] and quantity == 1:
+            return
+        if choice['count'] != 1 or str(quantity) not in choice['values']:
+            raise CartRejected('Requested item quantity is unavailable or ambiguous; choose a supported quantity')
+        if choice['value'] != str(quantity):
+            await page.locator('select#quantity').select_option(str(quantity))
+
+    async def normalize_cart_quantity(self, page, asin, quantity, match):
+        if match['quantity'] == quantity:
+            return quantity
+        # A supported native cart quantity picker can safely normalize a
+        # pre-existing target. Verify the resulting DOM state after the
+        # change; never add the target again to adjust quantity.
+        row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
+        picker = row.locator("select[name='quantity']")
+        if await row.count() == 1 and await picker.count() == 1:
+            choices = await picker.locator('option').evaluate_all("els => els.map(e => e.value)")
+            if str(quantity) in choices:
+                await picker.select_option(str(quantity))
+                await self.wait_state(page, 'quantity', asin=asin, quantity=quantity)
                 updated = await self.get_cart(page)
                 if len(updated) == 1 and updated[0]['asin'] == asin and updated[0]['quantity'] == quantity:
                     return quantity
-            raise CartRejected("The target is already in the cart with a different quantity; adjust its quantity in Amazon before starting this task")
-        if existing:
-            raise CartRejected("Other items are already in the active cart. Clear or save those items in Amazon before automatic checkout")
-        await self.navigate(page, product_url, wait_until="domcontentloaded")
-        await self.check(page)
-        selector = page.locator("select#quantity")
-        actual = 1
-        if await selector.count():
-            values = await selector.locator("option").evaluate_all("els => els.map(e => Number(e.value)).filter(x => Number.isInteger(x) && x > 0)")
-            if quantity not in values:
-                raise CartRejected("Requested item quantity is unavailable; choose a supported quantity")
-            actual=quantity
-            await selector.select_option(str(actual))
-        elif quantity!=1:
-            raise CartRejected("Requested item quantity could not be selected")
-        before = await page.evaluate(PAGE_STATE, {'state': 'cart', 'snapshot': True, 'asin': asin, 'quantity': actual})
-        if before.get('error'):
-            await self.check(page)
-            raise Attention(before['error'])
-        try:
-            await behavior.click(page, await self.resolve_action(page,"ADD_TO_CART"))
-        except InteractionError as exc:
-            raise Attention(str(exc)) from exc
-        await self.wait_state(page, 'cart', asin=asin, quantity=actual, before=before)
-        await self.check(page)
-        # Cart is a handoff, never evidence that an order was placed.
-        await self.navigate(page, f"https://{domain}/gp/cart/view.html", wait_until="domcontentloaded")
-        await self.wait_state(page, 'quantity', asin=asin, quantity=actual)
-        await self.check(page)
-        lines=await self.get_cart(page)
-        matching=[line for line in lines if line['asin']==asin]
-        if len(matching)!=1 or matching[0]['quantity']!=actual:
-            raise Attention("Cart product or quantity could not be verified; inspect the cart before restarting")
-        return actual
+        if (await row.count() == 1 and match['quantity'] is not None
+                and 1 <= quantity <= 30 and 1 <= match['quantity'] <= 30):
+            direction = 'Increase' if quantity > match['quantity'] else 'Decrease'
+            step = 1 if direction == 'Increase' else -1
+            for expected in range(match['quantity'] + step, quantity + step, step):
+                control = row.get_by_role('button', name=re.compile(rf'^{direction} (?:item quantity$|quantity by one, Quantity is \d+)', re.I))
+                if await control.count() != 1 or not await control.is_visible() or not await control.is_enabled():
+                    break
+                await behavior.click(page, control)
+                try:
+                    await page.wait_for_function("([asin, qty]) => {const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.getAttribute('data-asin')===asin); return rows.length===1 && rows[0].getAttribute('data-quantity')===String(qty)}", arg=[asin, expected], timeout=3000)
+                except Exception:
+                    break
+            updated = await self.get_cart(page)
+            if len(updated) == 1 and updated[0]['asin'] == asin and updated[0]['quantity'] == quantity:
+                return quantity
+        raise Attention("The target is already in the cart with a different quantity; adjust its quantity in Amazon before starting this task")
 
     @timed('Buy Now and checkout navigation')
     async def buy_now(self, page, quantity, asin):
@@ -1088,14 +1093,7 @@ class Amazon:
             page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['BUY_NOW'], re.I)))
         if not await offered.count():
             return False
-        selector = page.locator('select#quantity')
-        if await selector.count():
-            values = await selector.locator("option").evaluate_all("els => els.map(e => Number(e.value)).filter(x => Number.isInteger(x) && x > 0)")
-            if quantity not in values:
-                raise CartRejected('Requested item quantity is unavailable; choose a supported quantity')
-            await selector.select_option(str(quantity))
-        elif quantity != 1:
-            raise CartRejected('Requested item quantity could not be selected')
+        await self.select_product_quantity(page, quantity)
         title = await self.text(page, '#productTitle')
         if not title:
             raise Attention('Buy Now product title could not be verified')
@@ -1110,65 +1108,48 @@ class Amazon:
 
     async def get_cart(self,page):
         if urlparse(page.url).hostname not in DOMAINS.values(): raise Attention("Unexpected cart domain")
-        active=page.locator("#sc-active-cart [data-asin]")
-        if not await page.locator('#sc-active-cart').count():
-            active=page.locator("[data-asin][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *)")
-        lines=[]
-        for row in await active.all():
-            if not await row.is_visible(): continue
-            asin=await row.get_attribute('data-asin')
-            quantity=await row.get_attribute('data-quantity')
-            select=row.locator("select[name='quantity']")
-            if quantity is None and await select.count()==1:quantity=await select.input_value()
-            lines.append({'asin':asin,'quantity':int(quantity) if quantity and quantity.isdigit() else None})
-        return lines
+        # One snapshot instead of multiple controller round trips per cart row.
+        return await page.evaluate('''() => {
+            const selector = document.querySelector('#sc-active-cart') ? '#sc-active-cart [data-asin]' :
+                '[data-asin][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *)';
+            return [...document.querySelectorAll(selector)].filter(e => e.getClientRects().length &&
+                getComputedStyle(e).visibility !== 'hidden').map(e => {
+                const picker = e.querySelectorAll("select[name='quantity']");
+                const qty = e.getAttribute('data-quantity') ?? (picker.length === 1 ? picker[0].value : null);
+                return {asin:e.getAttribute('data-asin'), quantity:qty && /^\\d+$/.test(qty) ? Number(qty) : null};
+            });
+        }''')
 
-    async def save_unrelated_cart_items(self, page, target_asin):
-        """Move only identified, unrelated active-cart rows to Saved for Later."""
-        lines = await self.get_cart(page)
+    @timed('Remove unrelated cart items')
+    async def remove_unrelated_cart_items(self, page, target_asin, lines=None):
+        """Delete only uniquely identified unrelated active rows, once per row."""
+        lines = await self.get_cart(page) if lines is None else lines
         unrelated = [line['asin'] for line in lines if line['asin'] != target_asin]
-        if any(not asin for asin in unrelated) or len(unrelated) != len(set(unrelated)):
-            raise CartRejected('Cart item identities are ambiguous; no items were removed')
+        if any(not re.fullmatch(r'[A-Z0-9]{10}', asin or '') for asin in unrelated) or len(unrelated) != len(set(unrelated)):
+            raise Attention('Cart item identities are ambiguous; no items were removed')
         for asin in unrelated:
             row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
             if await row.count() != 1:
-                raise CartRejected('An unrelated cart item could not be uniquely identified')
-            action = row.locator("input[name^='submit.save-for-later'], button[name^='submit.save-for-later'], input[aria-label^='Save for later'], button[aria-label^='Save for later']").or_(
-                row.get_by_role('button', name=re.compile(r'^save for later$', re.I))).or_(
-                row.get_by_role('link', name=re.compile(r'^save for later$', re.I)))
+                raise Attention('An unrelated cart item could not be uniquely identified')
+            action = row.locator("input[name^='submit.delete'], button[name^='submit.delete']").or_(
+                row.get_by_role('button', name=re.compile(r'^delete(?: item)?(?: .+)?$', re.I))).or_(
+                row.get_by_role('link', name=re.compile(r'^delete$', re.I)))
             if await action.count() != 1 or not await action.is_visible() or not await action.is_enabled():
-                raise CartRejected('Save for Later is unavailable for an unrelated cart item; cart was not cleared')
+                raise Attention('Delete is unavailable or ambiguous for an unrelated cart item; review the cart')
             await behavior.click(page, action)
-            try:
-                await page.wait_for_function("asin => ![...document.querySelectorAll('#sc-active-cart [data-asin]')].some(e => e.getAttribute('data-asin') === asin)", arg=asin, timeout=3000)
-            except Exception:
-                # Amazon may persist Save for Later on the server while leaving
-                # this tab's cart markup stale. Reload and verify both sides.
-                await page.reload(wait_until='domcontentloaded')
-                try:
-                    await page.wait_for_function("asin => ![...document.querySelectorAll('#sc-active-cart [data-asin]')].some(e => e.getAttribute('data-asin') === asin)", arg=asin, timeout=5000)
-                except Exception as exc:
-                    raise CartRejected('Amazon did not confirm that an item left the active cart') from exc
-            saved = page.locator(f"#sc-saved-cart [data-asin='{asin}'], #sc-saved-cart-items [data-asin='{asin}']")
-            try:
-                await saved.wait_for(state='visible', timeout=5000)
-            except Exception:
-                await page.reload(wait_until='domcontentloaded')
-                try:
-                    await saved.wait_for(state='visible', timeout=5000)
-                except Exception as exc:
-                    raise CartRejected('Amazon did not verify the item in Saved for Later; review the cart') from exc
-            if await saved.count() != 1:
-                raise CartRejected('Amazon saved-item identity is ambiguous; review the cart')
+            # If acknowledgement is lost, pause; never issue the mutation again.
+            await self.wait_state(page, 'cart_removed', asin=asin)
         remaining = await self.get_cart(page)
         if any(line['asin'] != target_asin for line in remaining):
-            raise CartRejected('Unrelated items remain in the active cart')
+            raise Attention('Unrelated items remain in the active cart')
 
     async def prepare_checkout(self, page, asin, quantity):
         """Refuse automatic checkout of a mixed, unrecognized, or mismatched cart."""
         lines = await self.get_cart(page)
+        if len([line for line in lines if line['asin'] == asin]) != 1:
+            raise Attention('The target could not be uniquely identified before checkout; no items were removed')
         if any(line['asin'] != asin for line in lines):
-            await self.save_unrelated_cart_items(page, asin)
+            await self.remove_unrelated_cart_items(page, asin, lines)
             lines = await self.get_cart(page)
         if len(lines) != 1 or lines[0]['asin'] != asin:
             raise Attention("Automatic checkout requires exactly the target product in the active cart")

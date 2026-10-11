@@ -5,7 +5,7 @@ import re
 import pytest
 from patchright.async_api import async_playwright
 
-from retail.amazon import Amazon, CartRejected
+from retail.amazon import Amazon, Attention
 from retail.interactions import InteractionError
 from retail.browser_agent import BrowserAgent
 from retail.browser_mcp import AMAZON_ACTIONS, BrowserTools
@@ -173,7 +173,7 @@ def test_product_session_reuses_first_navigation(tmp_path, signed_out):
     ('<div data-asin="B012345678" data-quantity="1">Target</div><div data-asin="B000000001" data-quantity="1">Other</div>', 'other'),
     ('<div data-asin="B012345678" data-quantity="2">Target</div>', 'quantity'),
 ])
-def test_cart_preflight_preserves_existing_items(tmp_path, cart_html, expected):
+def test_cart_reconciliation_requires_exact_target(tmp_path, cart_html, expected):
     async def scenario():
         store = Store(tmp_path)
         async with async_playwright() as driver:
@@ -185,12 +185,12 @@ def test_cart_preflight_preserves_existing_items(tmp_path, cart_html, expected):
                 else:
                     await r.fulfill(body='<button onclick="window.added=true">Add to cart</button>')
             await page.route('**/*', route)
-            await page.goto('https://www.amazon.com/dp/B012345678')
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
             adapter = Amazon(store)
             if expected == 'existing':
                 assert await adapter.cart(page, 1, 'B012345678') == 1
             else:
-                with pytest.raises(CartRejected, match='Save for Later|different quantity'):
+                with pytest.raises(Attention, match='Delete|different quantity'):
                     await adapter.cart(page, 1, 'B012345678')
             assert page.url.endswith('/gp/cart/view.html')
             await browser.close()
@@ -229,7 +229,7 @@ def test_existing_target_quantity_is_normalized_without_adding(tmp_path):
                     body = '<button onclick="window.added=true">Add to cart</button>'
                 await r.fulfill(body=body, content_type='text/html')
             await page.route('**/*', route)
-            await page.goto('https://www.amazon.com/dp/B012345678')
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
             adapter = Amazon(store)
             assert await adapter.cart(page, 1, 'B012345678') == 1
             assert (await adapter.get_cart(page)) == [{'asin': 'B012345678', 'quantity': 1}]
@@ -238,7 +238,7 @@ def test_existing_target_quantity_is_normalized_without_adding(tmp_path):
     asyncio.run(scenario())
 
 
-def test_unrelated_cart_item_is_saved_and_target_is_not_added_twice(tmp_path):
+def test_unrelated_cart_item_is_deleted_without_adding_target_twice(tmp_path):
     async def scenario():
         store = Store(tmp_path)
         async with async_playwright() as driver:
@@ -249,18 +249,18 @@ def test_unrelated_cart_item_is_saved_and_target_is_not_added_twice(tmp_path):
                     body = '''<div id="sc-active-cart">
                     <div data-asin="B012345678" data-quantity="1">Target</div>
                     <div data-asin="B000000001" data-quantity="1">Other
-                      <input type="button" name="submit.save-for-later.abc" value="Save for later"
-                        onclick="document.querySelector('#sc-saved-cart').append(this.parentElement)">
+                      <input type="button" name="submit.delete.abc" value="Delete"
+                        onclick="this.parentElement.remove()">
                     </div></div><div id="sc-saved-cart"></div>'''
                 else:
                     body = '<button onclick="window.added=true">Add to cart</button>'
                 await r.fulfill(body=body, content_type='text/html')
             await page.route('**/*', route)
-            await page.goto('https://www.amazon.com/dp/B012345678')
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
             adapter = Amazon(store)
             assert await adapter.cart(page, 1, 'B012345678') == 1
             assert await adapter.get_cart(page) == [{'asin': 'B012345678', 'quantity': 1}]
-            assert await page.locator('#sc-saved-cart [data-asin="B000000001"]').count() == 1
+            assert await page.locator('[data-asin="B000000001"]').count() == 0
             assert not await page.evaluate('window.added || false', isolated_context=False)
             await browser.close()
         store.db.close()
@@ -282,32 +282,6 @@ def test_saved_items_are_not_mistaken_for_active_cart_items(tmp_path):
         store.db.close()
     asyncio.run(scenario())
 
-
-def test_save_for_later_verifies_server_side_change_after_reload(tmp_path):
-    async def scenario():
-        store = Store(tmp_path)
-        saved = {'value': False}
-        async with async_playwright() as driver:
-            browser = await driver.chromium.launch()
-            page = await browser.new_page()
-            async def route(r):
-                if r.request.url.endswith('/save'):
-                    saved['value'] = True
-                    await r.fulfill(body='ok')
-                else:
-                    row = '<div data-asin="B000000001" data-quantity="1">Other<input type="button" name="submit.save-for-later.abc" value="Save for later" onclick="fetch(\'/save\')"></div>'
-                    body = ('<div id="sc-active-cart"></div><div id="sc-saved-cart">' + row + '</div>') if saved['value'] else ('<div id="sc-active-cart">' + row + '</div><div id="sc-saved-cart"></div>')
-                    await r.fulfill(body=body, content_type='text/html')
-            await page.route('**/*', route)
-            await page.goto('https://www.amazon.com/gp/cart/view.html')
-            adapter = Amazon(store)
-            await adapter.save_unrelated_cart_items(page, 'B012345678')
-            assert saved['value']
-            assert await adapter.get_cart(page) == []
-            assert await page.locator('#sc-saved-cart [data-asin="B000000001"]').count() == 1
-            await browser.close()
-        store.db.close()
-    asyncio.run(scenario())
 
 
 def test_duplicate_identical_order_controls_are_one_semantic_action():

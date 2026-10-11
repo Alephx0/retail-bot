@@ -29,6 +29,7 @@ def test_amazon_browser_adapter_with_fixtures():
             assert product['offer_id'] == 'fixture-offer'
             assert not product['amazon_seller'], 'Fulfilled by Amazon is not sold by Amazon'
             assert product['available']
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
             with pytest.raises(Attention,match='different quantity'):
                 await adapter.cart(page,5,'B012345678')
             assert await adapter.cart(page,2,'B012345678') == 2

@@ -23,14 +23,11 @@ def test_cart_waits_for_acknowledgement_and_hydrated_quantity(delay):
                 nonlocal visits
                 if '/gp/cart/' in route.request.url:
                     visits += 1
-                    if visits == 1:
-                        body = '<div id="sc-active-cart"></div><span id="nav-cart-count">0</span>'
-                    else:
-                        # The second cart is initially empty while hydrating.
-                        body = '''<div id="sc-active-cart"></div><script>
-                        setTimeout(() => document.querySelector('#sc-active-cart').innerHTML =
-                            '<div data-asin="B012345678" data-quantity="1">Fixture</div>', 75);
-                        </script>'''
+                    # The single cart visit initially has no rows while hydrating.
+                    body = '''<div id="sc-active-cart"></div><script>
+                    setTimeout(() => document.querySelector('#sc-active-cart').innerHTML =
+                        '<div data-asin="B012345678" data-quantity="1">Fixture</div>', 75);
+                    </script>'''
                 else:
                     body = f'''<span id="nav-cart-count">0</span><button id="add-to-cart-button"
                         onclick="window.clicks=(window.clicks||0)+1;setTimeout(()=>{{document.querySelector('#nav-cart-count').textContent='1';window.ack=true;}}, {delay})">Add to cart</button>'''
@@ -40,13 +37,13 @@ def test_cart_waits_for_acknowledgement_and_hydrated_quantity(delay):
             adapter = Amazon(None)
             navigate = adapter.navigate
             async def checked_navigation(page, url, **kwargs):
-                if '/gp/cart/' in url and visits == 1:
+                if '/gp/cart/' in url:
                     assert await page.evaluate('window.ack', isolated_context=False)
                     assert await page.evaluate('window.clicks', isolated_context=False) == 1
                 return await navigate(page, url, **kwargs)
             adapter.navigate = checked_navigation
             assert await adapter.cart(page, 1, 'B012345678') == 1
-            assert visits == 2
+            assert visits == 1
             await browser.close()
     asyncio.run(scenario())
 
@@ -63,7 +60,7 @@ def test_cart_quantity_waits_for_committed_row_not_optimistic_select():
                 onchange="setTimeout(()=>this.parentElement.dataset.quantity=this.value,650)">
                 <option value="1">1</option><option selected value="2">2</option></select></div></div>''')
             await page.route('**/*', local)
-            await page.goto('https://www.amazon.com/dp/B012345678')
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
             assert await Amazon(None).cart(page, 1, 'B012345678') == 1
             assert await page.locator('[data-asin]').get_attribute('data-quantity') == '1'
             await browser.close()
