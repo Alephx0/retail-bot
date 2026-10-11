@@ -615,9 +615,10 @@ class Amazon:
                 const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
                 const oldVisible = [...document.querySelectorAll(selector)].some(visible);
                 const error = [...document.querySelectorAll('#auth-error-message-box, #auth-warning-message-box, #captchacharacters')].some(visible);
-                const next = [...document.querySelectorAll('#ap_email, #ap_password, #auth-mfa-otpcode, #cvf-input-code, #nav-link-accountList .nav-line-1')].some(visible);
+                const next = [...document.querySelectorAll('#ap_email, #ap_email_login, #ap_password, #auth-mfa-otpcode, #cvf-input-code, #nav-link-accountList .nav-line-1')].some(visible);
                 const challenge = /verify your identity|verify it's you|additional verification required|robot check|click the button below to continue shopping/i.test(document.body?.innerText || '');
-                return error || challenge || (!oldVisible && next);
+                const passwordStep = selector.includes('#ap_email') && visible(document.querySelector('#ap_password'));
+                return error || challenge || passwordStep || (!oldVisible && next);
             }''', arg=selector, timeout=10000)
         except BrowserTimeoutError as exc:
             raise AuthenticationRequired('Sign-in did not advance. Review the task browser, then Resume.') from exc
@@ -629,17 +630,58 @@ class Amazon:
     @timed('Account sign-in')
     async def authenticate(self, page, account):
         """Fill only the current account's Amazon sign-in fields, with bounded steps."""
+        # Credential entry always uses the existing bounded mouse/keyboard
+        # controller. This does not slow unrelated product/checkout actions.
+        paced = getattr(page, '_retail_paced_controller', None)
+        if paced is None:
+            paced = page._retail_paced_controller = behavior.PacedInput(page)
         for _ in range(6):
-            if urlparse(page.url).hostname not in DOMAINS.values():
-                return
-            if await page.locator("#ap_email:visible").count() and account.get("email"):
-                await behavior.fill(page, page.locator("#ap_email"), account["email"])
-                await behavior.click(page, page.locator("#continue"))
-                await self.wait_for_signin_step(page, '#ap_email')
-            elif await page.locator("#ap_password:visible").count() and account.get("password"):
-                await behavior.fill(page, page.locator("#ap_password"), account["password"])
-                await behavior.click(page, page.locator("#signInSubmit"))
+            origin = urlparse(page.url)
+            if origin.scheme != 'https' or origin.netloc != DOMAINS[account.get('region', 'US')]:
+                raise AuthenticationRequired('Sign-in left this account’s Amazon region; credentials were not entered.')
+            try:
+                await page.wait_for_function('''() => {
+                    const visible=e=>e && e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
+                    return [...document.querySelectorAll('#ap_email,#ap_email_login,#ap_password,#auth-mfa-otpcode,#cvf-input-code,#captchacharacters,#auth-error-message-box,#auth-warning-message-box')].some(visible)
+                        || [...document.querySelectorAll('#nav-link-accountList .nav-line-1')].some(e=>visible(e) && e.innerText.trim() && !/sign in/i.test(e.innerText))
+                        || /verify your identity|verify it's you|additional verification|robot check|continue shopping/i.test(document.body?.innerText || '');
+                }''', timeout=10000)
+            except BrowserTimeoutError as exc:
+                raise AuthenticationRequired('Amazon did not present a supported sign-in step; review View live.') from exc
+            origin = urlparse(page.url)
+            if origin.scheme != 'https' or origin.netloc != DOMAINS[account.get('region', 'US')]:
+                raise AuthenticationRequired('Sign-in left this account’s Amazon region; credentials were not entered.')
+            body = (await page.locator('body').inner_text()).lower()
+            if re.search(r"verify your identity|verify it's you|additional verification|robot check|continue shopping", body):
+                await self.check(page)
+            if await page.locator('#captchacharacters:visible, #auth-error-message-box:visible, #auth-warning-message-box:visible').count():
+                await self.check(page)
+                raise AuthenticationRequired('Amazon rejected sign-in. Check the saved account credentials before resuming.')
+            email = page.locator('#ap_email:visible, #ap_email_login:visible')
+            password = page.locator('#ap_password:visible')
+            if await password.count():
+                if not account.get('password'):
+                    raise AuthenticationRequired('Save a password for this account, or complete sign-in in View live.')
+                # Combined email/password layouts must fill both fields before submit.
+                if await email.count() and account.get('email'):
+                    await self.validate_signin_destination(email, account)
+                    if (await email.input_value()).strip().casefold() != account['email'].strip().casefold():
+                        await paced.fill(email, account['email'])
+                await self.validate_signin_destination(password, account)
+                await paced.fill(password, account['password'])
+                submit = page.locator('#signInSubmit:visible')
+                await self.validate_signin_destination(submit, account)
+                await paced.click(submit)
                 await self.wait_for_signin_step(page, '#ap_password')
+            elif await email.count():
+                if not account.get('email'):
+                    raise AuthenticationRequired('Save an email or username for this account, or complete sign-in in View live.')
+                await self.validate_signin_destination(email, account)
+                await paced.fill(email, account['email'])
+                submit = page.locator('#continue:visible')
+                await self.validate_signin_destination(submit, account)
+                await paced.click(submit)
+                await self.wait_for_signin_step(page, '#ap_email, #ap_email_login')
             elif await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
                 try:
                     await self.fill_otp(page, account)
@@ -647,6 +689,14 @@ class Amazon:
                     return
             else:
                 return
+
+    async def validate_signin_destination(self, control, account):
+        if await control.count() != 1:
+            raise AuthenticationRequired('The sign-in control is missing or ambiguous; review View live.')
+        destination = await control.evaluate("e => e.hasAttribute('formaction') ? e.formAction : (e.form?.action || location.href)")
+        target = urlparse(destination)
+        if target.scheme != 'https' or target.netloc != DOMAINS[account.get('region', 'US')]:
+            raise AuthenticationRequired('The sign-in form leaves this account’s Amazon region; credentials were not submitted.')
 
     async def fill_otp(self, page, account):
         if urlparse(page.url).hostname not in DOMAINS.values():
@@ -714,7 +764,7 @@ class Amazon:
         start_url = getattr(page, '_retail_start_url', None)
         # On Resume, inspect the existing challenge first. Navigating away from
         # an MFA/passkey page can invalidate the user's in-progress verification.
-        resuming_auth = urlparse(page.url).hostname in DOMAINS.values() and ("/ap/" in urlparse(page.url).path or await page.locator("#ap_email, #ap_password, #auth-mfa-otpcode, #captchacharacters").count())
+        resuming_auth = urlparse(page.url).hostname in DOMAINS.values() and ("/ap/" in urlparse(page.url).path or await page.locator("#ap_email, #ap_email_login, #ap_password, #auth-mfa-otpcode, #captchacharacters").count())
         if resuming_auth:
             await self.authenticate(page, account)
             await self.check(page)
@@ -729,10 +779,13 @@ class Amazon:
             sign_in = page.locator('#nav-link-accountList')
             href = await sign_in.evaluate("e => e.href || ''") if await sign_in.count() == 1 else ''
             parsed = urlparse(href)
-            if parsed.scheme == 'https' and parsed.hostname == DOMAINS[account['region']] and parsed.path.startswith(('/ap/signin', '/gp/sign-in')):
+            if parsed.scheme == 'https' and parsed.netloc == DOMAINS[account['region']] and parsed.path.startswith(('/ap/signin', '/gp/sign-in')):
                 await self.navigate(page, href, wait_until='domcontentloaded')
             else:
-                raise AuthenticationRequired('Sign in in the task browser, then Resume. The product page shows a signed-out session.')
+                # Some Amazon headers use JavaScript or an account-home link.
+                # The protected orders route supplies Amazon's own sign-in
+                # redirect without guessing parameters or visiting a foreign URL.
+                await self.navigate(page, f"https://{DOMAINS[account['region']]}/gp/your-account/order-history", wait_until='domcontentloaded')
         if not label or 'sign in' in label.lower():
             await self.authenticate(page, account)
         await self.check(page)
@@ -771,7 +824,7 @@ class Amazon:
                 const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
                 const labels = [...document.querySelectorAll('#nav-link-accountList .nav-line-1')].filter(visible);
                 const label = labels.length === 1 ? labels[0].innerText.trim() : '';
-                const blocked = [...document.querySelectorAll('#ap_email,#ap_password,#auth-mfa-otpcode,#cvf-input-code,#captchacharacters')].some(visible)
+                const blocked = [...document.querySelectorAll('#ap_email,#ap_email_login,#ap_password,#auth-mfa-otpcode,#cvf-input-code,#captchacharacters')].some(visible)
                     || /access denied|robot check|verify your identity|verify it's you|additional verification required|click the button below to continue shopping/i.test(document.body?.innerText || '');
                 return blocked || location.pathname.startsWith('/ap/') ? {label:''} : label ? {label} : false;
             }''')
@@ -842,7 +895,7 @@ class Amazon:
                     otpVisible:visible('#auth-mfa-otpcode,#cvf-input-code'),
                     captcha:visible('#captchacharacters'),
                     otp:!!document.querySelector('#auth-mfa-otpcode,#cvf-input-code'),
-                    password:!!document.querySelector('#ap_password')};
+                    password:visible('#ap_password,#ap_email,#ap_email_login')};
             }''')
         observed = await snapshot()
         if urlparse(page.url).hostname in DOMAINS.values():
@@ -934,7 +987,7 @@ class Amazon:
         if observed['otp']:
             raise AuthenticationRequired("Amazon needs account verification. Complete it in the task browser, then Resume.")
         if "/ap/signin" in page.url or observed['password']:
-            raise AuthenticationRequired("Session expired. Sign in in the task browser, then Resume.")
+            raise AuthenticationRequired("Amazon requires sign-in; restoring this account's saved session.")
 
     async def inspect_stock(self, page, item, region):
         """Read inventory without AI recovery or checkout-control resolution."""
@@ -970,9 +1023,12 @@ class Amazon:
                 used: !!document.querySelector('#usedBuySection') && !document.querySelector('#newBuyBoxPrice, #newBuyBox'),
                 image: images.length === 1 ? images[0].getAttribute('src') || '' : '',
                 stock: visibleText('#availability, #availabilityInsideBuyBox_feature_div, #outOfStock'),
+                account: visibleText('#nav-link-accountList .nav-line-1'),
                 purchase: visibleText('#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #deliveryBlockMessage')
             };
         }''')
+        if not inventory_only and 'sign in' in details.get('account', ''):
+            raise AuthenticationRequired('Account session expired; saved credentials will be used to sign in again.')
         title = details['title']
         if not title:
             heading=page.get_by_role("heading",level=1)
@@ -1063,6 +1119,10 @@ class Amazon:
         if not re.fullmatch(r'[A-Z0-9]{10}', asin) or not 1 <= quantity <= 30:
             raise CartRejected('Invalid product or quantity')
         cart_url = f"https://{domain}/gp/cart/view.html"
+        if getattr(page, '_retail_reconcile_cart', False) and not self.is_cart_page(page):
+            # Authentication may have interrupted an already-dispatched add.
+            # Inspect its result, never replay it or infer failure from redirect.
+            await self.navigate(page, cart_url, wait_until='domcontentloaded')
         # The account's product/offer was already verified by the caller. Add
         # once, then reconcile the resulting cart instead of leaving and
         # reloading the product for a preflight inspection.
@@ -1194,15 +1254,35 @@ class Amazon:
         if any(not re.fullmatch(r'[A-Z0-9]{10}', asin or '') for asin in unrelated) or len(unrelated) != len(set(unrelated)):
             raise Attention('Cart item identities are ambiguous; no items were removed')
         for asin in unrelated:
-            row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
+            row = page.locator(f"#sc-active-cart [data-asin='{asin}']:visible")
             if await row.count() != 1:
                 raise Attention('An unrelated cart item could not be uniquely identified')
-            action = row.locator("input[name^='submit.delete'], button[name^='submit.delete']").or_(
-                row.get_by_role('button', name=re.compile(r'^delete(?: item)?(?: .+)?$', re.I))).or_(
-                row.get_by_role('link', name=re.compile(r'^delete$', re.I)))
-            if await action.count() != 1 or not await action.is_visible() or not await action.is_enabled():
-                raise Attention('Delete is unavailable or ambiguous for an unrelated cart item; review the cart')
-            await behavior.click(page, action)
+            # Amazon keeps hidden responsive copies and sometimes labels the
+            # clickable input through aria-labelledby. Count usable controls,
+            # not hidden markup or the wrapper surrounding the same button.
+            try:
+                handle = await page.wait_for_function('''asin => {
+                    const visible=e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
+                    const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.dataset.asin===asin && visible(e));
+                    if(rows.length!==1) return {error:'row'};
+                    const candidates=[...rows[0].querySelectorAll('input[type="submit"],input[type="button"],button,a,[role="button"]')].filter(e=>{
+                        if(!visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true') return false;
+                        const labelled=(e.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id=>document.getElementById(id)?.textContent || '').join(' ');
+                        const label=(e.getAttribute('aria-label') || labelled.trim() || e.value || e.textContent || '').trim();
+                        return /^submit\\.delete(?:\\.|$)/.test(e.getAttribute('name') || '') || /^delete(?:\\s.*)?$/i.test(label);
+                    });
+                    const actions=candidates.filter(e=>!candidates.some(child=>child!==e && e.contains(child)));
+                    return actions.length>1 ? {error:'ambiguous'} : actions[0] || false;
+                }''', arg=asin, timeout=5000)
+            except BrowserTimeoutError as exc:
+                raise Attention('Delete did not become available for an unrelated cart item; review the cart') from exc
+            try:
+                action = handle.as_element()
+                if action is None:
+                    raise Attention('Delete is ambiguous for an unrelated cart item; review the cart')
+                await behavior.click(page, action)
+            finally:
+                await handle.dispose()
             # If acknowledgement is lost, pause; never issue the mutation again.
             await self.wait_state(page, 'cart_removed', asin=asin)
         remaining = await self.get_cart(page)

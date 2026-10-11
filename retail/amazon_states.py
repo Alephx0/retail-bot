@@ -13,7 +13,7 @@ PAGE_STATE = r"""args => {
         [...root.querySelectorAll('[aria-busy="true"], .a-spinner-wrapper, .a-spinner')].some(visible));
     if (!['www.amazon.com', 'amazon.com', 'www.amazon.co.uk', 'www.amazon.ca'].includes(location.hostname))
         return {error: 'Checkout left the permitted retailer; review the browser'};
-    if (nodes('#captchacharacters, #ap_password, #ap_email, #auth-mfa-otpcode, #cvf-input-code').length ||
+    if (nodes('#captchacharacters, #ap_password, #ap_email, #ap_email_login, #auth-mfa-otpcode, #cvf-input-code').length ||
         /access denied|robot check|verify your identity|verify it's you|additional verification required|click the button below to continue shopping|enter the characters you see|make sure you(?:'re| are) not a robot/i.test(body))
         return {error: 'Amazon interrupted the operation; review the task browser',
             continuation: /click the button below to continue shopping/i.test(body)};

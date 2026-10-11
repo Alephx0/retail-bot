@@ -80,6 +80,7 @@ class TaskRunner:
         monitors = []
         retain_context = False
         cart_attempted = False
+        reconcile_cart = ''
         try:
             saved_task = self.store.get("tasks", id)
             task = {**saved_task, **Task.model_validate(saved_task).model_dump(mode="json")}
@@ -258,6 +259,8 @@ class TaskRunner:
                     # starve another assigned product.
                     for offset in range(len(products)):
                         index = (next_monitor + offset) % len(products)
+                        if reconcile_cart and items[index]['asin'] != reconcile_cart:
+                            continue  # Finish the interrupted product, never rotate to another cart target.
                         if (eligible(products[index], items[index], group) if task['simulation']
                                 else stock_observation(products[index])[0] == 'available'):
                             chosen = index
@@ -319,11 +322,12 @@ class TaskRunner:
                     try:
                         cart_attempted = True
                         used_buy_now = False
-                        if task.get('use_buy_now') and group['retailer'] == 'amazon':
+                        if task.get('use_buy_now') and group['retailer'] == 'amazon' and not reconcile_cart:
                             used_buy_now = await adapter.buy_now(checkout_page, task['quantity'], items[chosen]['asin'])
                         if used_buy_now:
                             quantity = task['quantity']
                         else:
+                            checkout_page._retail_reconcile_cart = bool(reconcile_cart)
                             with stage('Cart action and verification'):
                                 quantity = await cart.add(checkout_page, items[chosen], task["quantity"])
                     except AuthenticationRequired:
@@ -398,6 +402,7 @@ class TaskRunner:
                         journal=self.store.get("submissions","submission-"+id)
                         if journal: self.store.put("submissions",journal,"submission-"+id+"-"+str(successes))
                         cart_attempted=False
+                        reconcile_cart=''
                         checkout_page._retail_agent_attempts = set()
                         self.status(id,"ready","Order confirmed; waiting for next configured checkout")
                         if checkout_page not in pages: await checkout_page.close()
@@ -446,6 +451,8 @@ class TaskRunner:
                         await self.pause(id, 'attention', 'Authentication changed after an order submission was attempted. Check Your Orders; this task will not submit again.')
                         self.status(id, 'stopped', 'Order submission was not retried after authentication changed')
                         break
+                    if cart_attempted:
+                        reconcile_cart = items[chosen]['asin']
                     interrupted_page = checkout_page or pages[0]
                     account = await self.recover_authentication(id, adapter, interrupted_page.context, account, interrupted_page)
                     if interrupted_page.context is not context and account.get('session', {}).get('cookies'):
