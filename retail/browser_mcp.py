@@ -1,12 +1,12 @@
-"""Task-scoped MCP tools sharing the orchestrator's Playwright page.
+"""Task-scoped evidence and validation, with optional MCP exposure for development.
 
-The SDK memory transport keeps browser capabilities local. The provider receives
-tool schemas/results; it never connects to the debugging port or gets credentials.
-New retailer adapters supply their own domains and semantic action policies.
+Runtime calls these bounded methods directly. Providers receive only allowlisted
+labels and references; retailer adapters alone execute purchasing actions.
 """
-import html
 import re
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
+
+from .recovery_evidence import public_url, PROTECTED_DIALOG
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,7 +17,7 @@ AMAZON_ACTIONS = {
     'BEGIN_CHECKOUT': r'^(?:proceed to checkout|continue to checkout|checkout|check out)(?:\s*\(\d+ items?\))?$',
     'CONTINUE_CHECKOUT': r'^(?:continue to checkout|proceed to checkout|continue with checkout|skip and continue to checkout)$',
     'DISMISS_CHECKOUT_OFFER': r'^(?:no thanks|no, thanks|not now|skip|skip this offer|continue without (?:adding|this offer))$',
-    'SUBMIT_ORDER': r'^(?:place (?:your )?order|confirm (?:and place |your )?order|complete purchase|submit order|purchase)(?:\s*\(.*\))?$',
+    'SUBMIT_ORDER': r'^(?:place (?:your )?order|confirm (?:and place |your )?order|complete purchase|submit order|purchase)(?:\s*\(\d+ items?\))?$',
 }
 
 
@@ -30,47 +30,67 @@ class BrowserTools:
         self.nodes = {}
         self.chosen = None
         self.evidence = []
-        self.server = FastMCP('retail-browser')
-        self.server.tool()(self.observe_controls)
-        self.server.tool()(self.inspect_accessibility)
-        self.server.tool()(self.validate_control)
+        self.context = page.context
+        self.owner = getattr(self.context, '_retail_task_id', '')
+        self._server = None
+
+    @property
+    def server(self):
+        # MCP remains available to development tools; runtime uses direct methods.
+        if self._server is None:
+            self._server = FastMCP('retail-browser')
+            for method in (self.observe_controls, self.inspect_accessibility, self.validate_control):
+                self._server.tool()(method)
+        return self._server
 
     def check_page(self):
-        if self.page.url != self.url or urlsplit(self.page.url).hostname not in self.domains:
-            raise ValueError('Page changed or left the retailer domain; observe again in a new action')
+        if (self.page.is_closed() or self.page.context is not self.context
+                or getattr(self.context, '_retail_task_id', '') != self.owner
+                or self.page.url != self.url or urlsplit(self.page.url).hostname not in self.domains):
+            raise ValueError('Page changed or left its account scope; review the task browser')
 
     async def observe_controls(self) -> dict:
-        """Observe visible action buttons and links; account data and cookies are excluded."""
+        """Observe only allowlisted action names, never arbitrary page/customer prose."""
         self.check_page()
         self.nodes.clear()
         self.chosen = None
         controls = []
-        root = self.page.locator('[role=dialog],dialog[open],[aria-modal=true]') if self.action == 'DISMISS_CHECKOUT_OFFER' else self.page
-        for node in (await root.locator('button,input[type=submit],input[type=button],[role=button],a[href],[role=link]').element_handles())[:500]:
-            if not await node.is_visible() or not await node.is_enabled():
-                continue
-            metadata = await node.evaluate("e => { const a=e.closest('a[href]'); const u=a ? new URL(a.href, location.href) : null; return {tag:e.tagName.toLowerCase(),label:(e.getAttribute('aria-label') || (e.matches('input') ? e.value : e.innerText) || '').trim().slice(0,120),href:u && u.origin === location.origin ? u.pathname : ''}; }")
-            ref = str(len(controls) + 1)
-            self.nodes[ref] = (node, metadata)
-            controls.append({'ref': ref, **metadata})
+        pattern = re.compile(self.policies[self.action], re.I)
+        frames = [self.page.main_frame] + [f for f in self.page.frames
+                  if f is not self.page.main_frame and urlsplit(f.url).hostname == urlsplit(self.url).hostname][:4]
+        for frame in frames:
+            root = frame.locator('[role=dialog],dialog[open],[aria-modal=true]') if self.action == 'DISMISS_CHECKOUT_OFFER' else frame
+            if self.action == 'DISMISS_CHECKOUT_OFFER' and await root.filter(has_text=PROTECTED_DIALOG).count():
+                raise ValueError('Checkout dialog requires a user decision')
+            # Role locators pierce shadow roots. Limit handles before transfer.
+            candidates = root.get_by_role('button', name=pattern).or_(root.get_by_role('link', name=pattern))
+            count = await candidates.count()
+            if count > 60:
+                raise ValueError('Too many possible controls; narrow the action before recovery')
+            for node in await candidates.element_handles():
+                if not await node.is_visible() or not await node.is_enabled():
+                    continue
+                metadata = await node.evaluate("e => { const a=e.closest('a[href]'); const u=a ? new URL(a.href, location.href) : null; return {tag:e.tagName.toLowerCase(),label:(e.getAttribute('aria-label') || (e.matches('input') ? e.value : e.innerText) || '').trim().slice(0,120),href:u && u.origin === location.origin ? u.pathname : ''}; }")
+                if not pattern.fullmatch(metadata['label']):
+                    continue
+                # Keep the exact path only in local validation state.
+                metadata['frame'] = frame
+                metadata['frame_url'] = frame.url
+                ref = str(len(controls) + 1)
+                self.nodes[ref] = (node, metadata)
+                controls.append({'ref': ref, 'tag': metadata['tag'], 'label': metadata['label'],
+                                 'href': '/checkout' if 'checkout' in metadata['href'].lower() else ''})
         self.evidence = controls
-        u = urlsplit(self.url)
-        return {'url': urlunsplit((u.scheme, u.netloc, u.path, '', '')), 'expected_action': self.action, 'controls': controls}
+        self.check_page()
+        return {'url': public_url(self.url), 'expected_action': self.action, 'controls': controls}
 
     async def inspect_accessibility(self) -> dict:
-        """Read button and link names through Chromium CDP; excludes text fields and customer text."""
-        self.check_page()
-        session = await self.page.context.new_cdp_session(self.page)
-        try:
-            result = await session.send('Accessibility.getFullAXTree')
-            names = [n.get('name', {}).get('value', '')[:120] for n in result.get('nodes', [])
-                     if not n.get('ignored') and n.get('role', {}).get('value') in ('button', 'link')]
-            return {'button_names': names[:150]}
-        finally:
-            await session.detach()
+        """Targeted role names from the current observation; no full AX tree."""
+        observed = await self.observe_controls()
+        return {'button_names': [c['label'] for c in observed['controls']]}
 
     async def validate_control(self, ref: str) -> dict:
-        """Propose an observed ref for the expected action. Offline replay and live actionability must pass."""
+        """Propose an observed ref for the expected action. Live uniqueness, ownership and actionability must pass."""
         self.check_page()
         self.chosen = None
         if ref not in self.nodes:
@@ -83,19 +103,19 @@ class BrowserTools:
         if self.action == 'CONTINUE_CHECKOUT':
             if not metadata.get('href') or 'checkout' not in urlsplit(metadata['href']).path.lower():
                 return {'validated': False, 'reason': 'Selected link is not a checkout continuation'}
-        # Replay only the bounded button metadata, with scripts and network absent.
-        replay_context = await self.page.context.browser.new_context()
-        try:
-            replay = await replay_context.new_page()
-            await replay.route('**/*', lambda route: route.abort())
-            replay_labels = [metadata['label']] if self.action == 'CONTINUE_CHECKOUT' else [c['label'] for c in self.evidence]
-            await replay.set_content('<body>' + ''.join('<button>' + html.escape(label) + '</button>' for label in replay_labels) + '</body>')
-            candidate = replay.get_by_role('button', name=metadata['label'], exact=True)
-            if await candidate.count() != 1:
-                return {'validated': False, 'reason': 'Offline replay is ambiguous'}
-            await candidate.click(trial=True, timeout=3000)
-        finally:
-            await replay_context.close()
+        if len(eligible) != 1:
+            return {'validated': False, 'reason': 'Multiple eligible controls; human review required'}
+        live_count = 0
+        frames = [self.page.main_frame] + [f for f in self.page.frames if f is not self.page.main_frame
+                  and urlsplit(f.url).hostname == urlsplit(self.url).hostname][:4]
+        for frame in frames:
+            root = frame.locator('[role=dialog],dialog[open],[aria-modal=true]') if self.action == 'DISMISS_CHECKOUT_OFFER' else frame
+            names = re.compile(pattern, re.I)
+            live_count += await root.get_by_role('button', name=names).or_(root.get_by_role('link', name=names)).count()
+        if live_count != 1:
+            return {'validated': False, 'reason': 'Control uniqueness changed after observation'}
+        if metadata['frame'].url != metadata['frame_url']:
+            return {'validated': False, 'reason': 'Frame changed after observation'}
         self.check_page()
         current = await node.evaluate("e => { const a=e.closest('a[href]'); const u=a ? new URL(a.href, location.href) : null; return {label:(e.getAttribute('aria-label') || (e.matches('input') ? e.value : e.innerText) || '').trim().slice(0,120),href:u && u.origin === location.origin ? u.pathname : ''}; }")
         if current['label'] != metadata['label'] or current['href'] != metadata.get('href','') or not await node.is_visible() or not await node.is_enabled():
@@ -104,6 +124,7 @@ class BrowserTools:
         if href and (urlsplit(href).scheme != 'https' or urlsplit(href).hostname not in self.domains):
             return {'validated': False, 'reason': 'Link leaves the permitted retailer'}
         await node.click(trial=True, timeout=3000)
+        self.check_page()
         self.chosen = node
         return {'validated': True, 'ref': ref, 'action': self.action, 'scope': 'current page only; not a permanent repair'}
 
@@ -116,13 +137,21 @@ class PriceTools:
         self.url = page.url
         self.rows = {}
         self.chosen = None
-        self.server = FastMCP('retail-checkout-price')
-        self.server.tool()(self.observe_price_rows)
-        self.server.tool()(self.inspect_price_accessibility)
-        self.server.tool()(self.validate_total)
+        self.context = page.context
+        self.owner = getattr(self.context, '_retail_task_id', '')
+        self._server = None
+
+    @property
+    def server(self):
+        if self._server is None:
+            self._server = FastMCP('retail-checkout-price')
+            for method in (self.observe_price_rows, self.inspect_price_accessibility, self.validate_total):
+                self._server.tool()(method)
+        return self._server
 
     def check_page(self):
-        if self.page.url != self.url or urlsplit(self.page.url).hostname not in self.domains:
+        if (self.page.is_closed() or self.page.context is not self.context or getattr(self.context, '_retail_task_id', '') != self.owner
+                or self.page.url != self.url or urlsplit(self.page.url).hostname not in self.domains):
             raise ValueError('Checkout page changed; observe again')
 
     @staticmethod
@@ -132,7 +161,7 @@ class PriceTools:
         if not match:
             return None
         label = match[1].strip()
-        if re.search(r'card|visa|mastercard|address|phone|email', label, re.I):
+        if not re.fullmatch(r'(?:order total|grand total|total due|amount due|amount payable|subtotal|item subtotal|shipping|delivery|tax|discount|total)', label, re.I):
             return None
         raw = re.search(r'([\d,]+(?:\.\d{2})?)', match[2])
         if not raw:
@@ -160,20 +189,13 @@ class PriceTools:
             candidates.append({'ref': ref, 'label': label, 'amount': amount})
             if len(candidates) == 60:
                 break
-        u = urlsplit(self.url)
-        return {'url': urlunsplit((u.scheme, u.netloc, u.path, '', '')), 'price_rows': candidates}
+        return {'url': public_url(self.url), 'price_rows': candidates}
 
     async def inspect_price_accessibility(self) -> dict:
         """Inspect Chromium AX names for total labels, excluding customer fields."""
         self.check_page()
-        session = await self.page.context.new_cdp_session(self.page)
-        try:
-            result = await session.send('Accessibility.getFullAXTree')
-            names = [str(n.get('name', {}).get('value', ''))[:100] for n in result.get('nodes', [])
-                     if not n.get('ignored') and re.search(r'\b(?:total|amount due|payable)\b', str(n.get('name', {}).get('value', '')), re.I)]
-            return {'total_names': names[:25]}
-        finally:
-            await session.detach()
+        observed = await self.observe_price_rows()
+        return {'total_names': [r['label'] for r in observed['price_rows']]}
 
     async def validate_total(self, ref: str) -> dict:
         """Validate one observed final total without clicking or editing checkout."""

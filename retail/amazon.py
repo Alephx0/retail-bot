@@ -24,6 +24,7 @@ from .store import now
 from .interactions import resolve, InteractionError
 from .browser_bridge import validate_endpoint
 from .browser_agent import BrowserAgent
+from .browser_recovery import RecoveryController
 from .browser_mcp import AMAZON_ACTIONS
 from .browser_visibility import set_visible
 from .browser_runtime import browser_options, extension_paths
@@ -89,6 +90,7 @@ class Amazon:
         self.browser_visible = False
         self.browser_initially_visible = False
         self.agent = BrowserAgent(store) if store else None
+        self.recovery = RecoveryController(store)
         self.profiles = AccountBrowserProfiles(store) if store else None
 
     @staticmethod
@@ -139,35 +141,16 @@ class Amazon:
         return response
 
     async def resolve_action(self, page, action):
-        settings = (self.store.get('settings', 'settings') or {}) if self.store else {}
-        mode = settings.get('agent_mode', 'off')
         page._retail_expected_action = action
-        if mode != 'agent':
-            try:
-                return await resolve(page, action)
-            except InteractionError as exc:
-                if mode == 'off' or ('multiple' in str(exc) and action != 'CONTINUE_CHECKOUT'):
-                    raise
-                if (page.url, action) in getattr(page, '_retail_agent_attempts', set()):
-                    raise InteractionError('Agent already attempted this page action; review the task browser') from exc
-                if self.agent:
-                    repaired = await self.agent.reuse(page, action, set(DOMAINS.values()), AMAZON_ACTIONS)
-                    if repaired is not None:
-                        attempts = getattr(page, '_retail_agent_attempts', set())
-                        attempts.add((page.url, action))
-                        page._retail_agent_attempts = attempts
-                        return repaired
-                from .diagnostics import Diagnostics
-                await Diagnostics(self.store).capture({'id': getattr(page.context, '_retail_task_id', '')}, page, action, exc)
-        # One bounded attempt per action/URL per page lifetime prevents an API
-        # request on every monitor poll. A new task gets a fresh budget.
-        attempts = getattr(page, '_retail_agent_attempts', set())
-        key = (page.url, action)
-        if key in attempts:
-            raise InteractionError('Agent already attempted this page action; review the task browser')
-        attempts.add(key)
-        page._retail_agent_attempts = attempts
-        return await self.agent.resolve(page, action, set(DOMAINS.values()), AMAZON_ACTIONS)
+        try:
+            # All persisted modes, including legacy "agent", are deterministic first.
+            return await resolve(page, action)
+        except InteractionError as exc:
+            if 'multiple' in str(exc):
+                raise
+            settings = (self.store.get('settings', 'settings') or {}) if self.store else {}
+            return await self.recovery.resolve(page, action, self.agent,
+                                               allow_ai=settings.get('agent_mode', 'off') != 'off')
 
     @timed('Browser engine readiness')
     async def ready(self, settings=None):
@@ -951,20 +934,13 @@ class Amazon:
                 with stage('Resolve purchase control'):
                     cart = await resolve(page,"ADD_TO_CART")
         except InteractionError:
-            # Stock checks do not spend an AI request each polling cycle.
             cart = page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['ADD_TO_CART'], re.I))
-            if not inventory_only and self.agent and (self.store.get('settings', 'settings') or {}).get('agent_mode') in ('recovery', 'agent'):
-                buttons = page.locator('button,input[type=submit],input[type=button],[role=button]')
-                labels = await buttons.evaluate_all("els => els.slice(0,150).map(e => e.getAttribute('aria-label') || (e.matches('input') ? e.value : e.innerText) || '')")
-                observed = getattr(page, '_retail_monitor_attempts', set())
-                if page.url not in observed and any(re.search(r'cart|basket|bag', label, re.I) for label in labels[:150]):
-                    observed.add(page.url)
-                    page._retail_monitor_attempts = observed
-                    try:
-                        with stage('Purchase-control AI recovery'):
-                            cart = await self.agent.resolve(page, 'ADD_TO_CART', set(DOMAINS.values()), AMAZON_ACTIONS)
-                    except InteractionError as exc:
-                        agent_error = str(exc)
+            if not inventory_only:
+                try:
+                    with stage('Purchase-control recovery'):
+                        cart = await self.resolve_action(page, 'ADD_TO_CART')
+                except InteractionError as exc:
+                    agent_error = str(exc)
         unique = await cart.count() == 1 if hasattr(cart, 'count') else True
         cart_available = unique and await cart.is_visible() and await cart.is_enabled()
         # Inventory and permission to buy are different. Grocery pages can say
@@ -1319,9 +1295,10 @@ class Amazon:
             text = await row.inner_text()
             if re.search(r"^\s*Order total\s*:", text, re.I):
                 values.append(money(text))
-        if not values and self.agent and self.store and (self.store.get('settings', 'settings') or {}).get('agent_mode') in ('recovery', 'agent'):
+        if not values and self.agent:
             try:
-                values = [await self.agent.resolve_total(page, set(DOMAINS.values()), allow_model=allow_recovery)]
+                values = [await self.recovery.read_total(page, self.agent, allow_model=allow_recovery and
+                    (self.store.get('settings', 'settings') or {}).get('agent_mode', 'off') != 'off')]
             except InteractionError as exc:
                 raise Attention('Final order total changed and AI could not verify it: ' + str(exc)) from exc
         if not values or any(value is None or value != values[0] for value in values) or values[0] > max_total:

@@ -106,7 +106,7 @@ function bindPerformance(modal, kind, id) {
       if (!modal.isConnected) return;
       const active = data.active.map(row => `<li>${esc(row.stage)}: ${duration(row.duration_ms)} elapsed</li>`).join('');
       body.innerHTML = (active ? `<p>In progress</p><ul>${active}</ul>` : '') + (data.summary.length ?
-        `<div class="table-wrap"><table><thead><tr><th>Step</th><th>Latest</th><th>Average</th><th>Longest</th><th>Count</th></tr></thead><tbody>${data.summary.map(row => `<tr><td>${esc(row.stage)}${row.errors ? `<small>${row.errors} failed</small>` : ''}</td><td>${duration(row.last_ms)}</td><td>${duration(row.mean_ms)}</td><td>${duration(row.max_ms)}</td><td>${row.count}</td></tr>`).join('')}</tbody></table></div>` : '<p class="help">No completed timings yet. Start the task, then refresh here. Timings reset when the application restarts.</p>');
+        `<div class="table-wrap"><table><thead><tr><th>Step</th><th>Latest</th><th>Average</th><th>p95</th><th>Longest</th><th>Count</th></tr></thead><tbody>${data.summary.map(row => `<tr><td>${esc(row.stage)}${row.errors ? `<small>${row.errors} failed</small>` : ''}</td><td>${duration(row.last_ms)}</td><td>${duration(row.mean_ms)}</td><td>${duration(row.p95_ms ?? row.max_ms)}</td><td>${duration(row.max_ms)}</td><td>${row.count}</td></tr>`).join('')}</tbody></table></div>` : '<p class="help">No completed timings yet. Start the task, then refresh here. Timings reset when the application restarts.</p>');
       loaded = true;
     } catch (error) { body.textContent = error.message; }
     finally { button.disabled = false; }

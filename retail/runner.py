@@ -168,6 +168,8 @@ class TaskRunner:
                 login_page._retail_start_url = f"https://{DOMAINS[account['region']]}/dp/{start_item['asin']}" if group['retailer'] == 'amazon' else None
                 self.pages[id] = [login_page]
                 context._retail_task_login_page = login_page
+                if hasattr(adapter, 'recovery'):
+                    await adapter.recovery.install(login_page)
                 account = await self.verify_account_session(id, adapter, context, account, login_page)
                 self.status(id, 'ready', 'Account session verified')
                 return True
@@ -254,6 +256,8 @@ class TaskRunner:
                     if not task["simulation"]:
                         checkout_page = getattr(context, '_retail_task_login_page', None) or await context.new_page()
                         context._retail_task_login_page = None
+                        if hasattr(adapter, 'recovery'):
+                            await adapter.recovery.install(checkout_page)
                         if checkout_page not in pages:
                             await self.hide_if_background(adapter, checkout_page)
                         self.pages[id] = [*pages, checkout_page] if checkout_page not in pages else pages

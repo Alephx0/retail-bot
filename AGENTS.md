@@ -13,6 +13,10 @@
 - Shared inventory monitors use read-only stock inspection without AI purchase-control recovery. Keep account offer checks before carting. Use bounded, on-demand stage timings to diagnose latency; distinguish nested timings, intentional waits, and live network variability from controlled benchmarks.
 - Amazon action readiness must depend on observable page or lifecycle states, never fixed settle sleeps. Bound stalled waits using browser timeouts, preserve retailer polling/backoff intervals, and never retry an irreversible action because its expected state did not appear. Test immediate, delayed, missing and interrupted transitions.
 
+- Successful browser actions are always deterministic, including saved legacy agent mode. Keep AI, diagnostics and source repair out of the fast path. Recovery owns only the current task page, obeys its deadline, and cannot retry a possibly submitted mutation.
+- Runtime recovery uses bounded direct Patchright calls. MCP is a development interface, not a second browser controller. Only explicit optional-dialog handlers may dismiss interruptions; verification, consent and purchase choices remain protected.
+- Model proposals are unapproved candidates. Source repairs run offline in isolated worktrees with a reproducing fixture, regression tests, performance gate and review. Never edit or reload the running application's source. Export only allowlisted incident evidence, never page prose, raw URLs, account data or traces.
+
 ## Product and interface
 
 - Justify every new setting with a concrete user need. Group creation has name, retailer, monitor input and order limit. Preserve the requested General, Monitoring, Checkout and Advanced group tabs and profile/profile-group assignment previews in Add tasks. Keep purchase goals, unit quotas and global purchasing inheritance out of the primary workflow.

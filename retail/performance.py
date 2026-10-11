@@ -1,5 +1,6 @@
 """Bounded in-memory stage timings. Never records arguments, URLs or secrets."""
 import asyncio
+import math
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -30,13 +31,17 @@ class Performance:
         summary = {}
         for row in rows:
             entry = summary.setdefault(row['stage'], {'stage': row['stage'], 'count': 0, 'total_ms': 0,
-                                                       'max_ms': 0, 'last_ms': 0, 'errors': 0})
+                                                       'max_ms': 0, 'last_ms': 0, 'errors': 0, 'durations': []})
+            entry['durations'].append(row['duration_ms'])
             entry['count'] += 1
             entry['total_ms'] += row['duration_ms']
             entry['max_ms'] = max(entry['max_ms'], row['duration_ms'])
             entry['last_ms'] = row['duration_ms']
             entry['errors'] += row['outcome'] == 'error'
         for entry in summary.values():
+            durations = sorted(entry.pop('durations'))
+            for percentile in (50, 95, 99):
+                entry[f'p{percentile}_ms'] = durations[min(len(durations)-1, max(0, math.ceil(len(durations)*percentile/100)-1))]
             entry['mean_ms'] = round(entry.pop('total_ms') / entry['count'], 2)
         return {'summary': sorted(summary.values(), key=lambda row: row['mean_ms'], reverse=True),
                 'recent': rows[-200:], 'active': [{**row, 'duration_ms': round((time.monotonic()-start)*1000, 2)}

@@ -1,5 +1,6 @@
 """Semantic actions with strict uniqueness and stable-attribute fallbacks."""
 import re
+from .recovery_evidence import PROTECTED_DIALOG
 
 
 class InteractionError(ValueError):
@@ -21,6 +22,8 @@ async def resolve(page, action):
     role,label,fallbacks=ACTIONS[action]
     if action == 'DISMISS_CHECKOUT_OFFER':
         page = page.locator('[role=dialog],dialog[open],[aria-modal=true]')
+        if await page.filter(has_text=PROTECTED_DIALOG).count():
+            raise InteractionError('This checkout dialog requires a user decision')
     candidates=[page.get_by_role(role,name=re.compile(label,re.I)),page.get_by_label(re.compile(label,re.I))]+[page.locator(css) for css in fallbacks]
     # Amazon's /checkout/byg interstitial renders the continuation as an
     # anchor, not a button. Resolve that known safe transition locally before
@@ -51,7 +54,7 @@ async def resolve(page, action):
                 # Recovery mode may let the bounded MCP agent choose between
                 # distinct same-site checkout continuations using their
                 # sanitized destinations. Do not make this an automatic stop.
-                raise InteractionError('CONTINUE_CHECKOUT: multiple eligible controls; agent disambiguation required')
+                raise InteractionError('CONTINUE_CHECKOUT: multiple eligible controls; manual review required')
     for locator in candidates:
         visible=[]
         for node in await locator.all():

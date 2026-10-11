@@ -158,11 +158,15 @@ def test_shared_monitor_keeps_checkout_context_capacity_available(tmp_path):
             if adapter.inspections:
                 break
             await asyncio.sleep(.01)
+        waiting = asyncio.Event()
+        original_status = engine.status
+        def observe_status(id, status, message, **metadata):
+            original_status(id, status, message, **metadata)
+            if id == tasks[1]['id'] and status == 'waiting':
+                waiting.set()
+        engine.status = observe_status
         await engine.start(tasks[1]['id'])
-        for _ in range(100):
-            if store.get('tasks', tasks[1]['id'])['status'] == 'waiting':
-                break
-            await asyncio.sleep(.01)
+        await asyncio.wait_for(waiting.wait(), 5)
         assert store.get('tasks', tasks[1]['id'])['status'] == 'waiting'
         assert all(not lock.locked() for lock in engine.account_locks.values())
         assert adapter.open_contexts == 1  # Sign-in preflights release their workers.

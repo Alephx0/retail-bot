@@ -1,6 +1,8 @@
 """One account-specific attempt. No automatic replay after a mutating boundary."""
 import asyncio
 import uuid
+import time
+from ..browser_recovery import execution_deadline
 
 from ..amazon import Attention
 from .domain import cents, qualifying, effective_plan
@@ -31,11 +33,14 @@ class Executor:
 
     async def run(self, attempt):
         plan=effective_plan(self.repo.require('run',attempt['run_id'])['plan'],attempt['account_id'])
+        token = execution_deadline.set(time.monotonic()+plan.get('checkout_timeout_seconds',300))
         try:
             await asyncio.wait_for(self.execute(attempt,plan),plan.get('checkout_timeout_seconds',300))
         except TimeoutError:
             # execute's cancellation handler records a safe or uncertain outcome before returning.
             return
+        finally:
+            execution_deadline.reset(token)
 
     async def execute(self, attempt, plan):
         id=attempt['id']; run=self.repo.require('run',attempt['run_id'])
@@ -72,11 +77,15 @@ class Executor:
                 page=session['page']; adapter=self.c.engine.amazon
                 self.c.pages[id]=page
                 page._retail_agent_attempts=set()
+                page._retail_recovered_controls={}
                 page._retail_submit_control=None
                 page._retail_review=None
                 page._retail_submit_gate=lambda:self.repo.submit_gate(id)
                 page._retail_task_id=id
                 session['context']._retail_task_id=id
+                page._retail_recovery_deadline = execution_deadline.get() or float('inf')
+                if hasattr(adapter, 'recovery'):
+                    await adapter.recovery.install(page)
                 self.repo.stage(id,'preparing','Verifying account session and offer')
                 await adapter.ensure_session(session['context'],account,page)
                 item={'asin':target['product_id'],'max_price':target['max_unit_cents']/100,'offer_id':target['offer_id']}

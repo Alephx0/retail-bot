@@ -130,7 +130,7 @@ def test_provider_protocol_and_errors():
     asyncio.run(scenario())
 
 
-def test_real_mcp_round_trip_recovery_and_rejections(tmp_path):
+def test_direct_provider_recovery_and_rejections(tmp_path):
     async def scenario():
         store = Store(tmp_path)
         connection = store.put('ai_connections', AIConnection(name='fixture', api_key='unused').model_dump())
@@ -153,20 +153,20 @@ def test_real_mcp_round_trip_recovery_and_rejections(tmp_path):
             await page.set_content('<button onclick="window.clicked=true">Add item to cart</button><input type=password value="PRIVATE">')
             adapter = Amazon(store)
             adapter.agent = BrowserAgent(store, provider_factory=FakeProvider)
-            node = await adapter.resolve_action(page, 'ADD_TO_CART')
+            node = await adapter.agent.resolve(page, 'ADD_TO_CART', {'www.amazon.com'}, AMAZON_ACTIONS)
             assert not await page.evaluate('Boolean(window.clicked)', isolated_context=False), 'Replay and trial must never click the real cart'
             await node.click()
             assert await page.evaluate('window.clicked', isolated_context=False)
             assert store.all('agent_runs')[-1]['status'] == 'validated'
             assert len(store.all('repair_recipes')) == 1
-            with pytest.raises(InteractionError, match='already attempted'):
-                await adapter.resolve_action(page, 'ADD_TO_CART')
+            assert store.all('repair_recipes')[0]['status'] == 'candidate'
+            assert await adapter.agent.reuse(page, 'ADD_TO_CART', {'www.amazon.com'}, AMAZON_ACTIONS) is None
             next_page = await browser.new_page()
             await next_page.route('https://www.amazon.com/**', lambda r: r.fulfill(body='<body></body>', content_type='text/html'))
             await next_page.goto('https://www.amazon.com/dp/B012345678')
             await next_page.set_content('<button>Add item to cart</button>')
             assert await adapter.resolve_action(next_page, 'ADD_TO_CART')
-            assert len(store.all('agent_runs')) == 1, 'Saved repair should be replayed without another API call'
+            assert len(store.all('agent_runs')) == 1, 'Known structure should resolve without another API call; candidates remain unapproved'
             await next_page.close()
 
             tools = BrowserTools(page, 'ADD_TO_CART', {'www.amazon.com'}, AMAZON_ACTIONS)
@@ -192,7 +192,7 @@ def test_real_mcp_round_trip_recovery_and_rejections(tmp_path):
     asyncio.run(scenario())
 
 
-def test_mcp_recovers_renamed_final_total_without_clicking(tmp_path):
+def test_deterministic_renamed_final_total_without_clicking(tmp_path):
     async def scenario():
         store = Store(tmp_path)
         connection = store.put('ai_connections', AIConnection(name='fixture', api_key='unused').model_dump())
@@ -215,8 +215,8 @@ def test_mcp_recovers_renamed_final_total_without_clicking(tmp_path):
             snapshot = await adapter.checkout_snapshot(page, 'B012345678', 1, 30, max_unit_price=20)
             assert snapshot['total'] == 23.50
             assert not await page.evaluate('Boolean(window.ordered)', isolated_context=False)
-            assert store.all('agent_runs')[-1]['status'] == 'validated'
-            assert len(store.all('price_recipes')) == 1
+            assert not store.all('agent_runs'), 'Known total semantics should not require a model'
+            assert not store.all('price_recipes')
             tools = PriceTools(page, {'www.amazon.com'})
             await page.set_content('<ul><li>Grand total: $23.50</li><li>Amount due: $24.50</li></ul><input name="placeYourOrder1" type="submit" value="Place your order">')
             await tools.observe_price_rows()
@@ -275,7 +275,7 @@ def test_checkout_rechecks_price_before_single_submission():
     asyncio.run(scenario())
 
 
-def test_monitor_uses_structured_price_and_mcp_control_recovery(tmp_path):
+def test_account_offer_uses_structured_price_and_control_recovery(tmp_path):
     async def scenario():
         store = Store(tmp_path)
         connection = store.put('ai_connections', AIConnection(name='fixture').model_dump())
@@ -296,7 +296,7 @@ def test_monitor_uses_structured_price_and_mcp_control_recovery(tmp_path):
             adapter.agent = BrowserAgent(store, provider_factory=FakeProvider)
             item = await adapter.inspect(page, {'asin': 'B012345678'}, 'US')
             assert item['title'] == 'Changed product' and item['price'] == 19.75 and item['available'], repr(item)
-            assert store.all('agent_runs')[0]['status'] == 'validated'
+            assert not store.all('agent_runs'), 'Known alternative cart labels recover deterministically'
             await browser.close()
         store.db.close()
     asyncio.run(scenario())
@@ -400,12 +400,12 @@ def test_amazon_agent_end_to_end_checkout_fixture(tmp_path, seller_missing):
                     current = store.get('tasks', task['id'])
                     if current['status'] in ('completed', 'error', 'review', 'attention'): break
                     await asyncio.sleep(.05)
-                assert current['status'] == 'completed', current
+                assert current['status'] == 'completed', current.get('message', current)
                 assert len(orders) == 1
                 assert len(store.all('checkouts')) == 1
                 # Inventory monitoring never invokes AI action recovery. The
                 # account offer and cart still resolve their purchase controls.
-                assert [r['action'] for r in store.all('agent_runs')] == ['ADD_TO_CART', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'SUBMIT_ORDER']
+                assert not store.all('agent_runs'), 'Legacy agent mode now preserves the deterministic path'
                 assert cart_items == 1
                 assert store.get('submissions', 'submission-' + task['id'])['status'] == 'confirmed'
             finally:
@@ -456,10 +456,10 @@ def test_agent_settings_browser_flow(tmp_path, monkeypatch):
             await page.locator('[data-view=settings]').last.click()
             await page.locator('[data-settings-tab=integrations]').click()
             await page.get_by_label('Connection', exact=True).select_option(label='Test OpenAI · gpt-6-sol')
-            await page.get_by_label('When AI may assist', exact=True).select_option('agent')
+            await page.get_by_label('When AI may assist', exact=True).select_option('recovery')
             await page.get_by_role('button', name='Save changes', exact=True).click()
             from patchright.async_api import expect
-            await expect(page.get_by_label('When AI may assist', exact=True)).to_have_value('agent')
+            await expect(page.get_by_label('When AI may assist', exact=True)).to_have_value('recovery')
             await page.locator('[data-settings-tab=browser]').click()
             await page.get_by_label('Browser connection', exact=True).select_option('true')
             await page.get_by_role('button', name='Save changes', exact=True).click()

@@ -73,6 +73,15 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM records WHERE kind=? AND id=?", (kind, id))
 
+    def put_bounded(self, kind, record, id=None, *, limit=200):
+        """Bound exceptional evidence on disk without decrypting historical rows."""
+        value = self.put(kind, record, id)
+        with self.db:
+            self.db.execute('DELETE FROM records WHERE kind=? AND rowid NOT IN '
+                            '(SELECT rowid FROM records WHERE kind=? ORDER BY rowid DESC LIMIT ?)',
+                            (kind, kind, limit))
+        return value
+
     def event(self, task_id, status, message):
         self.put("events", {"task_id": task_id, "status": status, "message": message, "at": now()})
         with self.db:

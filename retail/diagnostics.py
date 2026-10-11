@@ -1,6 +1,5 @@
 """Encrypted, bounded failure evidence. No production code is rewritten."""
 import base64
-from urllib.parse import urlsplit, urlunsplit
 
 from .store import now
 
@@ -8,28 +7,25 @@ from .store import now
 class Diagnostics:
     def __init__(self,store): self.store=store
 
-    async def capture(self,task,page,action,error):
-        record={'task_id':task['id'],'action':getattr(page,'_retail_expected_action',action),'stage':action,'previous_locator':getattr(page,'_retail_previous_locator',''),'error':str(error)[:500], 'at':now(),'status':'needs_review'}
+    async def capture(self, task, page, action, error):
+        from .browser_mcp import BrowserTools, AMAZON_ACTIONS
+        from .models import DOMAINS
+        from .recovery_evidence import public_url
+        import asyncio
+        expected = getattr(page, '_retail_expected_action', action)
+        record = {'task_id': task['id'], 'action': expected, 'stage': action,
+                  'error': type(error).__name__, 'at': now(), 'status': 'needs_review',
+                  'url': public_url(getattr(page, 'url', '')), 'dom': [], 'schema_version': 1}
+        # No screenshot/full AX tree on the recovery path. Explicit user traces
+        # remain encrypted and never form part of an AI/source-repair export.
         try:
-            u=urlsplit(page.url);record['url']=urlunsplit((u.scheme,u.netloc,u.path,'',''))
-            if '/checkout/' in u.path:
-                from .browser_mcp import PriceTools
-                try:
-                    pricing = PriceTools(page, {u.hostname})
-                    record['price_candidates'] = (await pricing.observe_price_rows())['price_rows']
-                except Exception:
-                    record['price_candidates'] = []
-            # Capture semantic controls only, excluding input values, scripts,
-            # cookies, hidden fields, and arbitrary page/customer text.
-            record['dom']=await page.locator('button,input[type=submit],input[type=button],select,a[href],[role=button],[role=link]').evaluate_all("els=>els.filter(e=>e.getClientRects().length).slice(0,500).map(e=>({tag:e.tagName,role:e.getAttribute('role'),id:e.id,name:e.getAttribute('name'),label:(e.getAttribute('aria-label')||(e.matches('input')?e.value:e.innerText)||'').slice(0,120)}))")
-            record['accessibility']=await page.locator('body').aria_snapshot(timeout=3000)
-            record['accessibility']=record['accessibility'][:20000]
-            # Mask customer content, retain control placement. Stored encrypted.
-            mask=page.locator('input,textarea,[contenteditable],p,span,a,td')
-            record['screenshot']=base64.b64encode(await page.screenshot(mask=[mask],timeout=3000)).decode()
+            if expected in AMAZON_ACTIONS:
+                async with asyncio.timeout(2):
+                    browser = BrowserTools(page, expected, set(DOMAINS.values()), AMAZON_ACTIONS)
+                    record['dom'] = (await browser.observe_controls())['controls']
         except Exception:
-            record['capture_note']='Some evidence could not be captured before the browser closed'
-        return self.store.put('diagnostics',record)
+            record['capture_note'] = 'Bounded control evidence unavailable'
+        return self.store.put_bounded('diagnostics', record)
 
     async def finish_trace(self, task_id, context):
         import tempfile

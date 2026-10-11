@@ -26,9 +26,12 @@ class CheckStore:
     def all(self, table):
         return self.records.get(table, [])
 
-    def put(self, table, record):
+    def put(self, table, record, id=None):
         self.records.setdefault(table, []).append(record)
         return record
+
+    def put_bounded(self, table, record, id=None, **kwargs):
+        return self.put(table, record, id)
 
 
 def fixture(path):
@@ -98,7 +101,7 @@ async def check_recovery(connection, provider_factory=None):
                 raise ValueError('Popup remained open')
             scenarios.append({'name': stage, 'ok': True})
             stage = 'duplicate checkout links'
-            control = await agent.resolve(page, 'CONTINUE_CHECKOUT', {'www.amazon.com'}, AMAZON_ACTIONS)
+            control = await Amazon(store).resolve_action(page, 'CONTINUE_CHECKOUT')
             await control.click()
             await page.wait_for_url('**/checkout/p/example/spc')
             scenarios.append({'name': stage, 'ok': True})
@@ -114,7 +117,7 @@ async def check_recovery(connection, provider_factory=None):
             if await adapter.confirmation(page) != '123-4567890-1234567':
                 raise ValueError('Simulated checkout confirmation was not detected')
             scenarios.append({'name': stage, 'ok': True})
-            return {'ok': True, 'message': 'AI + MCP + CDP recovered through the local checkout fixture, verified the $21.20 total and detected simulated order confirmation. No Amazon account or real purchase was used.', 'scenarios': scenarios}
+            return {'ok': True, 'message': 'Bounded AI proposals and deterministic CDP controls recovered through the local checkout fixture, verified the $21.20 total and detected simulated order confirmation. No Amazon account or real purchase was used.', 'scenarios': scenarios}
         except Exception as exc:
             scenarios.append({'name': stage, 'ok': False})
             return {'ok': False, 'message': f'Browser recovery failed at {stage}: {exc}', 'scenarios': scenarios}

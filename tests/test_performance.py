@@ -95,3 +95,24 @@ def test_monitor_never_uses_purchase_control_recovery(tmp_path, monkeypatch):
             await browser.close()
         store.db.close()
     asyncio.run(scenario())
+
+
+def test_percentiles_are_computed_only_on_snapshot():
+    recorder = Performance()
+    for duration in range(1, 101):
+        recorder.samples.append({'kind':'task','id':'one','stage':'Read','duration_ms':duration,'outcome':'ok'})
+    row = recorder.snapshot()['summary'][0]
+    assert (row['p50_ms'], row['p95_ms'], row['p99_ms']) == (50, 95, 99)
+    assert 'durations' not in row
+
+
+def test_recovery_read_model_matches_compact_workspace(tmp_path):
+    app=create_app(tmp_path)
+    with TestClient(app) as client:
+        app.state.engine.amazon.recovery.active[1]={'task_id':'one','status':'Recovering','action':'ADD_TO_CART'}
+        full=client.get('/api/state').json()
+        compact=client.get('/api/task-workspace').json()
+        assert full['browser_recovery']==compact['browser_recovery']
+        assert compact['browser_recovery']['active'][0]['task_id']=='one'
+        assert not full['tasks'], 'Recovery telemetry must not create or rewrite task state'
+        assert client.get('/api/recovery-incidents').json()==[]

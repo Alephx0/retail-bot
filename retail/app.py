@@ -171,6 +171,10 @@ def create_app(data_dir=None, *, warm_browser=False):
     async def performance(kind: str = '', id: str = ''):
         return app.state.engine.performance.snapshot(kind, id)
 
+    @app.get('/api/recovery-incidents')
+    async def recovery_incidents():
+        return store().all('recovery_incidents')
+
     @app.get("/api/state")
     async def state():
         result = {kind: [public(kind, x) for x in store().all(kind)] for kind in [*MODELS, "feed", "checkouts", "quotes", "proxy_health", "harvesters", "submissions"]}
@@ -179,6 +183,7 @@ def create_app(data_dir=None, *, warm_browser=False):
         result['events']=sorted(result['events']+group_events,key=lambda e:e['at'],reverse=True)[:150]
         result["active"] = list(app.state.engine.jobs)
         result['monitors'] = app.state.engine.monitors.snapshot()
+        result['browser_recovery'] = app.state.engine.amazon.recovery.snapshot()
         result['task_browser_ids'] = list(app.state.engine.pages)
         result['task_groups'] = [app.state.group_coordinator.summary(g) for g in app.state.group_coordinator.repo.all('group') if not g.get('archived')]
         result['fingerprint_tests'] = list(app.state.engine.amazon.fingerprint_tests)
@@ -604,6 +609,7 @@ def create_app(data_dir=None, *, warm_browser=False):
             'active': list(app.state.engine.jobs),
             'monitors': app.state.engine.monitors.snapshot(),
             'task_browser_ids': list(app.state.engine.pages),
+            'browser_recovery': app.state.engine.amazon.recovery.snapshot(),
         }
 
     @app.post('/api/task-workspace/{group_id}/duplicate')

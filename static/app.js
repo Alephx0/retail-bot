@@ -27,7 +27,7 @@ async function refresh(force=false){
   try{
     if(view==='task_groups'&&stateLoaded&&!force){
       const next=await api('task-workspace');
-      const changed=['groups','tasks','active','monitors','task_browser_ids'].some(key=>JSON.stringify(next[key])!==JSON.stringify(state[key]));
+      const changed=['groups','tasks','active','monitors','task_browser_ids','browser_recovery'].some(key=>JSON.stringify(next[key])!==JSON.stringify(state[key]));
       Object.assign(state,next);if(changed)render();
     }else if(view==='saved_plans'&&stateLoaded&&!force){
       if(taskGroupId)await loadTaskGroup();

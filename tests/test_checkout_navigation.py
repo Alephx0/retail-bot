@@ -6,6 +6,7 @@ import pytest
 from patchright.async_api import async_playwright
 
 from retail.amazon import Amazon, CartRejected
+from retail.interactions import InteractionError
 from retail.browser_agent import BrowserAgent
 from retail.browser_mcp import AMAZON_ACTIONS, BrowserTools
 from retail.models import AIConnection
@@ -42,7 +43,7 @@ def test_user_browser_recovery_check():
 
 
 @pytest.mark.parametrize('modal', [False, True])
-def test_byg_link_recovery_through_real_mcp(tmp_path, modal):
+def test_byg_link_and_dialog_recover_without_model(tmp_path, modal):
     async def scenario():
         store = Store(tmp_path)
         connection = store.put('ai_connections', AIConnection(name='fixture').model_dump())
@@ -70,7 +71,7 @@ def test_byg_link_recovery_through_real_mcp(tmp_path, modal):
             assert page.url.endswith('/checkout/review')
             assert not await page.evaluate('Boolean(window.unwanted)', isolated_context=False)
             runs = store.all('agent_runs')
-            assert [r['action'] for r in runs] == (['DISMISS_CHECKOUT_OFFER'] if modal else [])
+            assert not runs, 'A safe semantic dismissal should not require a model'
             assert all(r['status'] == 'validated' for r in runs)
             assert len(requests) == 2
             await browser.close()
@@ -100,6 +101,7 @@ def test_amazon_bypass_uses_checkout_link_without_model(tmp_path):
         async with async_playwright() as driver:
             browser = await driver.chromium.launch()
             page = await browser.new_page()
+            await page.route('**/*', lambda r: r.fulfill(body='<body></body>', content_type='text/html'))
             await page.goto('https://www.amazon.com/checkout/byg')
             await page.set_content('<a href="/checkout/review">Continue to checkout</a><input name="submit.addToCart" value="Add"><a href="/checkout/review">Continue to checkout</a>')
             adapter = Amazon(store)
@@ -110,7 +112,7 @@ def test_amazon_bypass_uses_checkout_link_without_model(tmp_path):
     asyncio.run(scenario())
 
 
-def test_different_checkout_links_are_sent_to_ai(tmp_path):
+def test_different_checkout_links_require_review(tmp_path):
     async def scenario():
         store = Store(tmp_path)
         connection = store.put('ai_connections', AIConnection(name='fixture').model_dump())
@@ -118,13 +120,14 @@ def test_different_checkout_links_are_sent_to_ai(tmp_path):
         async with async_playwright() as driver:
             browser = await driver.chromium.launch()
             page = await browser.new_page()
+            await page.route('**/*', lambda r: r.fulfill(body='<body></body>', content_type='text/html'))
             await page.goto('https://www.amazon.com/checkout/byg')
             await page.set_content('<a href="/checkout/entry">Continue to checkout</a><a href="/checkout/review">Continue to checkout</a><button>Add</button>')
             adapter = Amazon(store)
             adapter.agent = BrowserAgent(store, provider_factory=NavigationProvider)
-            control = await adapter.resolve_action(page, 'CONTINUE_CHECKOUT')
-            assert await control.get_attribute('href') == '/checkout/entry'
-            assert store.all('agent_runs')[-1]['status'] == 'validated'
+            with pytest.raises(InteractionError, match='multiple'):
+                await adapter.resolve_action(page, 'CONTINUE_CHECKOUT')
+            assert not store.all('agent_runs'), 'A model may not choose between conflicting destinations'
             await browser.close()
         store.db.close()
     asyncio.run(scenario())

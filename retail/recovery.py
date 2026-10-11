@@ -14,6 +14,13 @@ class Candidate(BaseModel):
 
 
 async def diagnose(store, diagnostic):
+    # Old diagnostic rows may contain raw labels or personal data. Never send them.
+    from .browser_mcp import AMAZON_ACTIONS
+    import re
+    action = diagnostic.get('action')
+    controls = [{'tag': 'button', 'label': str(c.get('label', ''))} for c in diagnostic.get('dom', [])
+                if action in AMAZON_ACTIONS and re.fullmatch(AMAZON_ACTIONS[action], str(c.get('label', '')), re.I)]
+    diagnostic = {'id': diagnostic['id'], 'action': action, 'dom': controls[:60]}
     settings=store.get('settings','settings') or {}
     connection = store.get('ai_connections', settings.get('ai_connection_id', ''))
     if connection:
