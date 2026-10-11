@@ -154,6 +154,8 @@ class Coordinator:
                 run=self.repo.run_state(run['id'],'preparing','Preparing account sessions before the execution window')
             if run['state']=='preparing' and timestamp>=window['start']:
                 run=self.repo.run_state(run['id'],'watching','Execution window is open')
+                for account_id in enabled_accounts(run['plan']):
+                    self.next_scan.pop((run['id'],account_id),None)
             if run['state'] in ('watching','preparing'):
                 for account_id in enabled_accounts(run['plan']):
                     key=(run['id'],account_id)
@@ -216,7 +218,7 @@ class Coordinator:
         index=self.product_cursor.get(key,0)%len(targets)
         semaphore=self.monitor_slots.setdefault(run['id'],asyncio.Semaphore(plan['monitor_concurrency']))
         try:
-            for target in targets if all_products else [targets[index]]:
+            for target in targets if all_products and run['state']!='preparing' else [targets[index]]:
                 async with semaphore:
                     current=self.repo.require('run',run['id'])
                     if current['state'] not in ('watching','preparing') or self.repo.member_state(*key)['state']!='running':
@@ -227,7 +229,12 @@ class Coordinator:
                         self.read_failure(current,account_id,target,plan,'Read timed out')
         finally:
             self.product_cursor[key]=index+1
-            self.next_scan[key]=time.monotonic()+plan['monitor_interval_ms']/1000
+            # Preparation verifies a session, not every product. Match the
+            # existing browser proof lifetime instead of repeatedly probing HTTP.
+            interval=plan['monitor_interval_ms']/1000
+            self.next_scan[key]=time.monotonic()+(max(60,interval) if run['state']=='preparing' else interval)
+            if run['state']=='preparing' and self.repo.require('run',run['id'])['state']=='watching':
+                self.next_scan[key]=0  # The window opened while verification was in flight.
 
     async def scan(self, run):
         # Explicit one-cycle helper; the scheduler dispatches independent accounts.
@@ -266,10 +273,17 @@ class Coordinator:
                 if not (account.get('session') or account.get('password')):
                     raise Conflict('Sign-in required')
                 cache=self.cache.get(key)
-                if cache and time.monotonic()-cache[0]<plan['monitor_interval_ms']/1000 and run['state']=='watching':
+                mode=(self.engine.store.get('settings','settings') or {}).get('session_verification_mode','http')
+                prepared=False
+                if run['state']=='preparing' and mode=='http' and hasattr(self.engine.amazon,'probe_session'):
+                    async with self.pool.lease(account, probe_only=True):
+                        prepared=await self.engine.amazon.probe_session(account,self.engine.amazon.account_proxy(account))=='authenticated'
+                if prepared:
+                    reason,message='prepared','Saved session accepted; browser verification follows at execution'
+                elif cache and time.monotonic()-cache[0]<plan['monitor_interval_ms']/1000 and run['state']=='watching':
                     product=cache[1]
                 else:
-                    async with self.pool.lease(account) as session:
+                    async with self.pool.lease(account, **({'headless':True} if run['state']=='preparing' and mode=='headless' else {})) as session:
                         cache=self.cache.get(key)
                         if cache and time.monotonic()-cache[0]<plan['monitor_interval_ms']/1000 and run['state']=='watching':
                             product=cache[1]

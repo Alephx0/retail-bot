@@ -107,8 +107,9 @@ class TaskRunner:
             monitors = self.monitors.subscribe(task, group, items, account['region'])
             seen_observations = {}
             startup_products = None
+            session_mode = (self.store.get('settings', 'settings') or {}).get('session_verification_mode', 'http')
             @timed('Account preparation')
-            async def prepare_account(start_item=None):
+            async def prepare_account(start_item=None, *, preliminary=False):
                 nonlocal account_lock, lock_acquired, slot_acquired, account, context
                 start_item = start_item or items[0]
                 account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
@@ -125,11 +126,6 @@ class TaskRunner:
                     if eligible_at > current:
                         self.status(id, 'stopped', 'Account purchase cooldown: start again after ' + eligible_at.isoformat())
                         return False
-                if self.browser_slots.locked():
-                    self.status(id, 'in_queue', 'Waiting for an available browser worker')
-                with stage('Browser worker wait'):
-                    await self.browser_slots.acquire()
-                slot_acquired=True
                 while task['account_id'] in getattr(adapter, 'logins', {}):
                     self.status(id, 'in_queue', 'Waiting for the account login browser to close')
                     login_context = adapter.logins[task['account_id']]
@@ -146,10 +142,34 @@ class TaskRunner:
                 account = self.store.get("accounts", task["account_id"])
                 account_proxy = account.get("proxy") or self.proxy(account.get("proxy_list_id", ""), account["id"])
                 connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)
+                if preliminary and session_mode == 'http' and hasattr(adapter, 'probe_session'):
+                    backoffs = 0
+                    while True:
+                        self.status(id, 'authenticating', 'Checking saved session without opening a browser')
+                        try:
+                            result = await adapter.probe_session(account, connection)
+                            if result == 'authenticated':
+                                self.status(id, 'ready', 'Saved session accepted; browser verification follows when stock is available')
+                                return True
+                            break  # Missing, expired or inconclusive proof requires the normal browser flow.
+                        except BackoffRequired as exc:
+                            backoffs += 1
+                            await self.wait_for_backoff(id, exc, backoffs)
+                            if backoffs >= 3:
+                                await self.pause(id, 'attention', 'Repeated retailer cooldowns. Review the account connection before resuming.')
+                                backoffs = 0
+                        except AccessDenied:
+                            await self.pause(id, 'attention', 'Amazon denied the session check. Review the account connection before resuming.')
+                if self.browser_slots.locked():
+                    self.status(id, 'in_queue', 'Waiting for an available browser worker')
+                with stage('Browser worker wait'):
+                    await self.browser_slots.acquire()
+                slot_acquired=True
+                browser_args = {'headless': True} if preliminary and session_mode == 'headless' else {}
                 if account_proxy and account_proxy != connection:
                     self.status(id, 'authenticating', 'Preparing account session on its sign-in connection')
                     with stage('Sign-in browser setup'):
-                        login_context = await adapter.context(account, account_proxy, task["solver_id"])
+                        login_context = await adapter.context(account, account_proxy, task["solver_id"], **browser_args)
                     try:
                         login_page = await login_context.new_page()
                         await self.hide_if_background(adapter, login_page)
@@ -160,7 +180,7 @@ class TaskRunner:
                         await self.close_context(adapter, login_context)
                 self.status(id, 'authenticating', 'Opening account browser; session verification follows')
                 with stage('Account browser setup'):
-                    context = await adapter.context(account, connection, task["solver_id"])
+                    context = await adapter.context(account, connection, task["solver_id"], **browser_args)
                 context._retail_task_id = id
                 with stage('Account page setup'):
                     login_page = await context.new_page()
@@ -172,6 +192,10 @@ class TaskRunner:
                     await adapter.recovery.install(login_page)
                 account = await self.verify_account_session(id, adapter, context, account, login_page)
                 self.status(id, 'ready', 'Account session verified')
+                if browser_args and (self.store.get('settings', 'settings') or {}).get('show_browser_window', True):
+                    await self.close_context(adapter, context)
+                    context = None
+                    self.pages.pop(id, None)
                 return True
 
             # Give the concurrent first scan a short grace period. Closing an
@@ -179,7 +203,7 @@ class TaskRunner:
             # launch/sign-in when stock arrives a fraction of a second later.
             # Out-of-stock returns immediately; slow scans release the slot.
             if not task['simulation']:
-                if not await prepare_account():
+                if not await prepare_account(preliminary=True):
                     return
                 try:
                     with stage('Initial stock handoff'):
@@ -187,7 +211,7 @@ class TaskRunner:
                                                                   .1 if task['checkout_mode'] == 'monitor' else 1.0)
                 except asyncio.TimeoutError:
                     pass
-                retain_context = task['checkout_mode'] != 'monitor' and any(
+                retain_context = context is not None and task['checkout_mode'] != 'monitor' and any(
                     stock_observation(product)[0] == 'available' for product in startup_products or [])
             pages = []
             self.status(id,"waiting","Standby: waiting for monitor stock observations")

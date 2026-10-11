@@ -290,6 +290,7 @@ class Settings(BaseModel):
     max_running_tasks: int = Field(default=10, ge=1, le=50)
     browser_channel: Literal["chromium", "chrome", "msedge"] = "chromium"
     show_browser_window: bool = True
+    session_verification_mode: Literal['http', 'headless', 'browser'] = 'http'
     browser_timeout_ms: int = Field(default=30000, ge=5000, le=120000)
     interaction_pacing: Literal['off', 'paced'] = 'off'
     proxy_timeout_seconds: int = Field(default=15, ge=3, le=60)
@@ -335,6 +336,8 @@ class Settings(BaseModel):
 
     @model_validator(mode='after')
     def profile_browser_connection(self):
+        if self.cdp_attach and self.session_verification_mode == 'headless':
+            raise ValueError('Headless session verification requires an app-managed browser')
         if self.cdp_attach and (not self.browser_incognito or self.browser_extension_ids):
             raise ValueError('Normal profiles and managed extensions require an app-managed browser')
         if self.fingerprint_backend == 'native' and self.browser_identity not in ('default', 'chrome'):

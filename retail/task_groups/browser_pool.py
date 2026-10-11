@@ -18,14 +18,19 @@ class BrowserPool:
         if entry:
             try:
                 await entry['context'].close()
+                owner = getattr(entry['context'], '_retail_close_task', None)
+                if owner:
+                    await asyncio.gather(owner, return_exceptions=True)
             finally:
                 self.engine.browser_slots.release()
 
     @asynccontextmanager
-    async def lease(self, account, attempt_id=''):
+    async def lease(self, account, attempt_id='', *, headless=None, probe_only=False):
         account_id=account['id']
         identity={k:account.get(k) for k in ('region','retailer','email','password','proxy','proxy_list_id','fingerprint_values','fingerprint_overrides','fingerprint_seed')}
-        profile_key=hashlib.sha256(json.dumps({'account':identity,'settings':self.engine.store.get('settings','settings') or {}},sort_keys=True).encode()).hexdigest()
+        settings=self.engine.store.get('settings','settings') or {}
+        window_headless=headless if headless is not None else not settings.get('show_browser_window',True)
+        profile_key=hashlib.sha256(json.dumps({'account':identity,'settings':settings,'headless':window_headless},sort_keys=True).encode()).hexdigest()
         if account_id in self.engine.amazon.logins or account_id in self.engine.amazon.fingerprint_tests:
             raise Conflict('Close this account browser before using the group')
         if any((self.engine.store.get('tasks',id) or {}).get('account_id')==account_id for id in self.engine.jobs):
@@ -43,6 +48,9 @@ class BrowserPool:
             claim=self.repo.claimed(account_id)
             if claim and claim!=attempt_id:
                 raise Conflict('Account is reserved by another attempt')
+            if probe_only:
+                yield None
+                return
             stale=None
             async with self.lock:
                 entry=self.sessions.get(account_id)
@@ -65,7 +73,7 @@ class BrowserPool:
                 await self.engine.browser_slots.acquire()
                 context=None
                 try:
-                    context=await self.engine.amazon.context(account)
+                    context=await self.engine.amazon.context(account, **({'headless': headless} if headless is not None else {}))
                     page=await context.new_page()
                     entry={'context':context,'page':page,'busy':True,'used':time.monotonic(),'profile_key':profile_key}
                     self.sessions[account_id]=entry

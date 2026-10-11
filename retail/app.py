@@ -226,13 +226,13 @@ def create_app(data_dir=None, *, warm_browser=False):
             if data.get('clear_api_key'):
                 merged['api_key'] = ''
         if kind == 'settings':
-            if app.state.group_coordinator.active() and any(merged.get(k) != old.get(k) for k in data if k.startswith(('browser_', 'fingerprint_', 'show_browser', 'native_browser', 'cdp_')) or k == 'max_running_tasks'):
+            if app.state.group_coordinator.active() and any(merged.get(k) != old.get(k) for k in data if k.startswith(('browser_', 'fingerprint_', 'show_browser', 'native_browser', 'cdp_')) or k in ('max_running_tasks','session_verification_mode')):
                 raise HTTPException(409, 'Stop task-group runs before changing browser settings')
             if merged.get('ai_connection_id'):
                 require('ai_connections', merged['ai_connection_id'])
             if merged.get('agent_mode', 'off') != 'off' and not merged.get('ai_connection_id'):
                 raise HTTPException(422, 'Select an AI connection before enabling the browser agent')
-            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('cdp_attach','cdp_endpoint','browser_channel','show_browser_window','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id','max_running_tasks')):
+            if app.state.engine.jobs and any(merged.get(k) != old.get(k) for k in ('session_verification_mode','cdp_attach','cdp_endpoint','browser_channel','show_browser_window','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id','max_running_tasks')):
                 raise HTTPException(409, 'Stop running tasks before changing browser or AI connections')
         if kind == "groups" and not id and "delay_ms" not in data:
             merged["delay_ms"] = (store().get("settings", "settings") or {}).get("default_monitor_delay", 4500)
@@ -323,6 +323,7 @@ def create_app(data_dir=None, *, warm_browser=False):
         result = store().put(kind, {**old, **valid}, id)
         if kind == 'settings' and result.get('max_running_tasks') != old.get('max_running_tasks'):
             app.state.engine.browser_slots = asyncio.Semaphore(result['max_running_tasks'])
+            app.state.engine.amazon.session_probe_slots = asyncio.Semaphore(result['max_running_tasks'])
         if folder_id:
             app.state.resources.add(folder_id, [result["id"]])
         if kind=="proxies": app.state.proxy_pool.sync()

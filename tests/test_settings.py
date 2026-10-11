@@ -145,6 +145,12 @@ def test_settings_browser_drafts_validation_and_layout(tmp_path, monkeypatch):
                 assert client.get('/api/state').json()['settings'][0]['default_monitor_delay'] == 6500
                 # Headless is explicit and persists; it does not silently change other settings.
                 await page.locator('[data-settings-tab=browser]').click()
+                await expect(page.get_by_label('Startup verification', exact=True)).to_have_value('http')
+                for mode in ('headless', 'browser', 'http'):
+                    await page.get_by_label('Startup verification', exact=True).select_option(mode)
+                    await page.get_by_role('button', name='Save changes', exact=True).click()
+                    await expect(page.locator('[data-settings-status]')).to_contain_text('Saved.')
+                    assert client.get('/api/state').json()['settings'][0]['session_verification_mode'] == mode
                 await expect(page.get_by_label('Window mode', exact=True)).to_have_value('true')
                 await page.get_by_label('Window mode', exact=True).select_option('false')
                 await page.get_by_role('button', name='Save changes', exact=True).click()

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import profile
 import re
 import time
@@ -95,6 +96,7 @@ class Amazon:
         self.fingerprint_test_lock = asyncio.Lock()
         self.login_watchers = {}
         self.launch_lock = asyncio.Lock()
+        self.session_probe_slots = asyncio.Semaphore((store.get('settings', 'settings') or {}).get('max_running_tasks', 10) if store else 10)
         self.identities = IdentityService(store)
         self.context_accounts = {}
         self.profile_browsers = set()
@@ -118,13 +120,13 @@ class Amazon:
             return None
         raw = str(raw).strip()
         if raw.isdigit():
-            return max(0, min(3600, int(raw)))
+            return max(0, int(raw))
         try:
             when = parsedate_to_datetime(raw)
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
-            seconds = int((when - datetime.now(timezone.utc)).total_seconds())
-            return max(0, min(3600, seconds))
+            seconds = math.ceil((when - datetime.now(timezone.utc)).total_seconds())
+            return max(0, seconds)
         except Exception:
             return None
 
@@ -200,14 +202,14 @@ class Amazon:
         elif getattr(page.context, '_retail_interactive_window', False):
             await set_visible(page, True)
             return
-        elif not self.browser_initially_visible:
+        elif getattr(page.context, '_retail_headless', not self.browser_initially_visible):
             return  # The interactive dashboard shares this headless page.
         else:
             await set_visible(page, True)
         self.browser_visible = True
 
     async def hide(self, page):
-        if self.cdp_attached or not self.browser_initially_visible:
+        if self.cdp_attached or getattr(page.context, '_retail_headless', not self.browser_initially_visible):
             return  # External windows are user-owned; headless needs no hiding.
         await set_visible(page, False)
         self.browser_visible = False
@@ -253,8 +255,12 @@ class Amazon:
             self.store.event('', 'browser_warmup', 'Browser warmup unavailable; task startup will retry')
 
     @timed('Browser context setup')
-    async def context(self, account, proxy=None, solver_id="", *, interactive=False):
+    async def context(self, account, proxy=None, solver_id="", *, interactive=False, headless=None):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
+        if headless is not None:
+            if settings.get('cdp_attach'):
+                raise ValueError('Session window overrides require an app-managed browser')
+            settings = {**settings, 'show_browser_window': not headless}
         identity_launch = browser_options(settings)
         extensions = extension_paths(self.store, settings.get('browser_extension_ids', []))
         custom_extensions = bool(extensions)
@@ -318,7 +324,8 @@ class Amazon:
         if native:
             seed = int(profile['seed'], 16) & 0xffffffff
             launch = native_launch_options({**settings, 'fingerprint_timezone': options.get('timezone_id', settings['fingerprint_timezone'])}, seed, values)
-        elif managed_workers or persistent or interactive or different_browser or custom_extensions:
+        elif (managed_workers or persistent or interactive or different_browser or custom_extensions
+              or self.browser_initially_visible != settings.get('show_browser_window', True)):
             launch = {'headless': not settings.get('show_browser_window', True), **identity_launch}
         if launch is not None:
             if 'executable_path' not in launch:
@@ -425,6 +432,7 @@ class Amazon:
                 task.add_done_callback(finished)
         context.on('close', release_context)
         context._retail_interactive_window = interactive and not self.cdp_attached
+        context._retail_headless = not settings.get('show_browser_window', True) and not self.cdp_attached
         context._retail_paced_input = settings.get('interaction_pacing') == 'paced'
         if us_options:
             context._retail_us_profile_options = {key: options[key] for key in ('locale', 'viewport', 'screen', 'device_scale_factor', 'timezone_id')}
@@ -745,6 +753,15 @@ class Amazon:
                                logged_in=True, session_saved_at=now(), last_login=now())
                 self.store.put("accounts", current)
                 self.store.put("sessions", {"account_id":account['id'],"retailer":account.get('retailer','amazon'),"status":"ready","last_login":now(),"network":account.get('proxy_list_id','')}, 'session-'+account['id'])
+
+    async def probe_session(self, account, connection):
+        from types import SimpleNamespace
+        from .session_probe import probe_session
+        def guard(response):
+            # Preserve existing retailer cooldown/access-denied semantics.
+            self._raise_for_response(SimpleNamespace(status=response.status_code, headers=response.headers))
+        async with self.session_probe_slots:
+            return await probe_session(account, connection, response_guard=guard)
 
     @timed('Wait for account header')
     async def wait_session_header(self, page):

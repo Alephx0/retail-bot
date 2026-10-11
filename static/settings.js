@@ -3,7 +3,7 @@
 // Drafts stay in memory, including across navigation. Never persist secret fields
 // in localStorage or include them in unrelated connection requests.
 const settingsSections = [['general','General'], ['browser','Browser & fingerprints'], ['notifications','Notifications'], ['integrations','Connections'], ['data','Data & privacy']];
-const stoppedSettings = ['max_running_tasks','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
+const stoppedSettings = ['max_running_tasks','session_verification_mode','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
 let settingsDraft = null, settingsBaseline = null, settingsSaving = false, settingsError = '', settingsSavedMessage = '';
 let installedBrowsers = null, browserLookupPending = false;
 Object.assign(titles, {
@@ -59,7 +59,10 @@ function settingsView() {
     settingCard('Application status', '', '<button type="button" data-context-view="retailers">View retailer availability</button>');
   const browserOptions = (installedBrowsers || [['chromium','Bundled Chromium'],['chrome','Chrome'],['msedge','Edge']].map(([id,label]) => ({id,label,available:null})))
     .map(b => [b.id, b.label + (b.available === false ? ' — not installed' : b.available === true ? ' — installed' : '')]);
-  const browser = settingCard('Browser session', 'Applies when a new browser session opens. Stop running tasks before changing the connection or window mode.',
+  const browser = settingCard('Account session verification', 'Choose how tasks check saved sign-in sessions before waiting for stock.',
+    select('session_verification_mode', 'Startup verification', [['http','Browser-free check (default)'],['headless','Headless browser'],['browser','Task browser (current behavior)']], s.session_verification_mode || 'http') +
+    settingHelp('Browser-free checks use saved cookies on the task connection. Missing or inconclusive sessions fall back to the task browser. Headless checks use the account fingerprint and require an app-managed browser; View live remains available. Purchasing always verifies the live browser session.')) +
+    settingCard('Browser session', 'Applies when a new browser session opens. Stop running tasks before changing the connection or window mode.',
     select('cdp_attach', 'Browser connection', [['false','Managed by Retail Desk'],['true','Existing browser (advanced)']], String(s.cdp_attach ?? false)) +
     '<div data-managed-browser>' +
     select('show_browser_window', 'Window mode', [['true','Visible browser (default)'],['false','Headless — no browser window']], String(s.show_browser_window ?? true)) +
