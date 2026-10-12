@@ -1,8 +1,9 @@
 import asyncio
 import base64
 import hashlib
+import json
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -18,7 +19,73 @@ PROVIDERS = {
 }
 
 
+class SolverError(ValueError):
+    """Categorical provider failure; raw response prose is never exported."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__('Solver rejected the request: ' + code)
+
+
 class SolverService:
+    @staticmethod
+    def token_task(solver, kind, url, params, proxy=None):
+        provider = solver['provider']
+        types = {
+            '2captcha': {'arkose':'FunCaptchaTask','recaptcha':'RecaptchaV2Task','turnstile':'TurnstileTask'},
+            'capmonster': {'arkose':'FunCaptchaTask','recaptcha':'RecaptchaV2Task','turnstile':'TurnstileTask'},
+        }
+        if kind not in types.get(provider,{}):
+            raise ValueError('The assigned provider has no supported adapter for this CAPTCHA type.')
+        if provider=='capmonster' and kind=='arkose' and not proxy:
+            raise ValueError('CapMonster FunCaptcha requires the same proxy as the account browser.')
+        task_type = types[provider][kind]
+        if provider=='2captcha' and not proxy:
+            task_type += 'Proxyless'
+        task = {'type':task_type,'websiteURL':url,
+                'websitePublicKey' if kind=='arkose' else 'websiteKey':params['key']}
+        if proxy:
+            endpoint=urlsplit(proxy['server'])
+            if endpoint.scheme not in ('http','https','socks4','socks5') or not endpoint.hostname or not endpoint.port:
+                raise ValueError('The browser proxy cannot be used by this provider.')
+            task.update(proxyType=endpoint.scheme,proxyAddress=endpoint.hostname,proxyPort=endpoint.port)
+            if proxy.get('username'):task['proxyLogin']=proxy['username']
+            if proxy.get('password'):task['proxyPassword']=proxy['password']
+        if kind=='arkose':
+            if params.get('blob'):task['data']=json.dumps({'blob':params['blob']})
+            if params.get('subdomain'):
+                subdomain=urlsplit(params['subdomain'] if '://' in params['subdomain'] else 'https://'+params['subdomain']).hostname
+                if not subdomain or not (subdomain=='arkoselabs.com' or subdomain.endswith('.arkoselabs.com')):
+                    raise ValueError('Unrecognized Arkose API domain.')
+                task['funcaptchaApiJSSubdomain']=subdomain
+            task['userAgent']=params['userAgent']
+        elif kind=='recaptcha':
+            task['isInvisible']=params.get('invisible',False)
+            if params.get('dataS'):task['recaptchaDataSValue']=params['dataS']
+        elif kind=='turnstile':
+            if params.get('action'):task['action']=params['action']
+            if params.get('cdata'):task['data']=params['cdata']
+        return task
+
+    async def solve_token(self, solver, task, *, user_agent=None, progress=None):
+        # One createTask call, even after a provider error or timeout.
+        async with asyncio.timeout(min(300,solver.get('timeout_seconds',120))):
+            result=await self.call(solver,'createTask',{'task':task})
+            task_id=result.get('taskId')
+            if progress:progress('provider_processing',task_id=task_id)
+            while result.get('status')!='ready':
+                if not task_id:
+                    raise ValueError('Solver did not return a task ID')
+                await asyncio.sleep(3)
+                result=await self.call(solver,'getTaskResult',{'taskId':task_id})
+            solution=result.get('solution') or {}
+            if user_agent and solution.get('userAgent') and solution['userAgent']!=user_agent:
+                raise SolverError('BROWSER_IDENTITY_MISMATCH')
+            token=solution.get('token') or solution.get('gRecaptchaResponse')
+            if not isinstance(token,str) or not token or len(token)>65536:
+                raise ValueError('Solver returned no valid response token')
+            if progress:progress('solution_received')
+            return token
+
     async def call(self, solver, method, payload=None):
         base = PROVIDERS[solver["provider"]]
         async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
@@ -27,7 +94,14 @@ class SolverService:
             data = response.json()
         if data.get("errorId"):
             # Do not echo provider text that may contain credentials or request content.
-            raise ValueError("Solver rejected the request: " + str(data.get("errorCode", "provider_error"))[:80])
+            # Accept known provider codes only, not arbitrary uppercase payloads.
+            code=data.get('errorCode')
+            known={'ERROR_CAPTCHA_UNSOLVABLE','ERROR_KEY_DOES_NOT_EXIST','ERROR_ZERO_BALANCE',
+                   'ERROR_NO_SLOT_AVAILABLE','ERROR_PROXY_CONNECT_REFUSED','ERROR_PROXY_CONNECT_TIMEOUT',
+                   'ERROR_PROXY_READ_TIMEOUT','ERROR_PROXY_BANNED','ERROR_PROXY_TRANSPARENT',
+                   'ERROR_TASK_ABSENT','ERROR_TASK_NOT_SUPPORTED','ERROR_INCORRECT_SESSION_DATA',
+                   'ERROR_INCORRECT_TASK_DATA','ERROR_IP_NOT_ALLOWED','ERROR_TOKEN_EXPIRED'}
+            raise SolverError(code if code in known else 'PROVIDER_ERROR')
         return data
 
     async def health(self, solver):
@@ -74,15 +148,13 @@ class SolverService:
 
 
 def proxy_url(line):
-    config = proxy_config(line)
-    if not config:
-        return None
-    auth = (quote(config["username"], safe="") + ":" + quote(config["password"], safe="") + "@") if "username" in config else ""
-    return "http://" + auth + config["server"].removeprefix("http://")
+    from .proxy_protocol import parse_proxy
+    return parse_proxy(line).url if line.strip() else None
 
 
 def proxy_fingerprint(line):
-    return hashlib.sha256(line.strip().encode()).hexdigest()[:16]
+    from .proxy_protocol import parse_proxy
+    return parse_proxy(line).fingerprint
 
 
 BROWSER_CHALLENGE_MARKERS = (
@@ -112,95 +184,11 @@ def classify_browser_probe(http_status, body_text):
     return "http_error"
 
 
-class ProxyHealth:
-    """Keep raw transport reachability separate from Chromium-session health."""
+from .proxy_testing import ProxyTesting
+from .proxy_protocol import parse_proxy
 
-    def __init__(self, store):
-        self.store = store
-        self.jobs = {}
 
-    def busy(self, record_id):
-        return any(key.endswith(":" + record_id) for key in self.jobs)
-
-    async def start(self, record, retailer, mode="connectivity"):
-        if mode not in ("connectivity", "browser"):
-            raise ValueError("Proxy check mode must be connectivity or browser")
-        key = mode + ":" + record["id"]
-        if key in self.jobs:
-            raise ValueError(f"This list already has a {mode} check running")
-        self.jobs[key] = asyncio.create_task(self.run(record, retailer, mode, key))
-
-    def _persist(self, record, retailer, mode, results, status):
-        prefix = "health-" if mode == "connectivity" else "browser-health-"
-        self.store.put(
-            "proxy_health",
-            {
-                "list_id": record["id"],
-                "retailer": retailer,
-                "kind": mode,
-                "status": status,
-                "results": results,
-                "at": now(),
-            },
-            prefix + record["id"],
-        )
-
-    async def run(self, record, retailer, mode, key):
-        try:
-            if mode == "browser":
-                await self._run_browser(record, retailer)
-            else:
-                await self._run_connectivity(record, retailer)
-        finally:
-            self.jobs.pop(key, None)
-
-    async def _run_connectivity(self, record, retailer):
-        """Fast HTTP-client check: tests route reachability, not browser acceptance."""
-        settings = self.store.get("settings", "settings") or {}
-        semaphore = asyncio.Semaphore(settings.get("proxy_concurrency", 5))
-        results = []
-        self._persist(record, retailer, "connectivity", results, "testing")
-
-        async def test(index, line):
-            async with semaphore:
-                started = time.monotonic()
-                result = {
-                    "index": index + 1,
-                    "fingerprint": proxy_fingerprint(line),
-                    "host": line.split(":", 1)[0],
-                    "transport": "httpx",
-                }
-                try:
-                    async with httpx.AsyncClient(
-                        proxy=proxy_url(line),
-                        timeout=settings.get("proxy_timeout_seconds", 15),
-                        trust_env=False,
-                    ) as client:
-                        async with client.stream(
-                            "GET",
-                            "https://" + RETAILERS[retailer]["domain"] + "/",
-                            follow_redirects=False,
-                        ) as response:
-                            # Receiving any HTTP response proves the route is
-                            # reachable. 403/429/503 are application responses,
-                            # not transport failures.
-                            result.update(
-                                http_status=response.status_code,
-                                status="reachable",
-                            )
-                except Exception as exc:
-                    result.update(status="failed", error=type(exc).__name__)
-                result["latency_ms"] = round((time.monotonic() - started) * 1000)
-                results.append(result)
-                self._persist(record, retailer, "connectivity", results, "testing")
-
-        await asyncio.gather(*(
-            test(i, line)
-            for i, line in enumerate(record["entries"].splitlines())
-            if line.strip()
-        ))
-        self._persist(record, retailer, "connectivity", results, "completed")
-
+class ProxyHealth(ProxyTesting):
     async def _run_browser(self, record, retailer):
         """Read-only Chromium probe using the same browser transport as tasks."""
         from patchright.async_api import async_playwright
@@ -223,12 +211,12 @@ class ProxyHealth:
                         result = {
                             "index": index + 1,
                             "fingerprint": proxy_fingerprint(line),
-                            "host": line.split(":", 1)[0],
+                            "host": parse_proxy(line).host,
                             "transport": "chromium",
                         }
                         context = None
                         try:
-                            context = await browser.new_context(proxy=proxy_config(line))
+                            context = await browser.new_context(proxy=parse_proxy(line).config(browser=True))
                             page = await context.new_page()
                             response = await page.goto(
                                 target,
@@ -263,9 +251,3 @@ class ProxyHealth:
                 await browser.close()
         self._persist(record, retailer, "browser", results, "completed")
 
-    async def close(self):
-        jobs = list(self.jobs.values())
-        for job in jobs:
-            job.cancel()
-        await asyncio.gather(*jobs, return_exceptions=True)
-        self.jobs.clear()

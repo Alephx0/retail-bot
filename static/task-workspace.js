@@ -1,6 +1,6 @@
 function taskRecoveryBadge(task) {
   const recovering=(state.browser_recovery?.active||[]).some(r=>r.task_id===task.id);
-  return recovering?'<span class="badge processing" role="status"><span class="status-dot"></span>Recovering</span>':badge(task.status||'ready');
+  return recovering?'<span class="badge processing" role="status"><span class="status-dot"></span>Recovering</span>':badge(task.account_ready&&task.status==='waiting'?'ready':task.status||'ready');
 }
 'use strict';
 let taskStatusFilter='all';
@@ -30,17 +30,48 @@ function taskWorkspace(){
   const taskTable=`
     <div class="toolbar task-controls">${searchField('tasks','Search account tasks',taskQuery)}<span class="spacer"></span><button data-work-bulk="start" ${rows.length||selected.size?'':'disabled'}>${icon('play',15)}Start ${scope}</button><button data-work-bulk="stop" ${rows.length||selected.size?'':'disabled'}>${icon('square',15)}Stop ${scope}</button>${selected.size?`<button data-work-bulk="delete" class="danger">Delete ${selected.size}</button>`:''}</div>
     ${rows.length?table(['<input type="checkbox" data-work-select-all aria-label="Select visible tasks" '+(rows.every(t=>selected.has(t.id))?'checked':'')+'>','Account / profile','Product','Qty','Status','Actions'],rows.map(t=>{
-      const running=state.active.includes(t.id),review=['review','attention'].includes(t.status);
-      return `<tr data-task-row="${t.id}"><td><input type="checkbox" data-work-select="${t.id}" aria-label="Select task for ${esc(t.account_id?name('accounts',t.account_id):'Virtual account')}" ${selected.has(t.id)?'checked':''}></td><td><strong>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')}</strong><small>${esc(t.profile_id?name('profiles',t.profile_id):'Account checkout defaults')}</small><small>${t.simulation?'Simulation':'Live'} &middot; ${esc(taskBehavior[t.checkout_mode])}</small></td><td>${taskMonitorSelect(g,t)}<small>${t.max_total==null?'Group order limit':`Task limit: ${Number(t.max_total).toFixed(2)}`}</small></td><td>${t.quantity}</td><td>${taskRecoveryBadge(t)}<small>${esc(t.message||'Ready to start')}</small></td><td><div class="actions">${running?review?`<button data-work-task="${t.id}" data-work-command="resume">Resume</button>`:iconButton('square','Stop task',`data-work-task="${t.id}" data-work-command="stop"`):iconButton('play','Start task',`data-work-task="${t.id}" data-work-command="start"`)}${iconButton('ellipsis','Task details',`data-work-details="${t.id}"`)}</div></td></tr>`;
+      const running=state.active.includes(t.id),review=['review','attention'].includes(t.status),offer=taskAccountOffer(t);
+      return `<tr data-task-row="${t.id}"><td><input type="checkbox" data-work-select="${t.id}" aria-label="Select task for ${esc(t.account_id?name('accounts',t.account_id):'Virtual account')}" ${selected.has(t.id)?'checked':''}></td><td><strong>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')}</strong><small>${esc(t.profile_id?name('profiles',t.profile_id):'Account checkout defaults')}</small><small>${t.simulation?'Simulation':'Live'} &middot; ${esc(taskBehavior[t.checkout_mode])}</small></td><td>${taskMonitorSelect(g,t)}<small>${t.max_total==null?'Group order limit':`Task limit: ${Number(t.max_total).toFixed(2)}`}</small></td><td>${t.quantity}</td><td>${taskRecoveryBadge(t)}<small>${esc(t.message||'Ready to start')}</small>${t.offer_usage?`<small>${esc(offerUsageSummary(t))}</small>`:offer?`<small>${offer.offer_id?(offer.use_offer_id===false?'Offer ID found (use disabled)':'Offer ID found'):'No usable Offer ID'} in last account check</small>`:''}</td><td><div class="actions">${running?review?`<button data-work-task="${t.id}" data-work-command="resume">Resume</button>`:iconButton('square','Stop task',`data-work-task="${t.id}" data-work-command="stop"`):iconButton('play','Start task',`data-work-task="${t.id}" data-work-command="start"`)}${iconButton('ellipsis','Task details',`data-work-details="${t.id}"`)}</div></td></tr>`;
     })):empty('layers',tasks.length?'No matching tasks':'No tasks yet',tasks.length?'Choose another filter or search.':'Add accounts or checkout profiles to create tasks.',tasks.length?'':'<button data-work-add>Add tasks</button>')}<div class="table-summary">${rows.length} of ${tasks.length} tasks &middot; ${selected.size} selected</div>`;
   return `<div class="workspace-tools group-backbar"><button class="back" data-work-back>${icon('arrow-left',14)}View all groups</button><span class="spacer"></span><select data-group-switch aria-label="Switch task group">${state.groups.map(x=>`<option value="${x.id}" ${x.id===g.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></div>
     <div class="task-page-heading"><h1>Tasks <span class="heading-count">${tasks.length}</span></h1><button class="primary" data-work-create>${icon('plus',15)}Create group</button></div>
     <div class="task-layout"><aside class="task-sidebar"><h2>Task group information</h2>${groupSettings(g,active)}<button data-work-schedule ${active?'disabled':''}>${icon('clock',15)}${g.schedule?.slots?.length?'Edit schedule':'Schedule'}</button><p class="help">${active?'Stop tasks to edit group settings.':g.schedule?.slots?.length?g.schedule.slots.length+' scheduled windows':'Starts when you press Start.'}</p>${statistics}${g.task_group_id?'<p class="notice">Original tasks retained as history. Manage this group in Operations &rarr; Saved plans.</p>':''}</aside>
     <section class="task-table"><div class="tg-header"><div><h2>${esc(g.name)}</h2><p>${esc(retailerName(g.retailer))} &middot; ${esc(compactProduct(g.products))}</p></div><div class="actions">${badge(active?'running':'ready')}${iconButton('copy','Duplicate group','data-work-duplicate')}${iconButton('trash-2','Delete group','data-work-delete')}<button class="primary" data-work-add>${icon('plus',15)}Add tasks</button></div></div>${tabs([['tasks','Tasks'],['monitors','Monitors']],taskWorkspaceTab,'data-work-section')}${taskWorkspaceTab==='monitors'?monitorWorkspace(g):taskTable}</section></div>`;
 }
+function taskAccountOffer(t){
+  return state.feed.filter(p=>p.source==='account'&&p.task_id===t.id&&p.account_id===t.account_id)
+    .reduce((latest,p)=>!latest||p.at>latest.at?p:latest,null);
+}
+function offerUsageSummary(t){
+  const u=t.offer_usage;if(!u)return '';
+  if(u.form==='dispatch_uncertain')return 'Offer form matched; action outcome uncertain';
+  if([u.cart,u.checkout].includes('evidence_lost'))return 'Offer ID evidence disappeared; review required';
+  if([u.form,u.cart,u.checkout].includes('mismatch'))return 'Offer ID mismatch; review required';
+  if(u.checkout==='matched')return 'Offer ID matched at checkout';
+  if(u.cart==='matched')return 'Offer ID matched in cart';
+  if(u.form==='endpoint_posting')return 'Sending Offer ID endpoint request';
+  if(u.form==='endpoint_acknowledged')return 'Endpoint acknowledged Add to Cart; checking cart';
+  if(u.form==='endpoint_redirected')return 'Endpoint redirected; inspecting existing cart';
+  if(u.form==='matched_posted')return 'Direct Offer ID POST completed; checking cart';
+  if(u.form==='matched_posting')return 'Sending direct Offer ID POST';
+  if(u.form==='matched_clicked')return 'Offer ID matched before purchase click';
+  if(u.form==='matched_dispatching')return 'Offer ID matched; sending purchase click';
+  return '';
+}
+function offerUsageDetails(t){
+  const u=t.offer_usage;if(!u)return '';
+  const labels={matched:'Matched',evidence_lost:'Previously matched ID disappeared - stopped',not_exposed:'Not exposed by Amazon; exact ID unverified',not_checked:'Not checked',mismatch:'Mismatch or ambiguous - stopped'};
+  const forms={endpoint_posting:'Matched; endpoint request in progress',endpoint_acknowledged:'Matched; endpoint acknowledged Add to Cart',endpoint_redirected:'Matched; redirect received, acceptance unconfirmed',matched_posted:'Matched; direct form POST completed',matched_posting:'Matched; direct form POST in progress',matched_clicked:'Matched before native click',matched_dispatching:'Matched; click dispatch in progress',dispatch_uncertain:'Matched; action outcome uncertain',mismatch:'Mismatch - no action sent'};
+  return `<p><strong>Offer validation</strong><br>${esc(offerUsageSummary(t))}</p><p class="help">${esc(u.route==='direct_endpoint'?'Direct Offer ID endpoint request':u.route==='direct_form'?'Direct Offer ID carting':u.action==='buy_now'?'Buy Now':'Add to Cart')}${u.shortcut==='unsupported_form'?' (shortcut unavailable; native click)':''} for ${esc(u.asin)} at ${esc(time(u.at))}</p><label for="task-action-offer">Offer ID checked for this action</label><textarea id="task-action-offer" readonly rows="3">${esc(u.offer_id||'')}</textarea><p>Purchase form: ${esc(forms[u.form]||'Not checked')}<br>Cart: ${esc(labels[u.cart]||'Not checked')}<br>Checkout: ${esc(labels[u.checkout]||'Not checked')}</p><p class="help">A matched form confirms the ID checked before dispatch. It does not prove server acceptance. Product, seller, quantity and price checks still apply.</p>`;
+}
+function taskOfferDetails(t){
+  const offer=taskAccountOffer(t);if(!offer)return '';
+  if(t.offer_usage?.offer_id===offer.offer_id)return '';
+  return `<p class="help">Last account offer check: ${esc(offer.asin)} at ${esc(time(offer.at))}. This is an observation; each run checks the current offer again.${offer.use_offer_id===false?' Offer ID use was disabled for this check; normal carting is used.':''}</p>${offer.offer_id?`<label for="task-discovered-offer">Discovered Offer ID</label><textarea id="task-discovered-offer" readonly rows="3">${esc(offer.offer_id)}</textarea><button data-copy="${esc(offer.offer_id)}">Copy Offer ID</button>`:'<p>No usable Offer ID was exposed in the last account check.</p>'}`;
+}
 function taskDetails(t){
   const active=state.active.includes(t.id);
-  const d=dialog(`<h2>Task details</h2><p>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')} · ${t.simulation?'Simulation':'Live'}</p><p>${taskRecoveryBadge(t)} ${esc(t.message||'')}</p><p class="help">Quantity ${t.quantity} · ${esc(taskBehavior[t.checkout_mode])} · ${t.max_total==null?'Uses group order limit':'Order limit '+t.max_total}</p><div class="actions">${active&&!t.simulation?'<button data-task-view>View browser</button>':''}<button data-task-edit ${active?'disabled':''}>Edit task</button><button data-task-copy>Duplicate task</button><button data-task-remove class="danger">Delete task</button></div>${performancePanel()}<div class="modal-actions"><button data-task-close>Close</button></div>`);
+  const d=dialog(`<h2>Task details</h2><p>${esc(t.account_id?name('accounts',t.account_id):'Virtual account')} · ${t.simulation?'Simulation':'Live'}</p><p>${taskRecoveryBadge(t)} ${esc(t.message||'')}</p><p class="help">Quantity ${t.quantity} · ${esc(taskBehavior[t.checkout_mode])} · ${t.max_total==null?'Uses group order limit':'Order limit '+t.max_total}</p><div class="actions">${active&&!t.simulation?'<button data-task-view>View browser</button>':''}<button data-task-edit ${active?'disabled':''}>Edit task</button><button data-task-copy>Duplicate task</button><button data-task-remove class="danger">Delete task</button></div>${taskOfferDetails(t)}${offerUsageDetails(t)}${performancePanel()}<div class="modal-actions"><button data-task-close>Close</button></div>`);
   bindPerformance(d, 'task', t.id);
   d.querySelector('[data-task-close]').onclick=()=>d.close();
   d.querySelector('[data-task-edit]').onclick=()=>{d.close();editAccountTask(t);};

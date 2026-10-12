@@ -41,7 +41,7 @@ class RecoveryController:
         self.active = {}
         self.recent = deque(maxlen=100)
         self.circuits = OrderedDict()
-        self.counts = {'recovered': 0, 'failed': 0, 'cancelled': 0, 'busy': 0, 'ai': 0}
+        self.counts = {'deterministic_actions': 0, 'recovery_requests': 0, 'recovered': 0, 'failed': 0, 'cancelled': 0, 'busy': 0, 'ai': 0}
 
     def snapshot(self):
         return {'active': list(self.active.values()), 'recent': list(self.recent),
@@ -94,7 +94,7 @@ class RecoveryController:
             # A handler exception must not accidentally release the pending action.
             # Leave unsafe dialogs visible; the action's own timeout stops it.
             try:
-                if getattr(page.context, '_retail_task_id', '') == owner:
+                if getattr(page.context, '_retail_task_id', '') == owner and not getattr(page.context,'_retail_mcp_active',False):
                     await self.dismiss(page, from_handler=True)
             except (InteractionError, TimeoutError):
                 pass

@@ -83,6 +83,8 @@ async def probe_session(account, connection, *, response_guard, transport=None, 
     if not len(cookies):
         return 'unknown'
     config = proxy_config(connection or '')
+    if config and config['server'].startswith('socks'):
+        return 'unknown'  # Browser transport owns SOCKS; do not silently use a direct HTTP route.
     proxy = httpx.Proxy(config['server'], auth=(config['username'], config['password']) if 'username' in config else None) if config else None
     url = f'https://{host}/gp/your-account/order-history'
     try:

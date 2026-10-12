@@ -8,7 +8,7 @@ class InteractionError(ValueError):
 
 
 ACTIONS={
-    'ADD_TO_CART':('button',r'^add to (?:shopping )?cart$',('#add-to-cart-button',"input[name='submit.add-to-cart']")),
+    'ADD_TO_CART':('button',r'^add (?:this product )?to (?:shopping )?cart$',('#add-to-cart-button',"input[name='submit.add-to-cart']")),
     'BUY_NOW':('button',r'^(?:buy(?: it)? now|purchase(?: now)?|get it now)$',('#buy-now-button',"input[name='submit.buy-now']")),
     'BEGIN_CHECKOUT':('button',r'^proceed to checkout(?:.*)$',("input[name='proceedToRetailCheckout']",'#sc-buy-box-ptc-button input')),
     'CONTINUE_CHECKOUT':('button',r'^continue to checkout$',()),

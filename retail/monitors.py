@@ -24,7 +24,10 @@ def monitor_items(store, group, task=None):
         {'asin': line.strip(), 'max_price': None, 'offer_id': ''}
         for line in source['products'].splitlines() if line.strip()]
     for item in items:
-        item['offer_id'] = item['offer_id'] or group.get('offer_id', '')
+        item['use_offer_id'] = group.get('use_offer_id', True)
+        item['offer_id_shortcut'] = item['use_offer_id'] and group.get('offer_id_shortcut', False)
+        item['offer_id_endpoint'] = item['offer_id_shortcut'] and group.get('offer_id_endpoint', False)
+        item['offer_id'] = (item['offer_id'] or group.get('offer_id', '')) if item['use_offer_id'] else ''
     selected = (task or {}).get('monitor_asin', '')
     if selected:
         items = [item for item in items if item['asin'] == selected]
@@ -109,8 +112,8 @@ class ProductMonitor:
                         with stage('Monitor check total'):
                             async with AsyncExitStack() as slots:
                                 with stage('Monitor concurrency wait'):
-                                    await slots.enter_async_context(self.registry.scan_slots)
                                     await slots.enter_async_context(self.registry.group_slots[self.group['id']])
+                                    await slots.enter_async_context(self.registry.scan_slots)
                                 scan = getattr(adapter, 'inspect_stock', adapter.inspect)
                                 product = await scan(page, self.item, self.region)
                     self.product = product

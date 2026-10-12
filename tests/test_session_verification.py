@@ -102,7 +102,7 @@ def test_bounded_read_and_cancellation():
 def test_startup_modes_release_workers_and_always_verify_before_cart(tmp_path,mode,result,initial_contexts):
     async def scenario():
         store,group,account,engine=fixture(tmp_path)
-        store.put('settings',{'session_verification_mode':mode,'show_browser_window':True},'settings')
+        store.put('settings',{'session_verification_mode':mode,'show_browser_window':True,'keep_accounts_ready':False},'settings')
         engine.amazon.probe_session=AsyncMock(return_value=result)
         create=engine.amazon.context
         launches=[]

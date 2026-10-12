@@ -14,6 +14,7 @@ def test_settings_defaults_secrets_conflicts_and_running_lock(tmp_path):
     with TestClient(create_app(tmp_path), headers=HEADERS) as client:
         initial = client.get('/api/state').json()['settings'][0]
         assert initial['show_browser_window'] is True
+        assert initial['show_mouse_cursor'] is False
         assert 'webhook' not in initial
         assert initial['agent_mode'] == 'off'
         hook = 'https://discord.com/api/webhooks/123/fixture-token'
@@ -85,6 +86,10 @@ def test_settings_browser_drafts_validation_and_layout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(AIProvider, 'test', fake_ai_test)
     with TestClient(create_app(tmp_path), headers=HEADERS) as client:
+        from test_browsing_calibration import CALIBRATION
+        from test_mouse_calibration import POINTER
+        CALIBRATION={**CALIBRATION,'pointer':POINTER}
+        assert client.post('/api/settings',json={'input_calibration':CALIBRATION}).status_code==200
         async def scenario():
             async with async_playwright() as driver:
                 browser = await driver.chromium.launch(headless=True)
@@ -156,7 +161,54 @@ def test_settings_browser_drafts_validation_and_layout(tmp_path, monkeypatch):
                 await page.get_by_role('button', name='Save changes', exact=True).click()
                 await expect(page.locator('[data-settings-status]')).to_contain_text('Saved.')
                 assert client.get('/api/state').json()['settings'][0]['show_browser_window'] is False
-                await page.get_by_text('Advanced browser options', exact=True).click()
+                speed=page.get_by_label('Pacing speed profile',exact=True)
+                timing=page.get_by_label('Input timing',exact=True)
+                await page.get_by_text('Demonstration timing',exact=True).click()
+                calibration=page.get_by_label('Use recorded timing',exact=True)
+                await expect(calibration).to_have_value('off')
+                await expect(page.get_by_text('Movement uses 18 fitted paths',exact=False)).to_be_visible()
+                await calibration.select_option('browsing')
+                await page.get_by_role('button',name='Save changes',exact=True).click()
+                await expect(page.locator('[data-settings-status]')).to_contain_text('new sessions')
+                assert client.get('/api/state').json()['settings'][0]['input_calibration_scope']=='browsing'
+                await expect(timing.locator('option[value=paced]')).to_have_text('Paced input (HumanTyping)')
+                await timing.select_option('paced')
+                cursor=page.get_by_label('Show mouse cursor for testing',exact=True)
+                await expect(cursor).not_to_be_checked()
+                await cursor.check()
+                await expect(speed).to_be_visible()
+                await expect(speed).to_have_value('balanced')
+                for preset in ('slow','balanced','fast','aggressive'):
+                    await speed.select_option(preset)
+                    await page.get_by_role('button',name='Save changes',exact=True).click()
+                    await expect(page.locator('[data-settings-status]')).to_contain_text('Saved.')
+                    assert client.get('/api/state').json()['settings'][0]['input_timing_preset']==preset
+                await speed.focus()
+                await page.keyboard.press('ArrowUp')
+                await expect(speed).to_be_focused()
+                await expect(speed).to_have_value('fast')
+                await page.get_by_role('button',name='Save changes',exact=True).click()
+                await expect(page.locator('[data-settings-status]')).to_contain_text('Saved.')
+                await page.reload()
+                await page.locator('[data-view=settings]').click()
+                await page.locator('[data-settings-tab=browser]').click()
+                await page.get_by_text('Advanced browser options',exact=True).click()
+                passkeys=page.get_by_label('Block passkey prompts in account browsers',exact=True)
+                await expect(passkeys).to_be_checked()
+                for enabled in (False,True):
+                    await passkeys.set_checked(enabled)
+                    await page.get_by_role('button',name='Save changes',exact=True).click()
+                    await expect(page.locator('[data-settings-status]')).to_contain_text('new sessions')
+                    assert client.get('/api/state').json()['settings'][0]['suppress_passkey_prompts'] is enabled
+                await page.get_by_text('Demonstration timing',exact=True).click()
+                await expect(calibration).to_have_value('browsing')
+                assert client.get('/api/state').json()['settings'][0]['input_calibration']==CALIBRATION
+                await expect(cursor).to_be_checked()
+                await cursor.uncheck()
+                await page.get_by_role('button',name='Save changes',exact=True).click()
+                await expect(page.locator('[data-settings-status]')).to_contain_text('new sessions')
+                assert client.get('/api/state').json()['settings'][0]['show_mouse_cursor'] is False
+                await expect(speed).to_have_value('fast')
                 await page.get_by_text('Fingerprint profiles', exact=True).click()
                 await page.locator('[name=fingerprint_backend]').select_option('native')
                 for surface in ['fonts', 'navigator', 'screen', 'proxy_location', 'timezone']:
@@ -215,11 +267,34 @@ def test_settings_browser_drafts_validation_and_layout(tmp_path, monkeypatch):
                     await page.locator(f'[data-settings-tab={key}]').click()
                     await expect(page.locator('[data-settings-tab][aria-selected=true]')).to_have_count(1)
                     await expect(page.locator(f'[data-settings-tab={key}]')).to_have_class('selected')
+                    if key=='browser':
+                        if not await calibration.is_visible():
+                            await page.get_by_text('Demonstration timing',exact=True).click()
+                        await expect(speed).to_be_visible()
+                        await speed.evaluate("e=>e.scrollIntoView({block:'center'})")
+                        await page.screenshot(path=str(artifacts/'pacing-desktop.png'),animations='disabled')
+                        if not await passkeys.is_visible():
+                            await page.get_by_text('Advanced browser options',exact=True).click()
+                        await expect(passkeys).to_be_visible()
+                        await passkeys.scroll_into_view_if_needed()
+                        await page.screenshot(path=str(artifacts/'passkeys-desktop.png'),animations='disabled')
                     await page.screenshot(path=str(artifacts / f'{key}-desktop.png'), full_page=True, animations='disabled')
                 await page.set_viewport_size({'width': 390, 'height': 844})
                 for key in ['general','browser','notifications','integrations','data']:
                     await page.locator(f'[data-settings-tab={key}]').click()
                     assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth'), key
+                    if key=='browser':
+                        if not await calibration.is_visible():
+                            await page.get_by_text('Demonstration timing',exact=True).click()
+                        await expect(speed).to_be_visible()
+                        await calibration.scroll_into_view_if_needed()
+                        await expect(calibration).to_be_visible()
+                        await page.screenshot(path=str(artifacts/'pacing-mobile.png'),animations='disabled')
+                        if not await passkeys.is_visible():
+                            await page.get_by_text('Advanced browser options',exact=True).click()
+                        await expect(passkeys).to_be_visible()
+                        await passkeys.scroll_into_view_if_needed()
+                        await page.screenshot(path=str(artifacts/'passkeys-mobile.png'),animations='disabled')
                 await page.screenshot(path=str(artifacts / 'data-mobile.png'), full_page=True, animations='disabled')
                 assert not errors, errors
                 await browser.close()

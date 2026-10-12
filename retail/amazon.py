@@ -7,6 +7,7 @@ import time
 import uuid
 import tempfile
 import hashlib
+from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -14,7 +15,7 @@ from .fingerprint import build_scripts
 from .native_fingerprint import launch_options as native_launch_options, needs_profile_browser
 from .worker_profiles import WorkerProfiles, debugging_port
 from .fingerprint_suite import build_profile as build_suite_profile
-from . import us_fingerprint, proxy_location, behavior
+from . import us_fingerprint, proxy_location, behavior, visible_mouse
 from urllib.parse import urlparse, urljoin
 
 from patchright.async_api import async_playwright, TimeoutError as BrowserTimeoutError
@@ -22,7 +23,7 @@ from patchright.async_api import async_playwright, TimeoutError as BrowserTimeou
 from .models import DOMAINS, proxy_config, Settings, account_fingerprint_settings
 from .identity import IdentityService
 from .store import now
-from .interactions import resolve, InteractionError
+from .interactions import resolve, InteractionError, ACTIONS
 from .browser_bridge import validate_endpoint
 from .browser_agent import BrowserAgent
 from .browser_recovery import RecoveryController
@@ -33,6 +34,17 @@ from .fingerprint_profiles import generated, inspect_hardware
 from .account_consistency import AccountBrowserProfiles
 from .performance import stage, timed
 from .amazon_states import PAGE_STATE
+from .amazon_offers import OFFER_EVIDENCE, ROW_OFFER_EVIDENCE, DIRECT_OFFER_FORM, DIRECT_OFFER_CART, ENDPOINT_TIMEOUT_MS
+
+
+SELLER_EVIDENCE = r'''root => {
+    const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+    const direct = [...root.querySelectorAll("#sellerProfileTriggerId, [tabular-attribute-name='Sold by'] .tabular-buybox-text, .tabular-buybox-text[tabular-attribute-name='Sold by'], .seller-name")]
+        .filter(visible).map(e => e.innerText.trim()).filter(Boolean);
+    const merchant = [...root.querySelectorAll('#merchantInfoFeature_feature_div .offer-display-feature-text-message')];
+    return {direct, merchant:merchant.length === 1 && visible(merchant[0]) ? merchant[0].innerText.trim() : '',
+        text:root === document ? [...root.querySelectorAll('#merchantInfoFeature_feature_div, #merchant-info, #tabular-buybox')].map(e=>e.innerText).join('\n') : root.innerText};
+}'''
 
 
 def money(text: str) -> float | None:
@@ -81,6 +93,10 @@ class BackoffRequired(Attention):
 class CartRejected(Attention):
     """A verified pre-cart failure; no cart mutation was attempted."""
     pass
+
+
+class _UnsupportedOfferForm(Exception):
+    """Cancel the navigation listener when validation sent no request."""
 
 
 class Amazon:
@@ -159,8 +175,11 @@ class Amazon:
         page._retail_expected_action = action
         try:
             # All persisted modes, including legacy "agent", are deterministic first.
-            return await resolve(page, action)
+            result=await resolve(page, action)
+            self.recovery.counts['deterministic_actions']+=1
+            return result
         except InteractionError as exc:
+            self.recovery.counts['recovery_requests']+=1
             if 'multiple' in str(exc):
                 raise
             settings = (self.store.get('settings', 'settings') or {}) if self.store else {}
@@ -255,8 +274,12 @@ class Amazon:
             self.store.event('', 'browser_warmup', 'Browser warmup unavailable; task startup will retry')
 
     @timed('Browser context setup')
-    async def context(self, account, proxy=None, solver_id="", *, interactive=False, headless=None):
+    async def context(self, account, proxy=None, solver_id="", *, interactive=False, headless=None, progress=None):
         settings = account_fingerprint_settings(self.store.get("settings", "settings") or {}, account)
+        report = progress or (lambda message: None)
+        if interactive:
+            settings = {**settings, 'show_browser_window': True}
+        report('Starting browser engine')
         if headless is not None:
             if settings.get('cdp_attach'):
                 raise ValueError('Session window overrides require an app-managed browser')
@@ -277,6 +300,7 @@ class Amazon:
         us_options = us_fingerprint.context_options(self.profiles.get(account), settings, account['region'])
         options.update(us_options)
         profile = self.profiles.get(account)
+        report('Preparing account browser identity')
         hardware = await self.hardware_profile(settings)
         values = (generated(profile, account.get('fingerprint_values', {}), hardware)
                   if settings.get('fingerprint_backend') != 'fingerprint-suite' else {})
@@ -292,7 +316,8 @@ class Amazon:
         if proxy is None:
             proxy = self.account_proxy(account)
         if proxy:
-            options["proxy"] = proxy_config(proxy)
+            from .proxy_protocol import parse_proxy
+            options["proxy"] = parse_proxy(proxy).config(browser=True)
         location = None
         if us_options and settings.get('fingerprint_proxy_location', True):
             if not proxy and (account.get('proxy') or account.get('proxy_list_id')):
@@ -309,6 +334,7 @@ class Amazon:
             profile = self.profiles.get(account)
             suite_profile = await build_suite_profile(int(profile['seed'], 16), profile['locale'], self.browser.version)
             options.update(suite_profile['options'])
+        needs_recovery = settings.get('agent_mode','off') != 'off' and not self.cdp_attached
         managed_workers = not native and not suite and (needs_profile_browser(settings) or us_fingerprint.enabled(settings))
         if managed_workers and self.cdp_attached:
             raise ValueError('Complete JavaScript graphics profiles require an app-managed browser; disable external CDP attachment.')
@@ -324,7 +350,7 @@ class Amazon:
         if native:
             seed = int(profile['seed'], 16) & 0xffffffff
             launch = native_launch_options({**settings, 'fingerprint_timezone': options.get('timezone_id', settings['fingerprint_timezone'])}, seed, values)
-        elif (managed_workers or persistent or interactive or different_browser or custom_extensions
+        elif (managed_workers or needs_recovery or persistent or interactive or different_browser or custom_extensions
               or self.browser_initially_visible != settings.get('show_browser_window', True)):
             launch = {'headless': not settings.get('show_browser_window', True), **identity_launch}
         if launch is not None:
@@ -335,13 +361,14 @@ class Amazon:
                 args += ['--lang=en-US', '--accept-lang=en-US']
             if browser_identity:
                 args.append('--user-agent=' + browser_identity)
-            if managed_workers:
+            if managed_workers or needs_recovery:
                 worker_port = debugging_port()
                 args += [f'--remote-debugging-port={worker_port}', '--remote-debugging-address=127.0.0.1']
             if extensions:
                 args += ['--enable-unsafe-extension-debugging']
                 launch['ignore_default_args'] = ['--disable-extensions']
         try:
+            report('Launching account window')
             if persistent:
                 if account.get('_fingerprint_test'):
                     temporary_profile = tempfile.TemporaryDirectory(prefix='retail-fingerprint-')
@@ -364,9 +391,12 @@ class Amazon:
                     owned_browser = await self.driver.chromium.launch(**launch)
                 saved_state = options.pop('storage_state', None)
                 context = await (owned_browser or self.browser).new_context(**options)
+            if worker_port and owned_browser:
+                context._retail_recovery_endpoint=f'http://127.0.0.1:{worker_port}'
             if owned_browser:
                 self.profile_browsers.add(owned_browser)
             if extensions:
+                report('Loading account browser extensions')
                 extension_session = await (owned_browser or self.browser).new_browser_cdp_session()
                 try:
                     if persistent:
@@ -391,6 +421,7 @@ class Amazon:
             # Loading extensions after session restoration can hang Chrome's
             # incognito extension initialization. This ordering is intentional.
             if saved_state:
+                report('Restoring saved session')
                 with stage('Restore account session'):
                     await context.set_storage_state(saved_state)
             if persistent:
@@ -434,6 +465,9 @@ class Amazon:
         context._retail_interactive_window = interactive and not self.cdp_attached
         context._retail_headless = not settings.get('show_browser_window', True) and not self.cdp_attached
         context._retail_paced_input = settings.get('interaction_pacing') == 'paced'
+        # In-memory connection reference for explicitly assigned signup solvers.
+        context._retail_signup_proxy = options.get('proxy')
+        context._retail_input_timing_preset = settings.get('input_timing_preset', 'balanced')
         if us_options:
             context._retail_us_profile_options = {key: options[key] for key in ('locale', 'viewport', 'screen', 'device_scale_factor', 'timezone_id')}
             context._retail_us_profile_options['surfaces'] = [key for key in us_fingerprint.SURFACES if settings.get('fingerprint_' + key)]
@@ -443,6 +477,11 @@ class Amazon:
             # both APIs; JS graphics contexts initialize workers automatically.
             # Native graphics are configured at process launch; only audio
             # fallbacks need an init script in that backend.
+            if settings.get('suppress_passkey_prompts', True):
+                from .passkey_prompts import install as suppress_passkeys
+                await suppress_passkeys(context)
+            if settings.get('show_mouse_cursor', False):
+                await visible_mouse.install(context)
             if suite_profile:
                 for script in suite_profile['scripts']:
                     await context.add_init_script(script)
@@ -479,6 +518,7 @@ class Amazon:
                         sessionStorage.setItem('__retail_restored_v1', '1');
                     })()''' % (json.dumps(domain), json.dumps(safe)))
             if location:
+                report('Checking account proxy route')
                 confirmed = await proxy_location.lookup_location(context)
                 proxy_location.ensure_same_route(location, confirmed)
                 context._retail_proxy_location = proxy_location.summary(confirmed)
@@ -550,6 +590,10 @@ class Amazon:
             self.logins[account["id"]] = context
             await self.authenticate(page, account)
             self.login_watchers[account['id']] = asyncio.create_task(self.watch_login(account['id'], context, page))
+        except AuthenticationRequired:
+            # Keep the authorized account browser available for verification/recovery.
+            self.login_watchers[account['id']] = asyncio.create_task(self.watch_login(account['id'],context,page))
+            raise
         except BaseException:
             await context.close()
             self.logins.pop(account["id"], None)
@@ -618,13 +662,17 @@ class Amazon:
                 const next = [...document.querySelectorAll('#ap_email, #ap_email_login, #ap_password, #auth-mfa-otpcode, #cvf-input-code, #nav-link-accountList .nav-line-1')].some(visible);
                 const challenge = /verify your identity|verify it's you|additional verification required|robot check|click the button below to continue shopping/i.test(document.body?.innerText || '');
                 const passwordStep = selector.includes('#ap_email') && visible(document.querySelector('#ap_password'));
-                return error || challenge || passwordStep || (!oldVisible && next);
+                const absent=[...document.querySelectorAll('h1,h2,[role=heading],#auth-error-message-box')].some(e=>visible(e)&&/looks like you.re new to amazon|cannot find an account|couldn.t find an account/i.test(e.innerText));
+                return absent || error || challenge || passwordStep || (!oldVisible && next);
             }''', arg=selector, timeout=10000)
         except BrowserTimeoutError as exc:
             raise AuthenticationRequired('Sign-in did not advance. Review the task browser, then Resume.') from exc
         if await page.locator('#captchacharacters:visible').count():
             raise ChallengeDetected('Amazon requires CAPTCHA verification. Complete it in the task browser, then Resume.', kind='captcha')
         if await page.locator('#auth-error-message-box:visible, #auth-warning-message-box:visible').count():
+            from .account_lifecycle import SIGNALS
+            signals=await page.evaluate(SIGNALS)
+            if signals.get('absent') and not signals.get('exists'):return
             raise AuthenticationRequired('Amazon could not complete sign-in. Review the account details in the task browser, then Resume.')
 
     @timed('Account sign-in')
@@ -635,22 +683,47 @@ class Amazon:
         paced = getattr(page, '_retail_paced_controller', None)
         if paced is None:
             paced = page._retail_paced_controller = behavior.PacedInput(page)
+        identifier = account.get('signin_identifier') or account.get('email', '')
         for _ in range(6):
             origin = urlparse(page.url)
             if origin.scheme != 'https' or origin.netloc != DOMAINS[account.get('region', 'US')]:
                 raise AuthenticationRequired('Sign-in left this account’s Amazon region; credentials were not entered.')
             try:
+                if getattr(page.context,'_retail_signup_authorized',False) and await page.evaluate(
+                    "() => /looking for something|web address you entered is not a functioning page/i.test(document.body?.innerText||'')"):
+                    raise BrowserTimeoutError('Recognized unavailable sign-in page')
                 await page.wait_for_function('''() => {
                     const visible=e=>e && e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
                     return [...document.querySelectorAll('#ap_email,#ap_email_login,#ap_password,#auth-mfa-otpcode,#cvf-input-code,#captchacharacters,#auth-error-message-box,#auth-warning-message-box')].some(visible)
                         || [...document.querySelectorAll('#nav-link-accountList .nav-line-1')].some(e=>visible(e) && e.innerText.trim() && !/sign in/i.test(e.innerText))
+                        || [...document.querySelectorAll('h1,h2,[role=heading],#auth-error-message-box')].some(e=>visible(e)&&/looks like you.re new to amazon|cannot find an account|couldn.t find an account/i.test(e.innerText))
                         || /verify your identity|verify it's you|additional verification|robot check|continue shopping/i.test(document.body?.innerText || '');
                 }''', timeout=10000)
             except BrowserTimeoutError as exc:
+                if getattr(page.context,'_retail_signup_authorized',False) and self.store:
+                    from .signup_recovery import recover_signup
+                    def update(status,message,**extra):
+                        key='creation-'+account['id'];old=self.store.get('account_creation',key) or {}
+                        self.store.put('account_creation',{**old,'account_id':account['id'],'status':status,'message':message,**extra},key)
+                    reached=await recover_signup(self,account,page,update)
+                    if reached=='signin':continue
+                    if reached=='new_account':
+                        from .account_lifecycle import authorized_signup
+                        if await authorized_signup(self,account,page):return
+                    return  # The signup watcher owns OTP, CAPTCHA and session checkpoints.
                 raise AuthenticationRequired('Amazon did not present a supported sign-in step; review View live.') from exc
             origin = urlparse(page.url)
             if origin.scheme != 'https' or origin.netloc != DOMAINS[account.get('region', 'US')]:
                 raise AuthenticationRequired('Sign-in left this account’s Amazon region; credentials were not entered.')
+            from . import account_lifecycle as lifecycle
+            observation=await lifecycle.observe(page,account)
+            if self.store is not None and account.get('id'):
+                lifecycle.record(self.store,account['id'],observation)
+            if observation.state==lifecycle.AccountState.SIGNUP_ELIGIBLE:
+                if await lifecycle.authorized_signup(self,account,page):return
+                raise AuthenticationRequired('Amazon reports no account for this identifier. Use the authorized Create account workflow; sign-in will not be repeated.')
+            if observation.state in (lifecycle.AccountState.RECOVERY,lifecycle.AccountState.BLOCKED):
+                raise AuthenticationRequired('Account action requires review: '+observation.evidence.replace('_',' '))
             body = (await page.locator('body').inner_text()).lower()
             if re.search(r"verify your identity|verify it's you|additional verification|robot check|continue shopping", body):
                 await self.check(page)
@@ -663,10 +736,10 @@ class Amazon:
                 if not account.get('password'):
                     raise AuthenticationRequired('Save a password for this account, or complete sign-in in View live.')
                 # Combined email/password layouts must fill both fields before submit.
-                if await email.count() and account.get('email'):
+                if await email.count() and identifier:
                     await self.validate_signin_destination(email, account)
-                    if (await email.input_value()).strip().casefold() != account['email'].strip().casefold():
-                        await paced.fill(email, account['email'])
+                    if (await email.input_value()).strip().casefold() != identifier.strip().casefold():
+                        await paced.fill(email, identifier)
                 await self.validate_signin_destination(password, account)
                 await paced.fill(password, account['password'])
                 submit = page.locator('#signInSubmit:visible')
@@ -674,12 +747,13 @@ class Amazon:
                 await paced.click(submit)
                 await self.wait_for_signin_step(page, '#ap_password')
             elif await email.count():
-                if not account.get('email'):
+                if not identifier:
                     raise AuthenticationRequired('Save an email or username for this account, or complete sign-in in View live.')
                 await self.validate_signin_destination(email, account)
-                await paced.fill(email, account['email'])
+                await paced.fill(email, identifier)
                 submit = page.locator('#continue:visible')
                 await self.validate_signin_destination(submit, account)
+                page.context._retail_signup_identifier = identifier
                 await paced.click(submit)
                 await self.wait_for_signin_step(page, '#ap_email, #ap_email_login')
             elif await page.locator("#auth-mfa-otpcode:visible, #cvf-input-code:visible").count() and account.get("auto_otp"):
@@ -693,7 +767,7 @@ class Amazon:
     async def validate_signin_destination(self, control, account):
         if await control.count() != 1:
             raise AuthenticationRequired('The sign-in control is missing or ambiguous; review View live.')
-        destination = await control.evaluate("e => e.hasAttribute('formaction') ? e.formAction : (e.form?.action || location.href)")
+        destination = await control.evaluate("e => e.hasAttribute('formaction') ? e.formAction : (e.form ? Object.getOwnPropertyDescriptor(HTMLFormElement.prototype,'action').get.call(e.form) : location.href)")
         target = urlparse(destination)
         if target.scheme != 'https' or target.netloc != DOMAINS[account.get('region', 'US')]:
             raise AuthenticationRequired('The sign-in form leaves this account’s Amazon region; credentials were not submitted.')
@@ -753,6 +827,8 @@ class Amazon:
         await self.check_browser_health(page, account)
         account['session_storage'] = await self.capture_session_storage(page)
         account["logged_in"] = True
+        from .account_lifecycle import record, classify
+        record(self.store,account["id"],classify({},session_verified=True))
         self.store.put("accounts", account)
         await context.close()
         del self.logins[account["id"]]
@@ -805,6 +881,8 @@ class Amazon:
                 current.update(session=await context.storage_state(indexed_db=True), session_storage=await self.capture_session_storage(page),
                                logged_in=True, session_saved_at=now(), last_login=now())
                 self.store.put("accounts", current)
+                from .account_lifecycle import record, classify
+                record(self.store,account["id"],classify({},session_verified=True))
                 self.store.put("sessions", {"account_id":account['id'],"retailer":account.get('retailer','amazon'),"status":"ready","last_login":now(),"network":account.get('proxy_list_id','')}, 'session-'+account['id'])
 
     async def probe_session(self, account, connection):
@@ -860,26 +938,21 @@ class Amazon:
 
     async def seller_text(self, root, *, product_page=False):
         """Read seller evidence, never infer the seller from 'Ships from'."""
-        direct = root.locator("#sellerProfileTriggerId, [tabular-attribute-name='Sold by'] .tabular-buybox-text, .tabular-buybox-text[tabular-attribute-name='Sold by'], .seller-name")
-        values = []
-        for node in await direct.all():
-            if await node.is_visible():
-                value = (await node.inner_text()).strip()
-                if value: values.append(value)
+        evidence = await root.evaluate(f'() => ({SELLER_EVIDENCE})(document)' if product_page else SELLER_EVIDENCE)
+        return self.seller_from_evidence(evidence, product_page=product_page)
+
+    @staticmethod
+    def seller_from_evidence(evidence, *, product_page=False):
+        values = evidence['direct']
         if values:
             return values[0] if len(set(values)) == 1 else ''
         if product_page:
             # Amazon's newer offer-display layout gives the seller a dedicated
             # merchant feature, separate from the shipping provider feature.
-            merchant = root.locator('#merchantInfoFeature_feature_div .offer-display-feature-text-message')
-            if await merchant.count() == 1 and await merchant.is_visible():
-                value = (await merchant.inner_text()).strip()
-                if value and '\n' not in value:
-                    return value
-            blocks = root.locator('#merchantInfoFeature_feature_div, #merchant-info, #tabular-buybox')
-            text = '\n'.join(await blocks.all_inner_texts())
-        else:
-            text = await root.inner_text()
+            value = evidence['merchant']
+            if value and '\n' not in value:
+                return value
+        text = evidence['text']
         match = re.search(r'(?:ships from and sold by|shipper\s*/\s*seller|sold by)\s*:?\s*([^\n]+)', text, re.I)
         if match:
             return re.split(r'\s+and (?:fulfilled|ships|shipped)|\s+Returns\b', match[1], flags=re.I)[0].strip().rstrip('.')
@@ -1000,25 +1073,43 @@ class Amazon:
         page._retail_initial_product = None
         response = None if reuse_initial else await self.navigate(page, target, wait_until="domcontentloaded", timeout=45000)
         await self.check(page)
+        if getattr(page, '_retail_ready_recheck', False):
+            # A standby browser is only a resource optimization. Verify the
+            # signed-in header on the newly loaded offer before carting.
+            label = await self.wait_session_header(page)
+            if not label or 'sign in' in label.lower():
+                raise AuthenticationRequired('Prepared account session expired; signing in again.')
+            page._retail_ready_recheck = False
         return await self.read_product(page, item, inventory_only=inventory_only)
 
     @timed('Read product details')
     async def read_product(self, page, item, *, inventory_only=False):
-        # One browser round trip for passive product fields. Keep action
-        # resolution and seller verification separate; they have stricter rules.
-        details = await page.evaluate('''() => {
+        page._retail_discovered_offer = None
+        if not item.get('use_offer_id', True):
+            page._retail_offer_usage = None
+        # Read the offer and its actionable-control evidence together. The
+        # actual mutation still resolves and validates its control at click time.
+        role, label, fallbacks = ACTIONS['ADD_TO_CART']
+        controls = page.get_by_role(role, name=re.compile(label, re.I)).or_(page.get_by_label(re.compile(label, re.I)))
+        for css in fallbacks:
+            controls = controls.or_(page.locator(css))
+        details = await controls.evaluate_all('''controls => {
             const first = selector => (document.querySelector(selector)?.innerText || '').trim();
             const visibleText = selector => [...document.querySelectorAll(selector)]
                 .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
                 .map(e => e.innerText).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
             const metadata = document.querySelectorAll("meta[property='product:price:amount'], meta[itemprop='price']");
             const images = document.querySelectorAll('#landingImage');
+            const usable = controls.filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden'
+                && !e.matches(':disabled') && !e.closest('[aria-disabled="true"]'));
             return {
+                seller: (__SELLER_EVIDENCE__)(document),
+                cart_controls: usable.length,
                 title: first('#productTitle'),
                 price: first('#corePrice_feature_div .a-price .a-offscreen, #corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #priceblock_ourprice'),
                 metadata: metadata.length === 1 ? metadata[0].getAttribute('content') || '' : '',
                 original: first('#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen, #corePrice_feature_div .a-text-price .a-offscreen'),
-                offer: document.querySelector("input[name='offerListingID'], input[name='offeringID.1']")?.getAttribute('value') || '',
+                offer: (__OFFER_EVIDENCE__)(usable.length === 1 ? usable[0] : null),
                 condition: first('#condition, #condition-value').toLowerCase(),
                 used: !!document.querySelector('#usedBuySection') && !document.querySelector('#newBuyBoxPrice, #newBuyBox'),
                 image: images.length === 1 ? images[0].getAttribute('src') || '' : '',
@@ -1026,7 +1117,10 @@ class Amazon:
                 account: visibleText('#nav-link-accountList .nav-line-1'),
                 purchase: visibleText('#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #deliveryBlockMessage')
             };
-        }''')
+        }'''.replace('__SELLER_EVIDENCE__', SELLER_EVIDENCE).replace('__OFFER_EVIDENCE__', OFFER_EVIDENCE))
+        offer = details['offer']
+        if offer['id'] and offer['asin'] != item['asin']:
+            offer = {'id': '', 'status': 'product_mismatch'}
         if not inventory_only and 'sign in' in details.get('account', ''):
             raise AuthenticationRequired('Account session expired; saved credentials will be used to sign in again.')
         title = details['title']
@@ -1043,28 +1137,9 @@ class Amazon:
             if re.fullmatch(r'\d{1,7}(?:\.\d{1,2})?', raw):
                 price = float(raw)
         original = money(details['original'])
-        seller = await self.seller_text(page, product_page=True)
+        seller = self.seller_from_evidence(details['seller'], product_page=True)
         agent_error = ''
-        try:
-            if inventory_only:
-                # A read-only stock signal needs neither an action locator nor
-                # a model request. A strict native control is a fallback when
-                # the page has no explicit inventory label.
-                cart = page.locator('#add-to-cart-button, input[name="submit.add-to-cart"]').or_(
-                    page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['ADD_TO_CART'], re.I)))
-            else:
-                with stage('Resolve purchase control'):
-                    cart = await resolve(page,"ADD_TO_CART")
-        except InteractionError:
-            cart = page.get_by_role('button', name=re.compile(AMAZON_ACTIONS['ADD_TO_CART'], re.I))
-            if not inventory_only:
-                try:
-                    with stage('Purchase-control recovery'):
-                        cart = await self.resolve_action(page, 'ADD_TO_CART')
-                except InteractionError as exc:
-                    agent_error = str(exc)
-        unique = await cart.count() == 1 if hasattr(cart, 'count') else True
-        cart_available = unique and await cart.is_visible() and await cart.is_enabled()
+        cart_available = details['cart_controls'] == 1
         # Inventory and permission to buy are different. Grocery pages can say
         # "In Stock" while replacing the purchase controls with sign-in or a
         # delivery-location restriction. Ignore navigation and hidden templates.
@@ -1073,18 +1148,40 @@ class Amazon:
         out_of_stock = bool(re.search(r'currently unavailable|out of stock|not in stock', stock_text))
         in_stock = bool(re.search(r'\bin stock\b', stock_text)) and not out_of_stock
         restrictions = []
+        if offer['status'] == 'product_mismatch':
+            restrictions.append('Purchase form belongs to a different product')
         if re.search(r'(?:cannot|can\'t|can not) be (?:shipped|delivered) to (?:your|the) (?:selected )?(?:delivery )?location', evidence['purchase']):
             restrictions.append('Unavailable for the selected delivery location')
         if 'sign in to get started' in evidence['purchase']:
             restrictions.append('Sign in required for this offer')
+        # Recovery cannot make a known unavailable/restricted offer eligible.
+        # Keep it only for unrecognized controls on otherwise usable offers.
+        if not inventory_only and not out_of_stock and not restrictions and details['cart_controls'] == 0:
+            try:
+                with stage('Purchase-control recovery'):
+                    cart = await self.resolve_action(page, 'ADD_TO_CART')
+                unique = await cart.count() == 1 if hasattr(cart, 'count') else True
+                cart_available = unique and await cart.is_visible() and await cart.is_enabled()
+            except InteractionError as exc:
+                agent_error = str(exc)
         available = cart_available and not out_of_stock and not restrictions
         stock_status = 'unavailable' if out_of_stock else 'available' if in_stock or available else 'unknown'
         stock_message = {'available': 'In stock', 'unavailable': 'Out of stock', 'unknown': 'Stock could not be verified'}[stock_status]
         if not available and not restrictions and stock_status != 'unavailable':
             restrictions.append('Add-to-cart control could not be verified')
         availability_message = '; '.join([stock_message, *restrictions])
+        if (item.get('use_offer_id', True) and not inventory_only and available and offer['id'] and price is not None
+                and (not item.get('offer_id') or item['offer_id'] == offer['id'])):
+            page._retail_discovered_offer = {
+                'id': offer['id'], 'asin': item['asin'], 'url': page.url,
+                'at': time.monotonic(),
+                'shortcut': item.get('offer_id_shortcut', False),
+                'endpoint': item.get('offer_id_shortcut', False) and item.get('offer_id_endpoint', False),
+            }
         return {"asin": item["asin"], "title": title, "price": price,
-                "original_price": original, "offer_id": details['offer'],
+                "original_price": original, "offer_id": offer['id'],
+                'offer_id_status': offer['status'],
+                'use_offer_id': item.get('use_offer_id', True),
                 "image": details['image'],
                 "amazon_seller": bool(re.fullmatch(r"Amazon(?:\.com|\.co\.uk|\.ca)?(?: Services(?:,? Inc\.?)?|\.com Services LLC)?", seller, re.I)),
                 "seller": seller or "Unknown", "condition": "used" if details['used'] or "used" in details['condition'] else "new",
@@ -1127,17 +1224,32 @@ class Amazon:
         # once, then reconcile the resulting cart instead of leaving and
         # reloading the product for a preflight inspection.
         if not self.is_cart_page(page):
-            await self.select_product_quantity(page, quantity)
-            before = await page.evaluate(PAGE_STATE, {'state': 'cart', 'snapshot': True, 'asin': asin, 'quantity': quantity})
-            if before.get('error'):
-                await self.check(page)
-                raise Attention(before['error'])
             with stage('Add target acknowledgement'):
                 try:
-                    await behavior.click(page, await self.resolve_action(page, "ADD_TO_CART"))
+                    offer = getattr(page, '_retail_discovered_offer', None)
+                    direct = False
+                    if offer and offer.get('shortcut'):
+                        page._retail_discovered_offer = None
+                        if offer['asin'] != asin:
+                            raise CartRejected('Discovered offer belongs to a different product')
+                        direct = await self.direct_offer_cart(page, None, offer, quantity)
+                        if not direct:
+                            # Unsupported before any mutation: reuse the binding
+                            # for one native click, without trying direct again.
+                            page._retail_discovered_offer = {**offer, 'shortcut': False}
+                    if direct:
+                        before = page._retail_direct_cart_before
+                    else:
+                        await self.select_product_quantity(page, quantity)
+                        before = await page.evaluate(PAGE_STATE, {'state': 'cart', 'snapshot': True, 'asin': asin, 'quantity': quantity})
+                        if before.get('error'):
+                            await self.check(page)
+                            raise Attention(before['error'])
+                        await self.click_product_offer(page, asin, quantity)
                 except InteractionError as exc:
                     raise Attention(str(exc)) from exc
-                await self.wait_state(page, 'cart', asin=asin, quantity=quantity, before=before)
+                if not (direct and offer.get('endpoint')):
+                    await self.wait_state(page, 'cart', asin=asin, quantity=quantity, before=before)
             # Amazon sometimes sends Add directly to the cart. Reuse it.
             if not self.is_cart_page(page):
                 with stage('Open cart after add'):
@@ -1148,16 +1260,207 @@ class Amazon:
             await self.wait_state(page, 'cart_items', asin=asin)
             await self.check(page)
             lines = await self.get_cart(page)
+            if (getattr(page, '_retail_endpoint_cart_only', False)
+                    and lines != [{'asin': asin, 'quantity': quantity}]):
+                raise Attention('Endpoint response redirected without readable acknowledgement and the cart does not exactly match. Review it; no cart changes or repeat Add were sent')
             matching = [line for line in lines if line['asin'] == asin]
             if len(matching) != 1:
                 raise Attention('The target could not be uniquely identified in the cart; review before restarting')
             if any(line['asin'] != asin for line in lines):
-                await self.remove_unrelated_cart_items(page, asin, lines)
+                lines = await self.remove_unrelated_cart_items(page, asin, lines)
+                matching = [line for line in lines if line['asin'] == asin]
+                if len(matching) != 1:
+                    raise Attention('The target could not be uniquely identified after cart cleanup')
             await self.normalize_cart_quantity(page, asin, quantity, matching[0])
             lines = await self.get_cart(page)
             if lines != [{'asin': asin, 'quantity': quantity}]:
                 raise Attention('Cart product or quantity could not be verified; inspect the cart before restarting')
+            await self.verify_cart_offer(page, asin)
+            page._retail_endpoint_cart_only = False
         return quantity
+
+    @staticmethod
+    def record_offer_usage(page, **changes):
+        usage = {**(getattr(page, '_retail_offer_usage', None) or {}), **changes, 'at': now()}
+        page._retail_offer_usage = usage
+        report = getattr(page, '_retail_report_offer_usage', None)
+        if report:
+            report(dict(usage))
+        return usage
+
+    async def verify_offer_row(self, page, asin, row, phase):
+        usage = getattr(page, '_retail_offer_usage', None)
+        if not usage or not usage.get('offer_id'):
+            return
+        if usage['asin'] != asin or urlparse(page.url).netloc != usage['origin']:
+            self.record_offer_usage(page, **{phase: 'mismatch'})
+            raise Attention('Offer verification belongs to a different product or origin; review before continuing')
+        tokens = await row.evaluate(ROW_OFFER_EVIDENCE) if row is not None else []
+        status = ('evidence_lost' if usage.get(phase) == 'matched' else 'not_exposed') if not tokens else 'matched' if tokens == [usage['offer_id']] else 'mismatch'
+        self.record_offer_usage(page, **{phase: status})
+        if status == 'evidence_lost':
+            raise Attention(f'{phase.title()} Offer ID evidence disappeared after verification; no further action was sent')
+        if status == 'mismatch':
+            raise Attention(f'{phase.title()} Offer ID differs from the purchase form or is ambiguous; no further action was sent. Review the existing cart; do not repeat Add to Cart')
+
+    async def verify_cart_offer(self, page, asin):
+        if not getattr(page, '_retail_offer_usage', None):
+            return
+        rows = page.locator(f"#sc-active-cart [data-asin='{asin}']:not([data-removed='true']):not([data-removed='true'] *):visible")
+        if await rows.count() != 1:
+            rows = page.locator(f"[data-asin='{asin}'][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *):not([data-removed='true']):not([data-removed='true'] *):visible")
+        await self.verify_offer_row(page, asin, rows.first if await rows.count() == 1 else None, 'cart')
+
+    async def click_bound_offer(self, page, control, offer, action):
+        """Check the exact form again after pointer movement, then dispatch once."""
+        position = await behavior.prepare(page, control)
+        current = await control.evaluate(OFFER_EVIDENCE)
+        if (page.url != offer['url'] or time.monotonic() - offer['at'] > 15
+                or current['id'] != offer['id'] or current['asin'] != offer['asin']):
+            self.record_offer_usage(page, offer_id=offer['id'], asin=offer['asin'],
+                                    origin=urlparse(offer['url']).netloc, action=action,
+                                    form='mismatch', cart='not_checked', checkout='not_checked')
+            raise CartRejected('Discovered offer changed; no purchase action was sent')
+        kwargs = {'timeout': 3000}
+        if position is not None:
+            kwargs['position'] = position
+            paced = behavior.controller(page)
+            kwargs['delay'] = paced.rng.triangular(35, 130, 65) * paced.duration_scale
+        self.record_offer_usage(page, offer_id=offer['id'], asin=offer['asin'],
+                                origin=urlparse(offer['url']).netloc, action=action,
+                                route='native_click',
+                                form='matched_dispatching', cart='not_checked', checkout='not_checked')
+        try:
+            await control.click(**kwargs)
+        except BaseException:
+            self.record_offer_usage(page, form='dispatch_uncertain')
+            raise
+        self.record_offer_usage(page, form='matched_clicked')
+
+    async def direct_offer_cart(self, page, control, offer, quantity):
+        """Validate and POST in one browser operation; never replay uncertainty."""
+        if offer.get('endpoint'):
+            return await self.endpoint_offer_cart(page, control, offer, quantity)
+        args = {**offer, 'quantity': quantity, 'submit': True}
+        if page.url != offer['url'] or time.monotonic() - offer['at'] > 15:
+            raise CartRejected('Direct Offer ID form changed or expired; no request was sent')
+        self.record_offer_usage(page, offer_id=offer['id'], asin=offer['asin'],
+                                origin=urlparse(offer['url']).netloc, action='add_to_cart',
+                                route='direct_form', shortcut='enabled', form='matched_posting',
+                                cart='not_checked', checkout='not_checked')
+        with stage('Direct Offer ID form POST'):
+            try:
+                async with page.expect_navigation(wait_until='commit', timeout=15000) as navigation:
+                    with stage('Prepare and dispatch direct Offer ID'):
+                        result = (await page.evaluate(DIRECT_OFFER_CART, args) if control is None
+                                  else await control.evaluate(DIRECT_OFFER_FORM, args))
+                    if result['status'] == 'unsupported':
+                        raise _UnsupportedOfferForm()
+                    if result['status'] == 'blocked':
+                        await self.check(page)
+                        raise CartRejected(result['error'])
+                    if result['status'] == 'already_sent':
+                        raise Attention('Direct Offer ID request was already dispatched; no repeat was sent')
+                    if result['status'] != 'sent':
+                        raise CartRejected('Direct Offer ID form changed before dispatch; no request was sent')
+                    page._retail_direct_cart_before = result.get('before')
+                response = await navigation.value
+                self._raise_for_response(response)
+                if response is None or response.status >= 400 or urlparse(page.url).netloc != urlparse(offer['url']).netloc:
+                    raise Attention('Direct Offer ID response could not be verified; inspect the cart without repeating Add')
+            except _UnsupportedOfferForm:
+                self.record_offer_usage(page, route='native_click', shortcut='unsupported_form', form='not_checked')
+                return False
+            except CartRejected:
+                self.record_offer_usage(page, form='mismatch')
+                raise
+            except BaseException:
+                self.record_offer_usage(page, form='dispatch_uncertain')
+                raise
+        self.record_offer_usage(page, form='matched_posted')
+        return True
+
+    async def endpoint_offer_cart(self, page, control, offer, quantity):
+        """One same-origin browser fetch, without rendering the ATC response."""
+        if page.url != offer['url'] or time.monotonic() - offer['at'] > 15:
+            raise CartRejected('Endpoint Offer ID form changed or expired; no request was sent')
+        args = {**offer, 'quantity': quantity, 'submit': True, 'endpoint': True,
+                'endpoint_timeout_ms': ENDPOINT_TIMEOUT_MS}
+        self.record_offer_usage(page, offer_id=offer['id'], asin=offer['asin'],
+                                origin=urlparse(offer['url']).netloc, action='add_to_cart',
+                                route='direct_endpoint', shortcut='enabled', form='endpoint_posting',
+                                cart='not_checked', checkout='not_checked')
+        try:
+            with stage('Direct Offer ID endpoint request'):
+                async with asyncio.timeout(ENDPOINT_TIMEOUT_MS / 1000 + 2):
+                    result = (await page.evaluate(DIRECT_OFFER_CART, args) if control is None
+                              else await control.evaluate(DIRECT_OFFER_FORM, args))
+            status = result['status']
+            if status == 'unsupported':
+                self.record_offer_usage(page, route='native_click', shortcut='unsupported_form', form='not_checked')
+                return False
+            if status == 'blocked':
+                await self.check(page)
+                raise CartRejected(result['error'])
+            if status == 'changed':
+                raise CartRejected('Endpoint Offer ID form changed before dispatch; no request was sent')
+            if status == 'already_sent':
+                raise Attention('Offer ID request was already dispatched; no repeat was sent')
+            self._raise_for_response(SimpleNamespace(status=result.get('http_status', 0),
+                headers={'retry-after': result.get('retry_after')}))
+            if page.url != offer['url']:
+                raise Attention('The task page changed during the endpoint request; review the cart without repeating Add')
+            if status not in ('acknowledged', 'redirected'):
+                raise Attention('Offer ID endpoint result is unverified or interrupted; inspect the cart. No fallback or repeat Add was sent')
+            page._retail_direct_cart_before = result.get('before')
+            page._retail_endpoint_cart_only = status == 'redirected'
+        except CartRejected:
+            self.record_offer_usage(page, form='mismatch')
+            raise
+        except BaseException:
+            self.record_offer_usage(page, form='dispatch_uncertain')
+            # Cancelling the controller only stops waiting/transmission; it
+            # never proves an already-sent mutation was undone.
+            try:
+                await asyncio.wait_for(page.evaluate('() => globalThis.__retailOfferRequest?.abort()'), 1)
+            except BaseException:
+                pass
+            raise
+        self.record_offer_usage(page, form='endpoint_redirected' if page._retail_endpoint_cart_only else 'endpoint_acknowledged')
+        return True
+
+    async def click_product_offer(self, page, asin, quantity=1):
+        """Consume fresh, account-page discovery once; preserve native form input."""
+        offer = getattr(page, '_retail_discovered_offer', None)
+        page._retail_discovered_offer = None
+        if not offer:
+            await behavior.click(page, await self.resolve_action(page, 'ADD_TO_CART'))
+            return
+        if (offer['asin'] != asin or page.url != offer['url']
+                or time.monotonic() - offer['at'] > 15):
+            raise CartRejected('Discovered offer expired or product changed; inspect the offer again')
+        with stage('Use discovered offer control'):
+            handle = await page.evaluate_handle('''expected => {
+                const matches = [...document.querySelectorAll('button,input[type="submit"],input[type="image"],#add-to-cart-button')]
+                    .filter(control => {
+                        const label = control.getAttribute('aria-label') || control.value || control.textContent || '';
+                        if (control.id !== 'add-to-cart-button' && control.name !== 'submit.add-to-cart'
+                            && !/^add to (?:shopping )?cart$/i.test(label.trim())) return false;
+                        const current = (__OFFER_EVIDENCE__)(control);
+                        return current.id === expected.id && current.asin === expected.asin;
+                    });
+                return matches.length === 1 ? matches[0] : null;
+            }'''.replace('__OFFER_EVIDENCE__', OFFER_EVIDENCE), {'id': offer['id'], 'asin': asin})
+            control = handle.as_element()
+            if control is None:
+                await handle.dispose()
+                raise CartRejected('Discovered offer changed; no Add to Cart was sent')
+            try:
+                if offer.get('shortcut') and await self.direct_offer_cart(page, control, offer, quantity):
+                    return
+                await self.click_bound_offer(page, control, offer, 'add_to_cart')
+            finally:
+                await control.dispose()
 
     @staticmethod
     def is_cart_page(page):
@@ -1182,7 +1485,7 @@ class Amazon:
         # A supported native cart quantity picker can safely normalize a
         # pre-existing target. Verify the resulting DOM state after the
         # change; never add the target again to adjust quantity.
-        row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
+        row = page.locator(f"#sc-active-cart [data-asin='{asin}']:not([data-removed='true']):not([data-removed='true'] *)")
         picker = row.locator("select[name='quantity']")
         if await row.count() == 1 and await picker.count() == 1:
             choices = await picker.locator('option').evaluate_all("els => els.map(e => e.value)")
@@ -1202,7 +1505,7 @@ class Amazon:
                     break
                 await behavior.click(page, control)
                 try:
-                    await page.wait_for_function("([asin, qty]) => {const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.getAttribute('data-asin')===asin); return rows.length===1 && rows[0].getAttribute('data-quantity')===String(qty)}", arg=[asin, expected], timeout=3000)
+                    await page.wait_for_function("([asin, qty]) => {const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.getAttribute('data-asin')===asin && !e.closest('[data-removed=\"true\"]')); return rows.length===1 && rows[0].getAttribute('data-quantity')===String(qty)}", arg=[asin, expected], timeout=3000)
                 except Exception:
                     break
             updated = await self.get_cart(page)
@@ -1226,7 +1529,15 @@ class Amazon:
         page._retail_cart_title = title.splitlines()[0].strip()
         page._retail_cart_asin = asin
         try:
-            await behavior.click(page, await self.resolve_action(page, 'BUY_NOW'))
+            control = await self.resolve_action(page, 'BUY_NOW')
+            offer = getattr(page, '_retail_discovered_offer', None)
+            if offer:
+                page._retail_discovered_offer = None
+                if offer['asin'] != asin:
+                    raise CartRejected('Buy Now offer belongs to a different product')
+                await self.click_bound_offer(page, control, offer, 'buy_now')
+            else:
+                await behavior.click(page, control)
         except InteractionError as exc:
             raise Attention(str(exc)) from exc
         await self.advance_checkout(page)
@@ -1238,7 +1549,7 @@ class Amazon:
         return await page.evaluate('''() => {
             const selector = document.querySelector('#sc-active-cart') ? '#sc-active-cart [data-asin]' :
                 '[data-asin][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *)';
-            return [...document.querySelectorAll(selector)].filter(e => e.getClientRects().length &&
+            return [...document.querySelectorAll(selector)].filter(e => !e.closest('[data-removed="true"]') && e.getClientRects().length &&
                 getComputedStyle(e).visibility !== 'hidden').map(e => {
                 const picker = e.querySelectorAll("select[name='quantity']");
                 const qty = e.getAttribute('data-quantity') ?? (picker.length === 1 ? picker[0].value : null);
@@ -1254,7 +1565,7 @@ class Amazon:
         if any(not re.fullmatch(r'[A-Z0-9]{10}', asin or '') for asin in unrelated) or len(unrelated) != len(set(unrelated)):
             raise Attention('Cart item identities are ambiguous; no items were removed')
         for asin in unrelated:
-            row = page.locator(f"#sc-active-cart [data-asin='{asin}']:visible")
+            row = page.locator(f"#sc-active-cart [data-asin='{asin}']:not([data-removed='true']):not([data-removed='true'] *):visible")
             if await row.count() != 1:
                 raise Attention('An unrelated cart item could not be uniquely identified')
             # Amazon keeps hidden responsive copies and sometimes labels the
@@ -1263,10 +1574,14 @@ class Amazon:
             try:
                 handle = await page.wait_for_function('''asin => {
                     const visible=e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
-                    const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.dataset.asin===asin && visible(e));
+                    const rows=[...document.querySelectorAll('#sc-active-cart [data-asin]')].filter(e=>e.dataset.asin===asin && visible(e) && !e.closest('[data-removed="true"]'));
                     if(rows.length!==1) return {error:'row'};
+                    // At quantity one the stepper also says Delete. It is not
+                    // the dedicated remove-item action and must never compete
+                    // with, or substitute for, that action.
+                    const stepper='[data-action~="a-stepper"],[data-action~="a-stepper-decrement"],[data-action~="a-stepper-increment"],.sc-action-quantity,.sc-quantity-stepper';
                     const candidates=[...rows[0].querySelectorAll('input[type="submit"],input[type="button"],button,a,[role="button"]')].filter(e=>{
-                        if(!visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true') return false;
+                        if(!visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true' || e.closest(stepper)) return false;
                         const labelled=(e.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id=>document.getElementById(id)?.textContent || '').join(' ');
                         const label=(e.getAttribute('aria-label') || labelled.trim() || e.value || e.textContent || '').trim();
                         return /^submit\\.delete(?:-active)?(?:\\.|$)/.test(e.getAttribute('name') || '')
@@ -1289,6 +1604,7 @@ class Amazon:
         remaining = await self.get_cart(page)
         if any(line['asin'] != target_asin for line in remaining):
             raise Attention('Unrelated items remain in the active cart')
+        return remaining
 
     async def prepare_checkout(self, page, asin, quantity):
         """Refuse automatic checkout of a mixed, unrecognized, or mismatched cart."""
@@ -1296,13 +1612,13 @@ class Amazon:
         if len([line for line in lines if line['asin'] == asin]) != 1:
             raise Attention('The target could not be uniquely identified before checkout; no items were removed')
         if any(line['asin'] != asin for line in lines):
-            await self.remove_unrelated_cart_items(page, asin, lines)
-            lines = await self.get_cart(page)
+            lines = await self.remove_unrelated_cart_items(page, asin, lines)
         if len(lines) != 1 or lines[0]['asin'] != asin:
             raise Attention("Automatic checkout requires exactly the target product in the active cart")
         if lines[0]['quantity'] != quantity:
             raise Attention("Cart quantity cannot be verified or differs from the requested quantity")
-        row = page.locator(f"#sc-active-cart [data-asin='{asin}']")
+        await self.verify_cart_offer(page, asin)
+        row = page.locator(f"#sc-active-cart [data-asin='{asin}']:not([data-removed='true']):not([data-removed='true'] *)")
         titles = [value.splitlines()[0].strip() for value in await row.locator('.sc-product-title').all_inner_texts() if value.strip()]
         page._retail_cart_title = titles[0] if titles and len(set(titles)) == 1 else ''
         page._retail_cart_asin = asin
@@ -1326,6 +1642,9 @@ class Amazon:
             if observed['kind'] == 'dialog':
                 action = 'DISMISS_CHECKOUT_OFFER'
             elif observed['kind'] == 'review':
+                if self.store:
+                    from .workflow_recovery import confirm_recovery
+                    confirm_recovery(self.store,page,{'ADD_TO_CART','BEGIN_CHECKOUT','CONTINUE_CHECKOUT','DISMISS_CHECKOUT_OFFER'})
                 return
             else:
                 action = 'CONTINUE_CHECKOUT'
@@ -1410,6 +1729,7 @@ class Amazon:
                 condition = condition_match[1].lower() if condition_match else None
             if not allow_used and condition != "new":
                 raise Attention("Checkout item condition could not be verified as new")
+        await self.verify_offer_row(page, asin, None if modern else lines.first, 'checkout')
         try:
             await page.wait_for_function("() => [...document.querySelectorAll('#subtotals-marketplace-table tr,li')].some(e => /^\\s*(?:(?:order|grand)\\s+total|total\\s+due|amount\\s+due|amount\\s+payable)\\s*:/i.test(e.textContent) && /[$£]\\s*[\\d,.]+/.test(e.textContent))", timeout=10000)
         except Exception as exc:
@@ -1460,6 +1780,8 @@ class Amazon:
                 components.append(entry)
         snapshot = {"total": values[0], "quantity": quantity, "asin": asin, "currency": "USD",
                     "unit_price": unit_price, "price_components": components}
+        if getattr(page, '_retail_offer_usage', None):
+            snapshot['offer_usage'] = dict(page._retail_offer_usage)
         page._retail_review['snapshot'] = snapshot
         return snapshot
 
@@ -1469,13 +1791,17 @@ class Amazon:
         if not review or review['url'] != page.url or time.monotonic() - review['at'] > 60:
             raise Attention('Checkout review expired or changed; submission stopped')
         control = getattr(page, '_retail_submit_control', None)
+        position = None
         if control is not None:
-            await behavior.prepare(page, control)
+            position = await behavior.prepare(page, control)
         if review['url'] != page.url or time.monotonic() - review['at'] > 60:
             raise Attention('Checkout review expired or changed during input preparation; submission stopped')
         # Check financial facts again after any agent round trips, using the
         # already validated control. There is no model call after journaling.
         fresh = await self.checkout_snapshot(page, *review['args'], **review['limits'], allow_recovery=False)
+        if (review['snapshot'].get('offer_usage', {}).get('checkout') == 'matched'
+                and fresh.get('offer_usage', {}).get('checkout') != 'matched'):
+            raise Attention('Checkout Offer ID evidence disappeared after review; submission stopped')
         if any(fresh.get(key) != review['snapshot'].get(key) for key in ('asin','quantity','currency','total','unit_price')):
             raise Attention('Checkout facts changed after submission intent; reconcile before retrying')
         gate = getattr(page, '_retail_submit_gate', None)
@@ -1484,7 +1810,7 @@ class Amazon:
         button = page._retail_submit_control
         page._retail_review = None
         page._retail_submit_control = None
-        await button.click(no_wait_after=True)
+        await button.click(position=position, no_wait_after=True)
         await self.wait_state(page, 'submission')
 
     async def confirmation(self, page):

@@ -7,3 +7,5 @@ pytest==9.1.1
 mcp==1.30.0
 websockets==16.0
 tzdata==2026.5
+IMAPClient==3.0.1
+h11==0.16.0

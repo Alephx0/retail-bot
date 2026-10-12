@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timezone
 from .account_consistency import PurchaseCooldown
 from .amazon import Amazon, Attention, AuthenticationRequired, ChallengeDetected, BackoffRequired, AccessDenied, CartRejected
@@ -13,6 +14,11 @@ from .performance import stage, timed, elapsed
 class TaskRunner:
     def __init__(self, engine): self.engine=engine
     def __getattr__(self, key): return getattr(self.engine,key)
+
+    def record_offer_usage(self, task_id, usage):
+        task = self.store.get('tasks', task_id)
+        if task:
+            self.store.put('tasks', {**task, 'offer_usage': usage})
 
     async def hide_if_background(self, adapter, page):
         settings = self.store.get('settings', 'settings') or {}
@@ -81,6 +87,8 @@ class TaskRunner:
         retain_context = False
         cart_attempted = False
         reconcile_cart = ''
+        ready_entry = None
+        ready_key = None
         try:
             saved_task = self.store.get("tasks", id)
             task = {**saved_task, **Task.model_validate(saved_task).model_dump(mode="json")}
@@ -109,12 +117,57 @@ class TaskRunner:
             seen_observations = {}
             startup_products = None
             session_mode = (self.store.get('settings', 'settings') or {}).get('session_verification_mode', 'http')
+            settings = self.store.get('settings','settings') or {}
+            if (not task['simulation'] and task['checkout_mode'] != 'monitor'
+                    and (session_mode != 'headless' or not settings.get('show_browser_window',True))):
+                ready_entry = self.engine.reserve_readiness(id, account['id'])
+
+            async def release_prepared():
+                nonlocal context,lock_acquired,slot_acquired,ready_entry
+                try:
+                    if ready_entry:
+                        ready_entry['idle'] = False
+                    if context:
+                        await self.diagnostics.finish_trace(id,context)
+                        await self.close_context(adapter,context)
+                finally:
+                    context = None
+                    self.pages.pop(id,None)
+                    if lock_acquired:
+                        account_lock.release(); lock_acquired=False
+                    if slot_acquired:
+                        self.browser_slots.release(); slot_acquired=False
+                    self.engine.forget_ready(id)
+                    ready_entry = None
+
+            async def standby_wait(operation):
+                """Keep task ownership, but yield idle capacity on demand."""
+                work = asyncio.ensure_future(operation)
+                eviction = None
+                try:
+                    if ready_entry and context:
+                        ready_entry['idle'] = True
+                        eviction = asyncio.create_task(ready_entry['evict'].wait())
+                        await asyncio.wait([work,eviction],return_when=asyncio.FIRST_COMPLETED)
+                        if ready_entry['evict'].is_set():
+                            await release_prepared()
+                            self.status(id,'waiting','Account standby released; waiting for stock',account_ready=False)
+                    return await work
+                finally:
+                    if ready_entry:
+                        ready_entry['idle'] = False
+                    for child in (work,eviction):
+                        if child and not child.done():child.cancel()
+                    await asyncio.gather(*(c for c in (work,eviction) if c),return_exceptions=True)
+
             @timed('Account preparation')
             async def prepare_account(start_item=None, *, preliminary=False):
-                nonlocal account_lock, lock_acquired, slot_acquired, account, context
+                nonlocal account_lock, lock_acquired, slot_acquired, account, context,ready_key
                 start_item = start_item or items[0]
                 account_lock=self.account_locks.setdefault(task["account_id"],asyncio.Lock())
-                if account_lock.locked():self.status(id,"in_queue","Waiting for this account's active task to finish")
+                if account_lock.locked():
+                    await self.engine.evict_ready(account['id'],exclude=id)
+                    self.status(id,"in_queue","Waiting for this account's active task to finish")
                 with stage('Account lease wait'):
                     await account_lock.acquire()
                 lock_acquired=True
@@ -143,7 +196,9 @@ class TaskRunner:
                 account = self.store.get("accounts", task["account_id"])
                 account_proxy = account.get("proxy") or self.proxy(account.get("proxy_list_id", ""), account["id"])
                 connection = account_proxy if task["use_account_proxy"] else self.proxy(task["proxy_id"], id)
-                if preliminary and session_mode == 'http' and hasattr(adapter, 'probe_session'):
+                stock_ready = any(m.product and stock_observation(m.product)[0]=='available'
+                                  and time.monotonic()-m.observed_at <= 10 for m in monitors)
+                if preliminary and not ready_entry and not stock_ready and session_mode == 'http' and hasattr(adapter, 'probe_session'):
                     backoffs = 0
                     while True:
                         self.status(id, 'authenticating', 'Checking saved session without opening a browser')
@@ -161,6 +216,8 @@ class TaskRunner:
                                 backoffs = 0
                         except AccessDenied:
                             await self.pause(id, 'attention', 'Amazon denied the session check. Review the account connection before resuming.')
+                if self.browser_slots.locked():
+                    await self.engine.evict_ready(exclude=id)
                 if self.browser_slots.locked():
                     self.status(id, 'in_queue', 'Waiting for an available browser worker')
                 with stage('Browser worker wait'):
@@ -197,6 +254,12 @@ class TaskRunner:
                     await self.close_context(adapter, context)
                     context = None
                     self.pages.pop(id, None)
+                if ready_entry and context:
+                    ready_key = self.engine.readiness_key(account['id'])
+                    if hasattr(context,'on'):
+                        event = ready_entry['evict']
+                        context.on('close',lambda *_:event.set())
+                        login_page.on('close',lambda *_:event.set())
                 return True
 
             # Give the concurrent first scan a short grace period. Closing an
@@ -212,10 +275,20 @@ class TaskRunner:
                                                                   .1 if task['checkout_mode'] == 'monitor' else 1.0)
                 except asyncio.TimeoutError:
                     pass
-                retain_context = context is not None and task['checkout_mode'] != 'monitor' and any(
-                    stock_observation(product)[0] == 'available' for product in startup_products or [])
+                retain_context = context is not None and task['checkout_mode'] != 'monitor' and (ready_entry is not None or any(
+                    stock_observation(product)[0] == 'available' for product in startup_products or []))
             pages = []
-            self.status(id,"waiting","Standby: waiting for monitor stock observations")
+            self.status(id,"waiting","Account ready; waiting for stock" if ready_entry and context else "Standby: waiting for monitor stock observations",account_ready=bool(ready_entry and context))
+            activation = self.engine.activation_times.get(id,0)
+            if activation > time.time():
+                if not (ready_entry and context):
+                    await release_prepared()
+                    retain_context = False
+                self.status(id,'waiting','Preparing for scheduled start; purchasing has not started',account_ready=bool(ready_entry and context))
+                while activation > time.time():
+                    await standby_wait(asyncio.sleep(max(0,activation-time.time())))
+                startup_products=None
+                seen_observations.clear()
             attempts, successes = 0, 0
             rate_limit_events = 0
             seen_offers = set()
@@ -223,6 +296,15 @@ class TaskRunner:
             while True:
                 latest = self.store.get("groups", group["id"])
                 group["delay_ms"] = latest.get("delay_ms", 4500)
+                if ready_entry and context and not cart_attempted and not reconcile_cart:
+                    prepared_page=getattr(context,'_retail_task_login_page',None)
+                    healthy=prepared_page is not None and not getattr(prepared_page,'is_closed',lambda:False)()
+                    if (ready_entry['evict'].is_set() or not healthy
+                            or ready_key != self.engine.readiness_key(account['id'])):
+                        await release_prepared()
+                        self.status(id,'waiting','Account readiness expired; fresh verification required',account_ready=False)
+                    else:
+                        retain_context=True
                 if not cart_attempted and not retain_context:
                     if context:
                         await self.diagnostics.finish_trace(id, context)
@@ -245,8 +327,20 @@ class TaskRunner:
                     products = startup_products
                     startup_products = None
                     if products is None:
+                        if context:
+                            prepared_page=getattr(context,'_retail_task_login_page',None)
+                            if prepared_page:
+                                prepared_page._retail_initial_product=None
+                                prepared_page._retail_ready_recheck=True
                         with stage('Waiting for stock observation'):
-                            products = await self.monitors.observations(monitors, seen_observations)
+                            products = await standby_wait(self.monitors.observations(monitors, seen_observations))
+                        if ready_entry and ready_key != self.engine.readiness_key(account['id']):
+                            await release_prepared()
+                            self.status(id,'waiting','Account configuration changed; preparing a fresh browser',account_ready=False)
+                    # Capacity may have been requested during initial preparation.
+                    if ready_entry and ready_entry['evict'].is_set():
+                        await release_prepared()
+                        self.status(id,'waiting','Account standby released for another task',account_ready=False)
                     chosen = None
                     for index, (product, item) in enumerate(zip(products, items)):
                         if group.get("notify_offer") and product.get("offer_id") and product["offer_id"] not in seen_offers:
@@ -269,9 +363,12 @@ class TaskRunner:
                     if chosen is None or task["checkout_mode"] == "monitor":
                         reasons = [f"{p['asin']}: " + '; '.join(rejection_reasons(p, i, group)) for p, i in zip(products, items) if rejection_reasons(p, i, group)]
                         message = ' | '.join(reasons)[:1600] or 'Monitor-only task: matching stock found; checkout is disabled for this task'
-                        self.status(id, "waiting", message)
+                        self.status(id, "waiting", ('Account ready; ' if ready_entry and context else '') + message,
+                                    account_ready=bool(ready_entry and context))
                         continue
                     self.status(id,"product_found","Stock detected; checking the assigned account offer")
+                    self.engine.forget_ready(id)
+                    ready_entry = None
                     elapsed('Stock signal age at task selection', monitors[chosen].observed_at)
                     product = products[chosen]
                     if not task['simulation'] and context is None:
@@ -282,6 +379,7 @@ class TaskRunner:
                     checkout_page = None
                     if not task["simulation"]:
                         checkout_page = getattr(context, '_retail_task_login_page', None) or await context.new_page()
+                        checkout_page._retail_report_offer_usage = lambda usage: self.record_offer_usage(id, usage)
                         context._retail_task_login_page = None
                         if hasattr(adapter, 'recovery'):
                             await adapter.recovery.install(checkout_page)
@@ -291,8 +389,19 @@ class TaskRunner:
                         # Recheck in the checkout session immediately before carting.
                         with stage('Account offer verification'):
                             fresh = await adapter.inspect(checkout_page, items[chosen], account["region"])
+                        # Show the account observation separately from anonymous
+                        # stock signals; neither changes the other's authority.
+                        self.store.put('feed', dict(fresh, at=now(), simulation=False,
+                            group_id=group['id'], retailer=group['retailer'],
+                            source='account', account_id=account['id'], task_id=id),
+                            id=f"account-offer-{id}-{items[chosen]['asin']}")
+                        if group.get('notify_offer') and fresh.get('offer_id') and fresh['offer_id'] not in seen_offers:
+                            seen_offers.add(fresh['offer_id'])
+                            message = f"Offer ID found for {items[chosen]['asin']} in the assigned account"
+                            self.store.event(id, 'offer_found', message)
+                            await self.notify(task, message)
                         if not eligible(fresh, items[chosen], group, defer_unknown_seller=True):
-                            self.status(id, 'waiting', 'Product changed before carting: ' + '; '.join(rejection_reasons(fresh, items[chosen], group)))
+                            self.status(id, 'waiting', 'Account offer does not meet task settings: ' + '; '.join(rejection_reasons(fresh, items[chosen], group)))
                             if checkout_page not in pages:
                                 await checkout_page.close()
                             continue
@@ -486,17 +595,30 @@ class TaskRunner:
         except Exception as exc:
             self.status(id, "error", str(exc) if isinstance(exc,ValueError) else f"Could not start task ({type(exc).__name__}). Check browser installation and account settings.")
         finally:
-            await self.monitors.unsubscribe(id, monitors)
-            if context:
+            # Stop can arrive after natural completion has entered teardown.
+            # Keep ownership until browser cleanup finishes, without cancelling
+            # that cleanup a second time.
+            self.engine.finishing_tasks.add(id)
+            try:
                 try:
-                    await self.diagnostics.finish_trace(id,context)
-                    await self.close_context(adapter, context)
-                except Exception:
-                    pass
-            if lock_acquired: account_lock.release()
-            if slot_acquired: self.browser_slots.release()
-            self.jobs.pop(id, None)
-            self.wakes.pop(id, None)
-            self.pages.pop(id, None)
-            self.live_view_locks.pop(('tasks', id), None)
-            self.store.delete("harvesters", "harvester-" + id)
+                    await self.monitors.unsubscribe(id, monitors)
+                finally:
+                    if context:
+                        try:
+                            try:
+                                await self.diagnostics.finish_trace(id,context)
+                            finally:
+                                await self.close_context(adapter, context)
+                        except Exception:
+                            pass
+            finally:
+                if lock_acquired: account_lock.release()
+                if slot_acquired: self.browser_slots.release()
+                self.engine.forget_ready(id)
+                self.engine.activation_times.pop(id,None)
+                self.jobs.pop(id, None)
+                self.wakes.pop(id, None)
+                self.pages.pop(id, None)
+                self.live_view_locks.pop(('tasks', id), None)
+                self.engine.finishing_tasks.discard(id)
+                self.store.delete("harvesters", "harvester-" + id)

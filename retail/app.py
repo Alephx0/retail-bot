@@ -12,6 +12,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .engine import Engine
 from .models import Account, Group, ProxyList, Settings, Task, Profile, Mailbox, Solver, InputList
+from .models import SMSProvider
+from .signup_sms import SMSPool, SMSError
 from .identity import test_mailbox
 from .retailers import catalog, RETAILERS
 from .services import ProxyHealth, SolverService
@@ -33,7 +35,7 @@ from .task_groups.workspace_lock import WorkspaceLock
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = {"accounts": Account, "groups": Group, "proxies": ProxyList, "tasks": Task, "settings": Settings,
           "folders": ResourceFolder, "profiles": Profile, "mailboxes": Mailbox, "solvers": Solver, "input_lists": InputList,
-          "ai_connections": AIConnection, "browser_extensions": BrowserExtension}
+          "ai_connections": AIConnection, "browser_extensions": BrowserExtension, "sms_providers": SMSProvider}
 
 
 def create_app(data_dir=None, *, warm_browser=False):
@@ -50,12 +52,19 @@ def create_app(data_dir=None, *, warm_browser=False):
         app.state.group_coordinator = Coordinator(app.state.engine)
         app.state.engine.group_coordinator = app.state.group_coordinator
         app.state.proxy_health = ProxyHealth(app.state.store)
+        app.state.engine.proxy_health = app.state.proxy_health
+        from .repair_supervisor import RepairSupervisor
+        app.state.engine.repair_supervisor = RepairSupervisor(app.state.store)
         for record in app.state.store.all("harvesters"):
             app.state.store.delete("harvesters", record["id"])
         for record in app.state.store.all("proxy_health"):
             if record.get("status") == "testing":
                 app.state.store.put("proxy_health", {**record, "status": "interrupted"})
         warmup = None
+        async def index_diagnostics():
+            while await asyncio.to_thread(app.state.store.index_legacy_diagnostics):
+                await asyncio.sleep(.05)
+        diagnostic_indexer = asyncio.create_task(index_diagnostics())
         try:
             await app.state.group_coordinator.boot(schedule=False)
             await app.state.engine.boot()
@@ -67,6 +76,8 @@ def create_app(data_dir=None, *, warm_browser=False):
                 if warmup:
                     warmup.cancel()
                     await asyncio.gather(warmup, return_exceptions=True)
+                diagnostic_indexer.cancel()
+                await asyncio.gather(diagnostic_indexer, return_exceptions=True)
                 await app.state.group_coordinator.close()
                 await app.state.engine.close()
                 await app.state.proxy_health.close()
@@ -159,7 +170,7 @@ def create_app(data_dir=None, *, warm_browser=False):
             value["card_last4"] = number[-4:]
         if kind == "mailboxes":
             value["has_password"] = bool(value.pop("password", ""))
-        if kind in ("solvers", "ai_connections"):
+        if kind in ("solvers", "ai_connections", "sms_providers"):
             value["has_api_key"] = bool(value.pop("api_key", ""))
         if kind == "proxies":
             value["count"] = len([x for x in value.pop("entries", "").splitlines() if x.strip()])
@@ -194,11 +205,18 @@ def create_app(data_dir=None, *, warm_browser=False):
         result["account_profiles"] = app.state.resources.links()
         result["task_events"] = store().all("task_events")[-250:]
         result["sessions"] = store().all("sessions")
+        result["account_care"] = app.state.engine.account_care.snapshot()
+        from .account_creation import snapshot as creation_snapshot
+        result['account_creation'] = creation_snapshot(app.state.engine)
         result['browser_health'] = store().all('browser_health')
         result["repairs"] = store().all("repairs")
         result["agent_runs"] = store().all("agent_runs")[-100:]
-        result["proxy_endpoints"] = [{k:v for k,v in p.items() if k!="connection"} for p in store().all("proxy_endpoints")]
-        result["diagnostics"] = [{k:v for k,v in d.items() if k not in ("dom","accessibility","screenshot","trace")} for d in store().all("diagnostics")][-100:]
+        result["workflow_incidents"] = store().all("workflow_incidents")
+        result["repair_queue"] = store().all("repair_queue")
+        result["account_lifecycle"] = store().all("account_lifecycle")
+        result["proxy_endpoints"] = [{k:v for k,v in p.items() if k not in {"connection","history","target"}} for p in store().all("proxy_endpoints")]
+        result["diagnostics"] = store().diagnostic_summaries()
+        result['diagnostics_indexing'] = store().diagnostics_need_index()
         return result
 
     @app.post("/api/{kind}")
@@ -206,7 +224,9 @@ def create_app(data_dir=None, *, warm_browser=False):
     async def save(kind: str, request: Request, id: str | None = None):
         if kind not in MODELS:
             raise HTTPException(404, "Unknown collection")
-        data = await request.json()
+        return await save_data(kind,await request.json(),id)
+
+    async def save_data(kind, data, id=None):
         if not isinstance(data, dict):
             raise HTTPException(422, "Expected a JSON object")
         old = require(kind, id) if id else {}
@@ -218,14 +238,20 @@ def create_app(data_dir=None, *, warm_browser=False):
                 raise HTTPException(422, 'Invalid settings revision')
             if any(key in data and old.get(key) != value for key, value in expected.items()):
                 raise HTTPException(409, 'These settings changed in another window. Discard your draft to reload the saved values, then try again.')
+        if kind == 'sms_providers' and id and any(a.get('sms_provider_id') == id and a['id'] in app.state.engine.amazon.logins for a in store().all('accounts')):
+            raise HTTPException(409, 'Close linked account browsers before editing their SMS connection')
         # Redacted secrets are preserved when omitted from edits.
         merged = {**old, **data}
-        if kind == 'ai_connections':
+        if kind in ('ai_connections', 'sms_providers'):
             if id and not data.get('api_key') and not data.get('clear_api_key'):
                 merged['api_key'] = old.get('api_key', '')
             if data.get('clear_api_key'):
                 merged['api_key'] = ''
         if kind == 'settings':
+            if app.state.engine.account_care.runs and any(merged.get(k) != old.get(k) for k in data if k.startswith(('browser_', 'fingerprint_', 'show_browser', 'native_browser', 'cdp_')) or k in ('max_running_tasks', 'session_verification_mode')):
+                raise HTTPException(409, 'Stop account browsing before changing browser settings')
+            if (app.state.engine.jobs or app.state.group_coordinator.active()) and merged.get('keep_accounts_ready',True) != old.get('keep_accounts_ready',True):
+                raise HTTPException(409, 'Stop running tasks before changing account readiness')
             if app.state.group_coordinator.active() and any(merged.get(k) != old.get(k) for k in data if k.startswith(('browser_', 'fingerprint_', 'show_browser', 'native_browser', 'cdp_')) or k in ('max_running_tasks','session_verification_mode')):
                 raise HTTPException(409, 'Stop task-group runs before changing browser settings')
             if merged.get('ai_connection_id'):
@@ -244,6 +270,8 @@ def create_app(data_dir=None, *, warm_browser=False):
             raise HTTPException(409, 'This account is active in a task group; stop its work before editing')
         if kind == 'proxies' and app.state.group_coordinator.active():
             raise HTTPException(409, 'Stop task-group runs before changing connection lists')
+        if kind == 'proxies' and any(a['id'] in app.state.engine.account_care.runs and a.get('proxy_list_id') == id for a in store().all('accounts')):
+            raise HTTPException(409, 'Stop account browsing before changing its connection list')
         try:
             valid = MODELS[kind].model_validate(merged).model_dump(mode="json")
             if kind == 'accounts':
@@ -260,6 +288,10 @@ def create_app(data_dir=None, *, warm_browser=False):
             field = "account_id" if kind == "accounts" else "proxy_id"
             if any(t.get(field) == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
                 raise HTTPException(409, "Stop tasks using this record before editing")
+        if kind == 'proxies' and id:
+            accounts={a['id'] for a in store().all('accounts') if a.get('proxy_list_id')==id}
+            if accounts.intersection(app.state.engine.amazon.logins) or any(t.get('account_id') in accounts and t['id'] in app.state.engine.jobs for t in store().all('tasks')):
+                raise HTTPException(409,'Close account browsers and stop tasks using this proxy group before editing')
         if kind == "proxies" and app.state.proxy_health.busy(id):
             raise HTTPException(409, "Wait for the proxy check to finish before editing")
         if kind == 'proxies' and any(m.group.get('monitor_proxy_id') == id for m in app.state.engine.monitors.active.values()):
@@ -275,7 +307,7 @@ def create_app(data_dir=None, *, warm_browser=False):
                 extension_paths(store(), effective['browser_extension_ids'])
             except ValueError as exc:
                 raise HTTPException(422, str(exc))
-            for field, target in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("proxy_list_id", "proxies")]:
+            for field, target in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("sms_provider_id", "sms_providers"), ("proxy_list_id", "proxies")]:
                 if valid[field]:
                     require(target, valid[field])
             if valid["retailer"] != old.get("retailer", valid["retailer"]):
@@ -351,7 +383,7 @@ def create_app(data_dir=None, *, warm_browser=False):
             field = {"groups": "group_id", "accounts": "account_id", "proxies": "proxy_id"}[kind]
             if any(t.get(field) == id for t in store().all("tasks")):
                 raise HTTPException(409, "Delete associated tasks first")
-        dependencies = {"profiles": [("tasks", "profile_id")], "mailboxes": [("accounts", "mailbox_id")],
+        dependencies = {"sms_providers": [("accounts", "sms_provider_id")], "profiles": [("tasks", "profile_id")], "mailboxes": [("accounts", "mailbox_id")],
                         "solvers": [("accounts", "solver_id"), ("tasks", "solver_id")],
                         "input_lists": [("groups", "input_list_id")], "proxies": [("groups", "monitor_proxy_id"), ("accounts", "proxy_list_id")]}
         for collection, field in dependencies.get(kind, []):
@@ -363,6 +395,8 @@ def create_app(data_dir=None, *, warm_browser=False):
             await app.state.engine.amazon.logins.pop(id).close()
         if kind == 'accounts':
             await app.state.engine.amazon.close_fingerprint_test(id)
+            store().delete('care_routines', 'care-routine-'+id)
+            store().delete('care_runs', 'care-run-'+id)
         if kind == 'browser_extensions':
             settings = store().get('settings', 'settings') or {}
             if id in settings.get('browser_extension_ids', []):
@@ -373,6 +407,7 @@ def create_app(data_dir=None, *, warm_browser=False):
                     store().put('accounts', {**account, 'fingerprint_overrides': {**overrides, 'browser_extension_ids': [key for key in overrides['browser_extension_ids'] if key != id]}})
         app.state.resources.cleanup(kind, id)
         store().delete(kind, id)
+        if kind=="proxies":app.state.proxy_pool.sync()
         return {"ok": True}
 
     @app.post("/api/tasks/{id}/{action}")
@@ -442,12 +477,21 @@ def create_app(data_dir=None, *, warm_browser=False):
 
     @app.post("/api/accounts/{id}/{action}")
     async def account_action(id: str, action: str):
+        require('accounts', id)
+        lock = app.state.engine.account_locks.setdefault(id, asyncio.Lock())
+        if app.state.group_coordinator.busy_account(id):
+            raise HTTPException(409, 'This account is busy; stop its task or browsing routine first')
+        await lock.acquire()
+        try:
+            return await perform_account_action(id, action)
+        finally:
+            lock.release()
+
+    async def perform_account_action(id: str, action: str):
         account = require("accounts", id)
-        if action in ('login', 'register', 'test-fingerprint', 'save-session') and app.state.group_coordinator.busy_account(id):
-            raise HTTPException(409, 'This account is reserved or busy in a task group')
-        if action in ('login', 'register', 'test-fingerprint'):
+        if action in ('login', 'register', 'register-auto', 'register-resume', 'test-fingerprint'):
             await app.state.group_coordinator.pool.discard(id)
-        if action in ("login", "register", "save-session") and any(t.get("account_id") == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
+        if action in ("login", "register", "register-auto", "register-resume", "save-session") and any(t.get("account_id") == id and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
             raise HTTPException(409, "Stop this account's running tasks before changing its session")
         if account.get("retailer", "amazon") != "amazon" and action not in ('test-fingerprint', 'close-fingerprint-test'):
             raise HTTPException(409, "Account browser automation for this retailer is planned")
@@ -462,6 +506,9 @@ def create_app(data_dir=None, *, warm_browser=False):
                 await app.state.engine.amazon.save_login(account)
             elif action == "register":
                 await app.state.engine.amazon.register(account)
+            elif action in ('register-auto','register-resume'):
+                from .account_creation import create_account
+                return await create_account(app.state.engine, account,resume=action=='register-resume')
             elif action == "otp":
                 return await app.state.engine.amazon.identities.code(account)
             elif action == "fill-otp":
@@ -482,6 +529,16 @@ def create_app(data_dir=None, *, warm_browser=False):
         except Exception:
             raise HTTPException(409, "Browser action failed. Run python -m patchright install chromium, then retry; complete any Amazon verification in the browser.")
         return {"ok": True}
+
+    @app.post('/api/sms_providers/{id}/test')
+    async def sms_provider_test(id: str):
+        provider = require('sms_providers', id)
+        try:
+            result = await SMSPool(provider).balance()
+        except SMSError as exc:
+            raise HTTPException(409, str(exc)) from None
+        store().put('sms_providers', {**provider, 'health': result})
+        return result
 
     @app.post("/api/mailboxes/{id}/test")
     async def mailbox_test(id: str):
@@ -525,11 +582,34 @@ def create_app(data_dir=None, *, warm_browser=False):
         if mode not in ("connectivity", "browser"):
             raise HTTPException(422, "Proxy check mode must be connectivity or browser")
         try:
-            await app.state.proxy_health.start(record, retailer, mode)
+            await app.state.proxy_health.start(record, retailer, mode,
+                fingerprints=body.get('fingerprints'),target=body.get('target'),
+                repeats=body.get('repeats',1),throughput=body.get('throughput',False))
         except ValueError as exc:
             raise HTTPException(409, str(exc))
         label = "Raw connectivity" if mode == "connectivity" else "Browser-session"
         return {"ok": True, "message": f"{label} proxy checks started"}
+
+    @app.post('/api/proxies/{id}/cancel')
+    async def proxy_cancel(id: str):
+        require('proxies',id)
+        await app.state.proxy_health.cancel(id)
+        return {'ok':True,'message':'Proxy checks cancelled'}
+
+    @app.post('/api/proxies/{id}/connections')
+    async def proxy_connections(id: str, request: Request):
+        # Reuse the normal save path and its task/session ownership guards.
+        from .proxy_protocol import parse_proxy
+        record=require('proxies',id)
+        body=await request.json()
+        selected=body.get('remove',[])
+        if not isinstance(selected,list) or any(not isinstance(x,str) for x in selected):
+            raise HTTPException(422,'Invalid connection selection')
+        lines=[line for line in record['entries'].splitlines() if parse_proxy(line).fingerprint not in selected]
+        additions=body.get('add','')
+        if not isinstance(additions,str):raise HTTPException(422,'Invalid connection import')
+        data={'name':record['name'],'entries':'\n'.join(lines)+('\n'+additions if additions else '')}
+        return await save_data('proxies',data,id)
 
     @app.post("/api/import/{kind}")
     async def import_records(kind: str, request: Request):
@@ -545,7 +625,7 @@ def create_app(data_dir=None, *, warm_browser=False):
         if kind == "accounts":
             for value in records:
                 assign_account_extensions(value)
-                for field, collection in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("proxy_list_id", "proxies")]:
+                for field, collection in [("mailbox_id", "mailboxes"), ("solver_id", "solvers"), ("sms_provider_id", "sms_providers"), ("proxy_list_id", "proxies")]:
                     if value.get(field):
                         require(collection, value[field])
         return {"created": [public(kind, record) for record in store().put_many(kind, records)]}
@@ -692,6 +772,46 @@ def create_app(data_dir=None, *, warm_browser=False):
         if not item.get("trace"):raise HTTPException(404,"No trace attached")
         return Response(base64.b64decode(item["trace"]),media_type="application/zip",headers={"Content-Disposition":"attachment; filename=retail-trace.zip"})
 
+    @app.get('/api/account-care')
+    async def account_care_state():
+        return {'account_care': app.state.engine.account_care.snapshot(),
+                'accounts': [public('accounts', account) for account in store().all('accounts')],
+                'sessions': store().all('sessions')}
+
+    @app.put("/api/account-care/{id}/routine")
+    async def save_browsing_routine(id: str, request: Request):
+        from .account_care import BrowsingRoutine
+        require('accounts', id)
+        try:
+            routine = BrowsingRoutine.model_validate(await request.json())
+        except ValidationError as exc:
+            raise HTTPException(422, str(exc))
+        try:
+            return app.state.engine.account_care.save(id, routine)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+
+    @app.post("/api/account-care/{id}/{action}")
+    async def browsing_action(id: str, action: str):
+        require('accounts', id)
+        care = app.state.engine.account_care
+        try:
+            if action == 'start':
+                return await care.start(id)
+            if action == 'stop':
+                care.request_stop(id)
+                return JSONResponse({'ok': True, 'stopping': id in care.runs}, status_code=202)
+            if action == 'focus':
+                entry = care.runs.get(id)
+                if not entry or not entry.get('page'):
+                    raise ValueError('The browsing window is still opening')
+                async with asyncio.timeout(3):
+                    await app.state.engine.amazon.expose(entry['page'])
+                return {'ok': True}
+            raise HTTPException(404, 'Unknown browsing action')
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+
     @app.post("/api/account-manager/bulk")
     async def manage_accounts(request: Request):
         data=await request.json()
@@ -704,18 +824,28 @@ def create_app(data_dir=None, *, warm_browser=False):
             raise HTTPException(422,"Unknown account action")
         results=[]
         for account in accounts:
+            lock = None
+            browser_attempted = False
             try:
                 if app.state.group_coordinator.busy_account(account['id']):
                     raise ValueError('This account is reserved or busy in a task group')
                 if any(t.get("account_id")==account["id"] and t["id"] in app.state.engine.jobs for t in store().all("tasks")):
                     raise ValueError("Stop this account's tasks first")
+                lock = app.state.engine.account_locks.setdefault(account['id'], asyncio.Lock())
+                await lock.acquire()
                 if action in ("open","verify"):
+                    browser_attempted = True
                     if account.get("retailer","amazon")!="amazon": raise ValueError("Retailer adapter is not implemented")
                     await app.state.group_coordinator.pool.discard(account['id'])
                     await app.state.engine.amazon.login(account)
                     if action=="verify":
-                        context=app.state.engine.amazon.logins[account["id"]]
-                        await app.state.engine.amazon.ensure_session(context,account,context.pages[0])
+                        context=app.state.engine.amazon.logins.get(account["id"])
+                        watcher=app.state.engine.amazon.login_watchers.pop(account['id'], None)
+                        if watcher:
+                            watcher.cancel()
+                            await asyncio.gather(watcher, return_exceptions=True)
+                        if context and context.pages:
+                            await app.state.engine.amazon.ensure_session(context,account,context.pages[0])
                 elif action=="group": app.state.resources.add(data.get("target_id",""),[account["id"]])
                 elif action=="profile": app.state.resources.link(account["id"],data.get("target_id",""))
                 elif action=="network":
@@ -725,9 +855,12 @@ def create_app(data_dir=None, *, warm_browser=False):
                 results.append({"id":account["id"],"ok":True})
             except Exception as exc:
                 message=str(exc) if isinstance(exc,ValueError) else "Verification or browser action requires attention"
-                if action in ("open","verify"):
+                if browser_attempted:
                     store().put('sessions',{'account_id':account['id'],'retailer':account.get('retailer','amazon'),'status':'verification_required','checked_at':now(),'action_required':message},'session-'+account['id'])
                 results.append({"id":account["id"],"ok":False,"message":message})
+            finally:
+                if lock is not None and lock.locked():
+                    lock.release()
         return {"results":results}
 
     @app.post("/api/recovery/{id}/{action}")

@@ -25,10 +25,11 @@ def tool_schema(name):
 class BrowserAgent:
     def __init__(self, store, provider_factory=AIProvider):
         self.store, self.provider_factory = store, provider_factory
+        self.recovery_slots=asyncio.Semaphore(2)
 
     page_kind = staticmethod(page_key)
 
-    async def _run(self, page, browser, action, names):
+    async def _run(self, page, browser, action, names, *, instructions=INSTRUCTIONS):
         settings = self.store.get('settings', 'settings') or {}
         connection = self.store.get('ai_connections', settings.get('ai_connection_id', ''))
         if not connection:
@@ -43,7 +44,7 @@ class BrowserAgent:
                 history = [{'role': 'user', 'content': 'Expected action: ' + action}]
                 for step in range(min(settings.get('agent_max_steps', 4), 4)):
                     record['steps'] = step + 1
-                    calls = await provider.turn(INSTRUCTIONS, history, schemas)
+                    calls = await provider.turn(instructions, history, schemas)
                     if not isinstance(calls, list) or len(calls) != 1 or calls[0].get('name') not in names:
                         raise InteractionError('Recovery requested an unsupported tool')
                     call = calls[0]
@@ -109,12 +110,14 @@ class BrowserAgent:
         return None
 
     async def resolve(self, page, action, domains, policies):
-        browser = BrowserTools(page, action, domains, policies)
-        chosen = await self._run(page, browser, action,
-                                 ('observe_controls', 'inspect_accessibility', 'validate_control'))
-        metadata = next(m for node, m in browser.nodes.values() if node == chosen)
-        if action != 'SUBMIT_ORDER':
-            self._candidate(page, action, metadata['label'],
-                            '/checkout' if 'checkout' in metadata.get('href', '') else '')
-        page._retail_previous_locator = 'Validated recovery control for ' + action
+        from .workflow_recovery import RecoveryRequest, inspect_recovery
+        # Expand only explicitly reviewed action semantics; never accept arbitrary model selectors.
+        permitted=dict(policies)
+        if action=='ADD_TO_CART':
+            permitted[action]=r'^(?:'+policies[action].removeprefix('^').removesuffix('$')+r'|add this product to cart)$'
+        chosen=await inspect_recovery(self,page,RecoveryRequest(action,frozenset(domains),permitted))
+        pending=getattr(page,'_retail_pending_repairs',{}).get(action)
+        if pending and action!='SUBMIT_ORDER':
+            self._candidate(page,action,pending[1]['control_label'],'')
+        page._retail_previous_locator='MCP-validated recovery control for '+action
         return chosen

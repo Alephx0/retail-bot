@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Cart removal acknowledgement fixture</title>
+<style>body{font:16px system-ui;max-width:800px;margin:24px auto}[data-asin]{padding:16px;border-bottom:1px solid #ddd}button,input{padding:8px;margin:4px}</style>
+<h1>Cart removal acknowledgement — synthetic items</h1>
+<form id="cart-form">
+<div id="sc-active-cart">
+  <div class="sc-list-item" data-asin="B012345678" data-quantity="3" data-removed="false">
+    <span class="sc-product-title">Synthetic target item</span>
+    <button type="button" data-action="a-stepper-decrement" aria-label="Decrease quantity by one, Quantity is 3">Minus</button>
+  </div>
+  <div class="sc-list-item" data-asin="B000000001" data-quantity="1">
+    <span class="sc-product-title">Unrelated item one</span>
+    <input type="submit" name="submit.delete-active.fixture-one" data-action="delete-active" value="Delete">
+  </div>
+  <div class="sc-list-item" data-asin="B000000002" data-quantity="1">
+    <span class="sc-product-title">Unrelated item two</span>
+    <input type="submit" name="submit.delete-active.fixture-two" data-action="delete-active" value="Delete">
+  </div>
+</div>
+</form>
+<div id="sc-saved-cart"><div data-asin="B000000003" data-quantity="1">Saved for later</div></div>
+<button id="checkout" type="button">Proceed to checkout</button>
+<script>
+window.cartEvents=[];
+window.fixture={delay:0,mode:'notice'};
+const active=()=>document.querySelector('#sc-active-cart');
+const rerender=()=>{active().innerHTML=active().innerHTML;};
+document.addEventListener('submit',e=>{
+  e.preventDefault();
+  const row=e.submitter.closest('[data-asin]');
+  cartEvents.push({action:'delete',asin:row.dataset.asin});
+  if(fixture.mode==='stalled')return;
+  if(fixture.mode==='interrupted'){
+    document.body.insertAdjacentHTML('beforeend','<input id="ap_password" type="password">');return;
+  }
+  active().setAttribute('aria-busy','true');
+  setTimeout(()=>{
+    row.dataset.removed='true';
+    row.classList.add('sc-list-item-optimistic-updates');
+    row.innerHTML='<div class="sc-list-item-removed-msg">Item removed</div>';
+    if(fixture.mode==='changed_quantity'){
+      const target=active().querySelector('[data-asin="B012345678"]');
+      target.dataset.quantity='2';
+      target.querySelector('button').setAttribute('aria-label','Decrease quantity by one, Quantity is 2');
+    }
+    if(fixture.mode!=='busy')active().removeAttribute('aria-busy');
+    rerender();
+  },fixture.delay);
+});
+document.addEventListener('click',e=>{
+  if(e.target.matches('[data-action="a-stepper-decrement"]')){
+    const row=e.target.closest('[data-asin]');
+    const qty=Number(row.dataset.quantity)-1;
+    cartEvents.push({action:'quantity',quantity:qty});
+    row.dataset.quantity=String(qty);
+    e.target.setAttribute('aria-label','Decrease quantity by one, Quantity is '+qty);
+    rerender();
+  }
+  if(e.target.id==='checkout'){
+    cartEvents.push({action:'checkout'});
+    document.body.insertAdjacentHTML('beforeend','<div id="spc-orders"><div data-asin="B012345678" data-quantity="1">Synthetic order review</div></div>');
+  }
+});
+</script></html>

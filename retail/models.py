@@ -57,17 +57,8 @@ def canonical_inputs(text):
 
 
 def proxy_config(value: str) -> dict | None:
-    if not value.strip():
-        return None
-    parts = value.strip().split(":", 3)
-    if len(parts) not in (2, 4) or not parts[1].isdigit() or not 1 <= int(parts[1]) <= 65535:
-        raise ValueError("Proxy format: host:port or host:port:username:password")
-    if not re.fullmatch(r"[a-zA-Z0-9.\-]+", parts[0]):
-        raise ValueError("Invalid proxy host")
-    result = {"server": f"http://{parts[0]}:{parts[1]}"}
-    if len(parts) == 4:
-        result.update(username=parts[2], password=parts[3])
-    return result
+    from .proxy_protocol import parse_proxy
+    return parse_proxy(value).config() if value.strip() else None
 
 
 class FingerprintOverrides(BaseModel):
@@ -149,6 +140,9 @@ class Account(BaseModel):
     mailbox_id: str = ""
     solver_id: str = ""
     auto_otp: bool = True
+    phone: str = Field(default="", pattern=r"^(?:\+[1-9]\d{6,14})?$")
+    sms_provider_id: str = ""
+    signin_identifier: str = Field(default="", max_length=200)
     account_type: Literal["personal", "business"] = "personal"
     purchase_cooldown_days: Literal[0, 2, 3, 4, 5, 6, 7] = 0
     fingerprint_overrides: FingerprintOverrides = Field(default_factory=FingerprintOverrides)
@@ -179,17 +173,14 @@ class Account(BaseModel):
 
 class ProxyList(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    entries: str = Field(max_length=50000)
+    entries: str = Field(default="", max_length=50000)
 
     @field_validator("entries")
     @classmethod
     def valid_entries(cls, value):
-        lines = list(dict.fromkeys(line.strip() for line in value.splitlines() if line.strip()))
-        if not 1 <= len(lines) <= 1000:
-            raise ValueError("Add between 1 and 1000 proxy connections")
-        for line in lines:
-            proxy_config(line)
-        return "\n".join(lines)
+        from .proxy_protocol import normalize_entries
+        return normalize_entries(value)
+
 
 
 class ScheduleSlot(BaseModel):
@@ -217,6 +208,9 @@ class Group(BaseModel):
     products: str = Field(default="", max_length=10000)
     delay_ms: int = Field(default=4500, ge=3500, le=3600000)
     offer_id: str = ""
+    use_offer_id: bool = True
+    offer_id_shortcut: bool = False
+    offer_id_endpoint: bool = False
     notify_offer: bool = False
     skip_monitoring: bool = False
     quantity: int = Field(default=1, ge=1, le=30)
@@ -280,6 +274,36 @@ class Task(BaseModel):
         return value
 
 
+class TimingSample(BaseModel):
+    low: float = Field(ge=10, le=400, allow_inf_nan=False)
+    median: float = Field(ge=10, le=400, allow_inf_nan=False)
+    high: float = Field(ge=10, le=400, allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def ordered(self):
+        if not self.low <= self.median <= self.high:
+            raise ValueError('Timing samples must be ordered low, median, high')
+        return self
+
+
+class PointerCalibration(BaseModel):
+    samples: int = Field(ge=10, le=150000)
+    base_ms: float = Field(ge=50, le=500, allow_inf_nan=False)
+    ms_per_pixel: float = Field(ge=.1, le=2, allow_inf_nan=False)
+    start_power: float = Field(ge=.7, le=2, allow_inf_nan=False)
+    end_power: float = Field(ge=.7, le=2, allow_inf_nan=False)
+    bend_fraction: float = Field(ge=0, le=.15, allow_inf_nan=False)
+
+
+class InputCalibration(BaseModel):
+    key_hold_ms: TimingSample
+    key_gap_ms: TimingSample
+    click_hold_ms: TimingSample
+    key_samples: int = Field(ge=20, le=150000)
+    click_samples: int = Field(ge=15, le=150000)
+    pointer: PointerCalibration | None = None
+
+
 class Settings(BaseModel):
     webhook: str = ""
     notifications: bool = False
@@ -290,15 +314,30 @@ class Settings(BaseModel):
     max_running_tasks: int = Field(default=10, ge=1, le=50)
     browser_channel: Literal["chromium", "chrome", "msedge"] = "chromium"
     show_browser_window: bool = True
+    suppress_passkey_prompts: bool = True
     session_verification_mode: Literal['http', 'headless', 'browser'] = 'http'
     browser_timeout_ms: int = Field(default=30000, ge=5000, le=120000)
     interaction_pacing: Literal['off', 'paced'] = 'off'
+    input_timing_preset: Literal['slow', 'balanced', 'fast', 'aggressive'] = 'balanced'
+    input_calibration: InputCalibration | None = None
+    input_calibration_scope: Literal['off', 'browsing'] = 'off'
+    show_mouse_cursor: bool = False
+
+    @model_validator(mode='after')
+    def calibration_available(self):
+        if self.input_calibration_scope!='off' and self.input_calibration is None:
+            raise ValueError('Record a timing demonstration before enabling it')
+        return self
+
     proxy_timeout_seconds: int = Field(default=15, ge=3, le=60)
     proxy_concurrency: int = Field(default=5, ge=1, le=20)
+    proxy_background_checks: bool = False
+    auto_source_repair: bool = True
     default_monitor_delay: int = Field(default=4500, ge=3500, le=3600000)
     webhook_checkouts: bool = True
     webhook_attention: bool = True
     trace_enabled: bool = False
+    keep_accounts_ready: bool = True
     diagnosis_endpoint: str = ""
     cdp_endpoint: str = "http://127.0.0.1:9222"
     cdp_attach: bool = False
@@ -421,6 +460,14 @@ class Mailbox(BaseModel):
     max_age_seconds: int = Field(default=300, ge=30, le=900)
 
 
+class SMSProvider(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider: Literal["smspool"] = "smspool"
+    api_key: str = Field(min_length=1, max_length=500)
+    max_price: float = Field(default=0.50, gt=0, le=20, allow_inf_nan=False)
+    timeout_seconds: int = Field(default=180, ge=30, le=600)
+
+
 class Solver(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     provider: Literal["manual", "capmonster", "2captcha", "anticaptcha", "capsolver", "flaresolverr"] = "manual"
@@ -467,7 +514,7 @@ def eligible(product: dict, item: dict, group: dict, *, defer_unknown_seller=Fal
     for cap in (item["max_price"], group["max_price"]):
         if cap is not None and price > cap:
             return False
-    if item["offer_id"] and product.get("offer_id") != item["offer_id"]:
+    if group.get('use_offer_id', True) and item["offer_id"] and product.get("offer_id") != item["offer_id"]:
         return False
     if not group["allow_third_party"] and not product.get("amazon_seller"):
         return False
@@ -513,8 +560,11 @@ def rejection_reasons(product, item, group):
         for cap in (item.get('max_price'), group.get('max_price')):
             if cap is not None and price > cap:
                 reasons.append(f'Price {price:.2f} exceeds limit {cap:.2f}')
-    if item.get('offer_id') and product.get('offer_id') != item['offer_id']:
-        reasons.append('The requested offer ID is not the displayed offer')
+    if group.get('use_offer_id', True) and item.get('offer_id') and product.get('offer_id') != item['offer_id']:
+        if product.get('offer_id'):
+            reasons.append('The supplied Offer ID differs from the current account offer. Clear the Offer ID filter to use automatic discovery; no cart action was sent')
+        else:
+            reasons.append('The current page did not expose a usable Offer ID, so the supplied ID could not be verified; no cart action was sent')
     if not group['allow_third_party'] and not product.get('amazon_seller'):
         seller = product.get('seller') or 'Unknown'
         reasons.append('Seller could not be read' if seller == 'Unknown' else f'Seller is {seller}; this group requires Amazon')

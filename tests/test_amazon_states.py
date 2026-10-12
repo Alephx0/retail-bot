@@ -97,19 +97,27 @@ REVIEW = '''<div id="spc-orders"><div data-asin="B012345678" data-quantity="1"
 
 
 @pytest.mark.parametrize('outcome', ['delayed_id', 'payment', 'stalled'])
-def test_order_submission_waits_for_result_and_never_resubmits(outcome):
+@pytest.mark.parametrize('paced',[False,True])
+def test_order_submission_waits_for_result_and_never_resubmits(outcome,paced):
     async def scenario():
         async with async_playwright() as driver:
             browser = await driver.chromium.launch()
             page = await browser.new_page()
             page.wait_for_timeout = no_fixed_wait
             page.set_default_timeout(300 if outcome == 'stalled' else 4000)
+            page.context._retail_paced_input = paced
+            if paced:
+                from retail.behavior import PacedInput
+                page._retail_paced_controller = PacedInput(page,seed=19)
             action = {
                 'delayed_id': "document.body.insertAdjacentHTML('beforeend','<h1>Order placed</h1>');setTimeout(()=>document.body.insertAdjacentHTML('beforeend','<p>123-1234567-1234567</p>'),2000)",
                 'payment': "document.body.insertAdjacentHTML('beforeend','<input name=cvv><p>Verify your card</p>')",
                 'stalled': '',
             }[outcome]
-            body = REVIEW + f'<button onclick="window.clicks=(window.clicks||0)+1;{action}">Place your order</button>'
+            body = REVIEW + f'''<button style="width:200px;height:60px" onclick="
+                window.clicks=(window.clicks||0)+1;
+                window.clickOffset=event.clientX-this.getBoundingClientRect().left;
+                {action}">Place your order</button>'''
             await page.route('**/*', lambda r: r.fulfill(content_type='text/html', body=body))
             await page.goto('https://www.amazon.com/checkout/spc')
             adapter = Amazon(None)
@@ -123,6 +131,9 @@ def test_order_submission_waits_for_result_and_never_resubmits(outcome):
             with pytest.raises(Attention, match='expired'):
                 await adapter.submit_order(page)
             assert await page.evaluate('window.clicks', isolated_context=False) == 1
+            if paced:
+                offset=await page.evaluate('window.clickOffset',isolated_context=False)
+                assert 20 < offset < 180 and abs(offset-100)>2
             await browser.close()
     asyncio.run(scenario())
 

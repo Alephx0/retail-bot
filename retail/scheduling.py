@@ -2,6 +2,20 @@
 from datetime import datetime, timedelta
 
 
+def preparations(schedule, current, lead_seconds=60):
+    """Windows starting soon; preparing must never authorize an early purchase."""
+    active = {key for key,_ in occurrences(schedule,current)}
+    result = []
+    for key,_ in occurrences(schedule,current+timedelta(seconds=lead_seconds)):
+        if key in active:
+            continue
+        _,index,day = key.rsplit('/',2)
+        start = datetime.fromisoformat(day+'T'+schedule['slots'][int(index)]['start']).astimezone()
+        if current.timestamp() < start.timestamp() <= current.timestamp()+lead_seconds:
+            result.append((key,start.isoformat()))
+    return result
+
+
 def occurrences(schedule, current):
     configured = schedule.get("configured_at")
     if not configured:

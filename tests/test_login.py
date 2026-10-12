@@ -84,10 +84,11 @@ def test_signin_waits_for_form_change_without_resubmitting(tmp_path, result):
     asyncio.run(scenario())
 
 
-def test_automatic_login_and_encrypted_session_capture(tmp_path):
+@pytest.mark.parametrize('identifier,combined', [('',False),('+15551234567',False),('+15551234567',True)])
+def test_automatic_login_and_encrypted_session_capture(tmp_path,identifier,combined):
     async def scenario():
         store = Store(tmp_path)
-        account = store.put('accounts',Account(name='Fixture',email='fixture@example.com',password='fixture-password').model_dump())
+        account = store.put('accounts',Account(name='Fixture',email='fixture@example.com',password='fixture-password',signin_identifier=identifier).model_dump())
         adapter = Amazon(store)
         requests = []
         async with async_playwright() as driver:
@@ -101,6 +102,8 @@ def test_automatic_login_and_encrypted_session_capture(tmp_path):
                     html='<body><form action="/verified" method="post"><input id="ap_password" name="password" type="password"><button id="signInSubmit">Sign in</button></form></body>'
                 elif '/verified' in request.url:
                     html='<body><div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>Your Orders</body>'
+                elif combined:
+                    html='<body><form action="/verified" method="post"><input id="ap_email" name="email"><input id="ap_password" name="password" type="password"><button id="signInSubmit">Sign in</button></form></body>'
                 else:
                     html='<body><form action="/password" method="post"><input id="ap_email" name="email"><button id="continue">Continue</button></form></body>'
                 await route.fulfill(body=html,content_type='text/html')
@@ -112,6 +115,9 @@ def test_automatic_login_and_encrypted_session_capture(tmp_path):
             assert 'session_saved_at' in saved
             assert 'cookies' in saved['session']
             assert any(body and 'fixture-password' in body for _,body in requests)
+            from urllib.parse import parse_qs
+            assert any(body and parse_qs(body).get('email')==[identifier or account['email']] for _,body in requests)
+            assert saved['email']==account['email'] and saved['signin_identifier']==identifier
             assert store.all('events') == []
             await page.set_content('<body>Order placed 123-1234567-1234567. Payment verification required.</body>')
             assert await adapter.payment_verification(page)

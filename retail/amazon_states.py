@@ -34,7 +34,9 @@ PAGE_STATE = r"""args => {
     if (args.state === 'cart' || args.state === 'quantity' || args.state === 'cart_items' || args.state === 'cart_removed') {
         const selector = document.querySelector('#sc-active-cart') ? '#sc-active-cart [data-asin]' :
             '[data-asin][data-quantity]:not(#sc-saved-cart *):not(#sc-saved-cart-items *)';
-        const lines = nodes(selector);
+        // Amazon retains visible ASIN rows as removal notices. They are not
+        // active cart contents, even while their old quantity is still present.
+        const lines = nodes(selector).filter(e => !e.closest('[data-removed="true"]'));
         const matching = lines.filter(e => e.getAttribute('data-asin') === args.asin);
         const quantity = e => e.getAttribute('data-quantity') ?? e.querySelector("select[name='quantity']")?.value;
         if (args.state === 'cart_removed') return !busy && !!document.querySelector('#sc-active-cart') && matching.length === 0;

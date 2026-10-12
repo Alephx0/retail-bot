@@ -3,8 +3,11 @@
   "private": true,
   "description": "Optional Node helper for the independent Apify fingerprint-suite backend",
   "dependencies": {
+    "chrome-devtools-mcp": "1.10.1",
     "fingerprint-generator": "2.1.88",
     "fingerprint-injector": "2.1.88"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

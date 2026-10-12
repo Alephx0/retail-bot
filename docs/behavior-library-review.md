@@ -2,6 +2,8 @@
 
 The current application uses asynchronous Python Patchright, owns each account's context, and depends on locator actionability, cancellation, exact field values, and final order revalidation. Those requirements matter more than a library's marketing claim of undetectability. This review does not establish human equivalence for any candidate.
 
+Update 2026-10-11: the Recovery branch now includes the [HumanTyping timing subset](../retail/_vendor/humantyping/README.md) from the 8765 build, with MIT attribution. The table records the original review decisions. Recovery retains its existing speed profiles, centered click variation and automatic sign-in safeguards.
+
 | Candidate | Fit and evidence | Decision |
 |---|---|---|
 | [HumanCursor-Playwright 0.1.1](https://pypi.org/project/humancursor-playwright/) | Async Python movement; accepts an existing page. Wheel source uses duck typing compatible with Patchright. Depends on Playwright, NumPy and PyTweening; packaged license is MIT. Published repository URLs still contain `yourusername`. `click_on()` calls coordinate mouse input after movement, without retaining locator actionability checks; it also ignores a false return from `move_to()`. No typing model. | Closest mouse-only integration candidate, but unsuitable as a direct click replacement. Movement-only evaluation could be isolated behind the existing controller; no measured advantage yet justifies adding it. |

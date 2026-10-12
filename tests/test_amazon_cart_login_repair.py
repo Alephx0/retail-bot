@@ -2,6 +2,7 @@
 import asyncio
 import json
 from urllib.parse import urlparse
+from pathlib import Path
 
 import pytest
 from patchright.async_api import async_playwright
@@ -9,6 +10,38 @@ from patchright.async_api import async_playwright
 from retail.amazon import Amazon, Attention, AuthenticationRequired, ChallengeDetected
 from retail.store import Store
 from scripts.cart_fixture import CartFixture, TARGET, OTHER
+
+
+@pytest.mark.parametrize('layout',['captured','delayed','stepper_only','two_dedicated'])
+def test_captured_stepper_delete_layout_uses_dedicated_delete_only(layout):
+    async def scenario():
+        markup=(Path(__file__).parent/'fixtures/amazon_cart_stepper_delete.html').read_text(encoding='utf-8')
+        async with async_playwright() as driver:
+            browser=await driver.chromium.launch()
+            page=await browser.new_page()
+            await page.route('**/*',lambda r:r.fulfill(body=markup,content_type='text/html'))
+            await page.goto('https://www.amazon.com/gp/cart/view.html')
+            await page.evaluate('''layout=>{
+                const e=document.querySelector('[data-asin="B000000001"] input');
+                if(layout==='stepper_only')e.remove();
+                if(layout==='two_dedicated')e.after(e.cloneNode(true));
+                if(layout==='delayed'){e.hidden=true;setTimeout(()=>e.hidden=false,150);}
+            }''',layout,isolated_context=False)
+            adapter=Amazon(None)
+            if layout in ('stepper_only','two_dedicated'):
+                with pytest.raises(Attention,match='Delete'):
+                    await adapter.cart(page,2,TARGET)
+                assert await page.evaluate('cartEvents',isolated_context=False)==[]
+                assert await page.locator('#sc-active-cart [data-asin]').count()==3
+                await browser.close()
+                return
+            assert await adapter.cart(page,2,TARGET)==2
+            assert await adapter.get_cart(page)==[{'asin':TARGET,'quantity':2}]
+            assert await page.evaluate('cartEvents',isolated_context=False)==[
+                {'action':'delete','asin':OTHER},{'action':'delete','asin':'B000000002'}]
+            assert await page.locator('#sc-saved-cart [data-asin]').count()==1
+            await browser.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('identification',['supplied_html','name','data_action'])

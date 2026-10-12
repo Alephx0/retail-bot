@@ -69,6 +69,8 @@ class BrowserPool:
                 await self._close_entry(evicted)
                 # No browser I/O under the pool lock. The account lock owns this creation.
                 if self.engine.browser_slots.locked():
+                    await self.engine.evict_ready()
+                if self.engine.browser_slots.locked():
                     raise Conflict('Waiting for a browser slot')
                 await self.engine.browser_slots.acquire()
                 context=None

@@ -61,9 +61,12 @@ async def check_recovery(connection, provider_factory=None):
     scenarios = []
     stage = 'launch'
     async with async_playwright() as driver:
-        browser = await driver.chromium.launch(headless=True)
+        from .worker_profiles import debugging_port
+        port=debugging_port()
+        browser = await driver.chromium.launch(headless=True,args=[f'--remote-debugging-port={port}'])
         try:
             context = await browser.new_context(service_workers='block')
+            context._retail_recovery_endpoint=f'http://127.0.0.1:{port}'
 
             async def route(request):
                 from urllib.parse import urlsplit

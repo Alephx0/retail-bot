@@ -142,8 +142,11 @@ def test_solver_provider_adapter(monkeypatch):
 
 
 def test_proxy_health_results_redact_credentials(monkeypatch,tmp_path):
-    original = httpx.AsyncClient
-    monkeypatch.setattr('retail.services.httpx.AsyncClient',lambda **kwargs: original(transport=httpx.MockTransport(lambda r:httpx.Response(403))))
+    from retail.proxy_protocol import parse_proxy
+    from retail.store import now
+    async def measured(line,*args,**kwargs):
+        return {**parse_proxy(line).public(),'status':'healthy','http_status':403,'application_status':'denied','transport':'asyncio','latency_ms':12,'observed_at':now()}
+    monkeypatch.setattr('retail.proxy_testing.probe',measured)
     async def scenario():
         store=Store(tmp_path)
         record=store.put('proxies',{'name':'pool','entries':'example.com:80:user:SECRET'})
@@ -152,9 +155,9 @@ def test_proxy_health_results_redact_credentials(monkeypatch,tmp_path):
         await asyncio.gather(*list(health.jobs.values()))
         results=store.all('proxy_health')
         assert results[0]['kind'] == 'connectivity'
-        assert results[0]['results'][0]['status'] == 'reachable'
+        assert results[0]['results'][0]['status'] == 'healthy'
         assert results[0]['results'][0]['http_status'] == 403
-        assert results[0]['results'][0]['transport'] == 'httpx'
+        assert results[0]['results'][0]['application_status'] == 'denied'
         assert 'SECRET' not in str(results)
         assert 'latency_ms' in results[0]['results'][0]
         store.db.close()

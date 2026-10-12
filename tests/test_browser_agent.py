@@ -364,7 +364,10 @@ def test_amazon_agent_end_to_end_checkout_fixture(tmp_path, seller_missing):
                 html = '<div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>'
             elif '/dp/' in path:
                 html = '<span id="productTitle">Fixture</span><div id="corePrice_feature_div"><span class="a-price"><span class="a-offscreen">$20.00</span></span></div><span id="sellerProfileTriggerId">Amazon.com</span><span id="nav-cart-count">0</span><button onclick="fetch(\'/add-item\').then(()=>document.querySelector(\'#nav-cart-count\').textContent=\'1\')">Add item to cart</button>'
-                html += '<div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>'
+                # Anonymous stock scans use observable availability, never AI
+                # purchase-control recovery. The account still resolves the
+                # deliberately unfamiliar Add item to cart control below.
+                html += '<div id="availability">In Stock</div><div id="nav-link-accountList"><span class="nav-line-1">Hello, Fixture</span></div>'
             elif '/gp/cart/' in path:
                 html = '<div id="sc-active-cart">' + ('<div data-asin="B012345678" data-quantity="1">Fixture</div>' if cart_items else '') + '</div><button onclick="location.href=\'/checkout\'">Continue to checkout</button>'
             elif '/checkout' in path:

@@ -39,6 +39,7 @@ def summarize(values):
 async def benchmark(samples, baseline):
     old=load_previous(baseline,'retail/amazon.py')
     old_tools=load_previous(baseline,'retail/browser_mcp.py')
+    old.resolve=load_previous(baseline,'retail/interactions.py').resolve
     values={'baseline':[],'current':[]}
     validation={'baseline':[],'current':[]}
     added_contexts={'baseline':0,'current':0}
@@ -55,7 +56,8 @@ async def benchmark(samples, baseline):
             page=await browser.new_page()
             await page.route('**/*',lambda r:r.fulfill(body=markup,content_type='text/html'))
             await page.goto('https://www.amazon.com/dp/B012345678')
-            if mode=='current': await adapters[mode].recovery.install(page)
+            if hasattr(adapters[mode],'recovery'):
+                await adapters[mode].recovery.install(page)
             pages[mode]=page
         for index in range(samples+5):
             order=['baseline','current'] if index%2 else ['current','baseline']
@@ -90,7 +92,7 @@ async def benchmark(samples, baseline):
             'accepted':ratio<1.05,'validation':{m:summarize(v) for m,v in validation.items()},
             'validation_new_contexts':added_contexts,'python_cpu_seconds':round(time.process_time()-cpu,3),
             'wall_seconds':round(time.perf_counter()-started,3),
-            'limitations':'Local warmed fixtures; no fingerprint setup, live network, provider latency or full transaction engine. Python CPU excludes Chromium/Node. p99 needs larger samples for tail confidence.',
+            'limitations':'Equivalent supported dialog-handler setup on both sides; baseline action resolver loaded from its revision. Local warmed fixtures; no fingerprint setup, live network, provider latency or full transaction engine. Python CPU excludes Chromium/Node. p99 needs larger samples for tail confidence.',
             'samples_ms':values}
 
 

@@ -1,7 +1,7 @@
 'use strict';
 // Presentation groups only; views and API records remain the source of truth.
 const navigationSections = [
-  {primary:'accounts', items:[['accounts','Accounts'],['manager','Sessions & relationships']]},
+  {primary:'accounts', items:[['accounts','Accounts'],['manager','Sessions & relationships'],['account_creation','Account creation']]},
   {primary:'checkouts', items:[['checkouts','Orders'],['monitors','Monitors'],['events','Activity'],['feed','Product observations'],['saved_plans','Saved plans']]},
   {primary:'tools', items:[['tools','Overview'],['input_lists','Product lists'],['mailboxes','Mailboxes & codes'],['solvers','Verification'],['troubleshooting','Diagnostics'],['retailers','Retailers']]}
 ];
@@ -26,6 +26,7 @@ document.addEventListener('input',e=>{
   const key=e.target.dataset.liveSearch;if(!key)return;
   if(key==='groups')groupQuery=e.target.value;
   if(key==='tasks'){taskQuery=e.target.value;selected.clear();}
+  if(key==='care'){careQuery=e.target.value;managerSelection.clear();}
   if(key==='resources')resourceQueries[view]=e.target.value;
   render();
 });

@@ -3,7 +3,7 @@
 // Drafts stay in memory, including across navigation. Never persist secret fields
 // in localStorage or include them in unrelated connection requests.
 const settingsSections = [['general','General'], ['browser','Browser & fingerprints'], ['notifications','Notifications'], ['integrations','Connections'], ['data','Data & privacy']];
-const stoppedSettings = ['max_running_tasks','session_verification_mode','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
+const stoppedSettings = ['max_running_tasks','session_verification_mode','keep_accounts_ready','browser_channel','show_browser_window','cdp_attach','cdp_endpoint','fingerprint_backend','native_browser_executable','browser_incognito','browser_identity','brave_executable','opera_executable','browser_extension_ids','agent_mode','ai_connection_id'];
 let settingsDraft = null, settingsBaseline = null, settingsSaving = false, settingsError = '', settingsSavedMessage = '';
 let installedBrowsers = null, browserLookupPending = false;
 Object.assign(titles, {
@@ -55,12 +55,15 @@ function settingsView() {
       input('max_running_tasks', 'Maximum active browser workers', s.max_running_tasks ?? 10, 'number', 'min="1" max="50" required') +
       '<p class="setting-help" data-running-note></p><details><summary>Advanced network limits</summary>' +
       input('proxy_timeout_seconds', 'Proxy check timeout (seconds)', s.proxy_timeout_seconds ?? 15, 'number', 'min="3" max="60" required') +
-      input('proxy_concurrency', 'Concurrent proxy checks', s.proxy_concurrency ?? 5, 'number', 'min="1" max="20" required') + '</details>') +
+      input('proxy_concurrency', 'Concurrent proxy checks', s.proxy_concurrency ?? 5, 'number', 'min="1" max="20" required') + check('proxy_background_checks','Refresh stale proxy health while idle',s.proxy_background_checks ?? false) + settingHelp('Checks at most five stale connections when no tasks or account browsers are active. Starting work cancels background checks.') + '</details>') +
+    settingCard('Verified source repairs', 'Successful AI recovery can stage a tested repair in a separate checkout. Activation requires a stopped application and review.',check('auto_source_repair','Generate and validate source repairs automatically',s.auto_source_repair ?? true)) +
     settingCard('Application status', '', '<button type="button" data-context-view="retailers">View retailer availability</button>');
   const browserOptions = (installedBrowsers || [['chromium','Bundled Chromium'],['chrome','Chrome'],['msedge','Edge']].map(([id,label]) => ({id,label,available:null})))
     .map(b => [b.id, b.label + (b.available === false ? ' — not installed' : b.available === true ? ' — installed' : '')]);
   const browser = settingCard('Account session verification', 'Choose how tasks check saved sign-in sessions before waiting for stock.',
     select('session_verification_mode', 'Startup verification', [['http','Browser-free check (default)'],['headless','Headless browser'],['browser','Task browser (current behavior)']], s.session_verification_mode || 'http') +
+    check('keep_accounts_ready','Keep accounts ready for restocks',s.keep_accounts_ready ?? true) +
+    settingHelp('Keeps up to four verified task browsers ready within the worker limit. Ready accounts use browser verification directly. Idle browsers yield capacity when needed. Scheduled tasks prepare up to one minute early without purchasing. Headless-only preparation remains separate when checkout uses a visible browser.') +
     settingHelp('Browser-free checks use saved cookies on the task connection. Missing or inconclusive sessions fall back to the task browser. Headless checks use the account fingerprint and require an app-managed browser; View live remains available. Purchasing always verifies the live browser session.')) +
     settingCard('Browser session', 'Applies when a new browser session opens. Stop running tasks before changing the connection or window mode.',
     select('cdp_attach', 'Browser connection', [['false','Managed by Retail Desk'],['true','Existing browser (advanced)']], String(s.cdp_attach ?? false)) +
@@ -72,10 +75,19 @@ function settingsView() {
     '<div data-existing-browser hidden>' + input('cdp_endpoint', 'Local debugging address', s.cdp_endpoint || 'http://127.0.0.1:9222', 'url') +
     settingHelp('Start a dedicated Chrome or Edge debugging session first. Its window mode is controlled outside this app.') +
     '<button type="button" data-inspect-cdp>Test saved connection</button>' + settingHelp('Save an address change before testing it.') + '</div>') +
+    settingCard('Input timing', 'Applies to new browser sessions. Existing sessions keep their timing until reopened.',
+      select('interaction_pacing', 'Input timing', [['off','Standard input'],['paced','Paced input (HumanTyping)']], s.interaction_pacing || 'off') +
+      select('input_timing_preset', 'Pacing speed profile', [['slow','Slow'],['balanced','Balanced'],['fast','Fast'],['aggressive','Aggressive']], s.input_timing_preset || 'balanced') +
+      (s.input_calibration ? '<details><summary>Demonstration timing</summary>' +
+        select('input_calibration_scope', 'Use recorded timing', [['off','Off'],['browsing','Account browsing only']], s.input_calibration_scope || 'off') +
+        settingHelp('Blends your recorded timing with existing pacing. Applies to new browsing runs; your speed profile still scales it. Checkout timing is unchanged. ' + s.input_calibration.key_samples + ' character samples and ' + s.input_calibration.click_samples + ' pointer clicks.' +
+          (s.input_calibration.pointer ? ' Movement uses ' + s.input_calibration.pointer.samples + ' fitted paths for travel time, acceleration, approach and curvature. Samples are blended, not replayed.' : ' Mouse movement uses the standard smooth curve.')) + '</details>' : '') +
+      check('show_mouse_cursor', 'Show mouse cursor for testing', s.show_mouse_cursor ?? false) +
+      settingHelp('Shows pointer movement and highlights mouse presses in task browsers and View live. Works with Standard input, paced input and automatic sign-in. Save, then reopen the browser session to apply.') +
+      settingHelp('Controls typing speed, pointer movement and click timing for paced input and automatic sign-in. Balanced keeps the current timing. Page checks and retailer cooldowns stay unchanged.') +
+      settingHelp('Slow adds time, Fast reduces it, and Aggressive is quickest. HumanTyping varies typing intervals while preserving exact text. Paced clicks vary around the center inside each target. Standard input keeps your profile saved for later; automatic sign-in still uses paced input.')) +
     settingCard('Page loading', '', secondsField('browser_timeout_ms', 'Page timeout (seconds)', s.browser_timeout_ms ?? 30000, 5, 120)) +
-    '<details class="setting-card"><summary>Advanced browser options</summary>' +
-    select('interaction_pacing', 'Input timing', [['off','Standard input'],['paced','Paced input (slower)']], s.interaction_pacing || 'off') +
-    settingHelp('Applies to new browser sessions.') + legacyProfileSettings(s) + '</details>';
+    '<details class="setting-card"><summary>Advanced browser options</summary>' + check('suppress_passkey_prompts', 'Block passkey prompts in account browsers', s.suppress_passkey_prompts ?? true) + settingHelp('New account browsers decline passkey creation and sign-in prompts before Windows opens a dialog. Password and verification-code entry remain available.') + legacyProfileSettings(s) + '</details>';
   const notifications = settingCard('App sounds', 'Keep the dashboard open to hear sounds. Preview also enables browser audio.',
     check('checkout_sound', 'Play a sound for completed checkouts', s.checkout_sound ?? true) +
     check('attention_sound', 'Play a sound when attention is needed', s.attention_sound ?? true) +
@@ -238,27 +250,29 @@ async function saveSettings(form) {
   const selectedBrowser = installedBrowsers?.find(b => b.id === settingsDraft.browser_channel);
   if (!settingsDraft.cdp_attach && selectedBrowser?.available === false && ('browser_channel' in patch || patch.cdp_attach === false))
     return settingsFieldError('This browser is not installed. Choose an installed browser.',form.elements.browser_channel);
+  const openDetails = [...form.querySelectorAll('details')].map(d => d.open);
+  const restoreDetails = () => document.querySelectorAll('#settings-form details').forEach((d,i) => { d.open = openDetails[i] || false; });
   settingsSaving = true; settingsError = ''; $('#settings-error').textContent = ''; updateSettingsStatus();
   try {
     const expected = Object.fromEntries(Object.keys(patch).filter(k => k !== 'webhook').map(k => [k, settingsBaseline[k]]));
     const saved = await api('settings','POST',{...patch,_expected:expected});
     state.settings = [saved]; settingsDraft = null; settingsBaseline = null;
-    settingsSavedMessage = Object.keys(patch).some(key => key.startsWith('fingerprint_') || ['browser_channel','show_browser_window','cdp_attach','cdp_endpoint','browser_timeout_ms','interaction_pacing'].includes(key))
+    settingsSavedMessage = Object.keys(patch).some(key => key.startsWith('fingerprint_') || ['suppress_passkey_prompts','browser_channel','show_browser_window','show_mouse_cursor','cdp_attach','cdp_endpoint','browser_timeout_ms','interaction_pacing','input_timing_preset','input_calibration_scope'].includes(key))
       ? 'Saved. Browser changes apply to new sessions.' : 'Saved. All changes are up to date.';
     settingsSaving = false;
-    $('#screen').innerHTML = settingsView(); updateSettingsStatus();
+    $('#screen').innerHTML = settingsView(); restoreDetails(); updateSettingsStatus();
     await refresh();
   } catch (err) {
     settingsSaving = false;
     // Restore disabled controls by rebuilding from the retained draft.
-    $('#screen').innerHTML = settingsView(); updateSettingsStatus();
+    $('#screen').innerHTML = settingsView(); restoreDetails(); updateSettingsStatus();
     const key = Object.keys(patch).find(k => err.message.includes(k));
     settingsFieldError(err.message, key ? $('#settings-form').elements[key] : null);
   }
 }
 
 function troubleshootingView() {
-  return `<div class="troubleshooting"><button type="button" data-view="settings">← Settings (drafts kept)</button>${settingCard('Activity', '', '<div class="setting-actions"><button type="button" data-context-view="events">Activity log</button><button type="button" data-context-view="feed">Monitor observations</button></div>')}${settingCard('AI browser recovery tests','These tests make API calls and may incur provider charges. They use a local fixture, without opening retailer accounts or placing orders.',(state.ai_connections || []).map(c => `<article class="connection-card"><h4>${esc(c.name)}</h4><p>${esc(c.browser_health?.message || 'Not tested')}</p><button type="button" data-ai-recovery="${esc(c.id)}">Test browser recovery</button></article>`).join('') || '<p>Add a connection in Settings first.</p>')}${settingCard('Recent browser recovery','Only interrupted tasks enter recovery.',(state.browser_recovery?.recent || []).slice(-8).reverse().map(r => `<p>${esc(r.action.toLowerCase().replaceAll('_',' '))} ? ${esc(({recovered:'Resumed',failed:'Needs attention',cancelled:'Stopped',busy:'Needs attention'})[r.status] || r.status)} ? ${Number(r.duration_ms).toFixed(0)} ms</p>`).join('') || '<p>No recovery needed this session.</p>')}${settingCard('Recent AI activity','',(state.agent_runs || []).slice(-8).reverse().map(r => `<p>${esc(r.action)} · ${esc(r.status)} · ${r.steps || 0} model calls</p>`).join('') || '<p>No activity yet.</p>')}${settingCard('Diagnostic evidence','Traces can contain account details.', '<div class="diagnostic-list">' + ((state.diagnostics || []).map(d => `<button type="button" data-diagnostic="${esc(d.id)}">${esc(d.action)} · ${esc(time(d.at))}</button>`).join('') || '<p>No diagnostic evidence recorded.</p>') + '</div>' + repairsView())}</div>`;
+  return `<div class="troubleshooting"><button type="button" data-view="settings">← Settings (drafts kept)</button>${settingCard('Activity', '', '<div class="setting-actions"><button type="button" data-context-view="events">Activity log</button><button type="button" data-context-view="feed">Monitor observations</button></div>')}${settingCard('AI browser recovery tests','These tests make API calls and may incur provider charges. They use a local fixture, without opening retailer accounts or placing orders.',(state.ai_connections || []).map(c => `<article class="connection-card"><h4>${esc(c.name)}</h4><p>${esc(c.browser_health?.message || 'Not tested')}</p><button type="button" data-ai-recovery="${esc(c.id)}">Test browser recovery</button></article>`).join('') || '<p>Add a connection in Settings first.</p>')}${settingCard('Recent browser recovery','Only interrupted tasks enter recovery.',(state.browser_recovery?.recent || []).slice(-8).reverse().map(r => `<p>${esc(r.action.toLowerCase().replaceAll('_',' '))} ? ${esc(({recovered:'Resumed',failed:'Needs attention',cancelled:'Stopped',busy:'Needs attention'})[r.status] || r.status)} ? ${Number(r.duration_ms).toFixed(0)} ms</p>`).join('') || '<p>No recovery needed this session.</p>')}${settingCard('Recent AI activity','',(state.agent_runs || []).slice(-8).reverse().map(r => `<p>${esc(r.action)} · ${esc(r.status)} · ${r.steps || 0} model calls</p>`).join('') || '<p>No activity yet.</p>')}${repairPipelineView()}${settingCard('Diagnostic evidence','Traces can contain account details.', '<div class="diagnostic-list">' + ((state.diagnostics || []).map(d => `<button type="button" data-diagnostic="${esc(d.id)}">${esc(d.action)} · ${esc(time(d.at))}</button>`).join('') || (state.diagnostics_indexing?'<p>Preparing older diagnostic summaries in the background...</p>':'<p>No diagnostic evidence recorded.</p>')) + '</div>' + repairsView())}</div>`;
 }
 
 document.addEventListener('input', event => {
@@ -306,3 +320,11 @@ window.addEventListener('beforeunload', event => {
   if (settingsDirty() || settingsSaving) { event.preventDefault(); event.returnValue = ''; }
 });
 window.addEventListener('resize', () => { if (view === 'settings') updateSettingsStatus(); });
+
+function repairPipelineView(){
+  const jobs=state.repair_queue||[],incidents=state.workflow_incidents||[];
+  const validated=jobs.filter(j=>j.status==='ready_for_review').length;
+  return settingCard('Verified recovery and source repair',`${incidents.length} retained failure patterns ? ${validated} validated repairs`,
+    '<button type="button" data-refresh-troubleshooting>Refresh diagnostics</button>'+
+    (jobs.map(j=>`<p>${esc(j.action.toLowerCase().replaceAll('_',' '))} ? ${esc(({pending:'Queued for an idle period',preparing:'Preparing isolated source',generating:'Generating regression and repair',validating:'Checking regression and performance',ready_for_review:'Validated; ready for review and restart',needs_review:'Needs developer review'})[j.status]||j.status)}<small>${esc(j.failure_type||'')}</small></p>`).join('')||'<p>No verified recoveries need a source repair.</p>'));
+}

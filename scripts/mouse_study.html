@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mouse movement study</title>
+<style>
+  :root {color-scheme:dark;font:15px system-ui;background:#101114;color:#eee}
+  body {margin:0;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+  header {padding:18px 24px;border-bottom:1px solid #393c44;display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+  h1 {font-size:20px;margin:0 0 5px} p {margin:0;color:#bfc5cf;line-height:1.5}
+  .copy {flex:1;min-width:240px} .actions {display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button {font:inherit;color:#eee;background:#262a32;border:1px solid #626b7a;border-radius:6px;padding:9px 13px;cursor:pointer}
+  button:focus-visible {outline:3px solid #a7c7ff;outline-offset:3px} button:disabled {opacity:.5;cursor:default}
+  #arena {position:relative;flex:1;min-height:100px;margin:14px;overflow:hidden;border:1px solid #343842;border-radius:8px}
+  #target {position:absolute;background:#285a92;border:2px solid #a4cbff;padding:0;display:none}
+  #instruction {position:absolute;inset:20px;display:grid;place-content:center;text-align:center;pointer-events:none}
+  #status {min-width:110px;font-variant-numeric:tabular-nums}
+  footer {padding:0 24px 14px;color:#aeb7c5;font-size:12px}
+  @media(max-width:500px){header{padding:12px;gap:10px}.actions{width:100%}footer{padding:0 14px 12px}}
+</style>
+<header><div class="copy"><h1>Mouse movement study</h1><p>Click each highlighted target at your normal pace. Move naturally; this is not a speed test.</p></div>
+<div class="actions"><span id="status" role="status">Connecting...</span><button id="start" disabled>Start study</button><button id="pause" disabled>Pause</button><button id="finish" disabled>Finish capture</button></div></header>
+<main id="arena" aria-label="Mouse study area"><div id="instruction"><p>24 clicks across different distances and target sizes.<br>You can pause or finish early.</p></div><button id="target" aria-label="Highlighted target">Click</button></main>
+<footer>Local mouse coordinates and timing only. No keyboard recording, screenshots or account data. Stops after 15 minutes.</footer>
+<script>
+(() => {
+  const arena=document.querySelector('#arena'),target=document.querySelector('#target'),status=document.querySelector('#status');
+  const start=document.querySelector('#start'),pause=document.querySelector('#pause'),finish=document.querySelector('#finish'),hint=document.querySelector('#instruction');
+  const positions=[[.8,.65],[.17,.24],[.36,.3],[.7,.18],[.55,.8],[.22,.66],[.82,.4],[.66,.5],
+    [.12,.79],[.74,.75],[.85,.2],[.42,.64],[.17,.4],[.31,.44],[.67,.24],[.81,.8],
+    [.45,.18],[.22,.73],[.62,.68],[.77,.63],[.15,.15],[.84,.4],[.36,.79],[.55,.38]];
+  const widths=[72,140,44,100,56,140,72,44];
+  let connected=false,active=false,paused=false,done=false,index=0,pointer=null,trial=null,pending=[],commands=[],totalMoves=0,misses=0,lastAt=-1;
+  let down=null;
+  const rect=e=>{const r=e.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}};
+  function render(){
+    start.disabled=!connected||active||done;pause.disabled=!active||done;finish.disabled=!connected||done;
+    pause.textContent=paused?'Resume':'Pause';
+    status.textContent=!connected?'Connecting...':done?'Capture finished':!active?'Ready':paused?'Paused':`${index} / 24 captured`;
+  }
+  function showTarget(){
+    if(index>=positions.length){complete();return;}
+    const r=arena.getBoundingClientRect(),[u,v]=positions[index];
+    const width=Math.min(widths[index%widths.length],r.width-24),height=index%3===0?56:38;
+    Object.assign(target.style,{width:width+'px',height:height+'px',left:(8+u*Math.max(0,r.width-width-18))+'px',top:(8+v*Math.max(0,r.height-height-18))+'px',display:'block'});
+    target.disabled=paused;hint.style.display='none';
+    trial={index,started:performance.now(),start:pointer?{...pointer}:null,target:rect(target),viewport:{width:innerWidth,height:innerHeight},points:[],misses:0};
+    down=null;render();
+  }
+  function complete(){
+    if(done)return;done=true;active=false;trial=null;down=null;target.style.display='none';
+    commands.push('finish');hint.style.display='grid';hint.firstElementChild.textContent='Capture finished. Tell me in chat so I can analyze and apply it.';render();
+  }
+  window.__mouseStudyDrain=()=>({trials:pending.splice(0),commands:commands.splice(0),completed:index,move_samples:totalMoves,misses,active,paused,done});
+  window.__mouseStudyConnect=()=>{connected=true;render();};
+  window.__mouseStudyStop=complete;
+  addEventListener('pointermove',event=>{
+    if(!event.isTrusted||event.pointerType!=='mouse')return;
+    pointer={x:event.clientX,y:event.clientY};
+    if(!active||paused||done||!trial||down)return;
+    const samples=event.getCoalescedEvents?.()||[];
+    for(const e of samples.length?samples:[event]){
+      const t=e.timeStamp;
+      if(t<=lastAt)continue;lastAt=t;
+      if(trial.points.length<4000&&totalMoves<150000){trial.points.push({t:t-trial.started,x:e.clientX,y:e.clientY});totalMoves++;}
+    }
+  },{passive:true});
+  addEventListener('pointerdown',e=>{
+    if(!e.isTrusted||e.pointerType!=='mouse'||e.button!==0||!active||paused||done||!trial)return;
+    if(e.target!==target){if(arena.contains(e.target)){trial.misses++;misses++;}return;}
+    down={t:e.timeStamp,x:e.clientX,y:e.clientY};
+    trial.target=rect(target);
+    trial.points.push({t:down.t-trial.started,x:down.x,y:down.y});
+  },true);
+  addEventListener('pointerup',e=>{
+    if(!e.isTrusted||e.pointerType!=='mouse'||e.button!==0||!trial||!down)return;
+    if(e.target!==target){down=null;return;}
+    trial.click={x:down.x,y:down.y,t:down.t-trial.started,hold:e.timeStamp-down.t};
+    pending.push(trial);index++;trial=null;down=null;
+    // Start the next trial after the click dispatch, so the old click cannot
+    // activate the newly positioned control or race a browser render.
+    requestAnimationFrame(()=>{if(!done&&!paused)showTarget();});
+  },true);
+  start.onclick=()=>{if(!connected||active||done)return;active=true;showTarget();};
+  pause.onclick=()=>{if(!active||done)return;paused=!paused;down=null;trial=null;
+    target.disabled=paused;if(!paused)showTarget();render();};
+  finish.onclick=complete;
+  addEventListener('resize',()=>{if(active&&!paused&&!done)showTarget();});
+  addEventListener('blur',()=>{if(active&&!paused&&!done){paused=true;trial=null;down=null;target.disabled=true;render();}});
+  render();
+})();
+</script></html>

@@ -12,8 +12,15 @@ from scripts.analyze_behavior_datasets import mouse_metrics
 
 def test_pacing_setting_validation(tmp_path):
     with TestClient(create_app(tmp_path), headers={'X-Retail-Client': 'dashboard'}) as client:
+        assert client.get('/api/state').json()['settings'][0]['input_timing_preset']=='balanced'
         assert client.post('/api/settings', json={'interaction_pacing': 'paced'}).status_code == 200
         assert client.post('/api/settings', json={'interaction_pacing': 'invalid'}).status_code == 422
+        for preset in behavior.TIMING_PRESETS:
+            assert client.post('/api/settings',json={'input_timing_preset':preset}).status_code==200
+            # Focused edits must not overwrite the selected preset.
+            assert client.post('/api/settings',json={'sound_volume':.6}).status_code==200
+            assert client.get('/api/state').json()['settings'][0]['input_timing_preset']==preset
+        assert client.post('/api/settings',json={'input_timing_preset':'unknown'}).status_code==422
 
 
 def test_mouse_analysis_uses_client_seconds_and_excludes_duplicate_timestamps():
@@ -55,7 +62,7 @@ def test_paced_browser_input_scroll_and_cancellation():
                 assert sum(event['type']=='wheel' for event in events) >= 3
                 keys = [event for event in events if event['type'] in ('keydown','keyup') and event['key'] != 'Shift']
                 holds = [keys[i+1]['t']-keys[i]['t'] for i in range(0,len(keys),2)]
-                assert len(holds) == 9 and min(holds) >= 25 and max(holds)-min(holds) > 5
+                assert len(holds) == 11 and min(holds) >= 25 and max(holds)-min(holds) > 5
                 assert all(e['shift'] for e in keys if e['type']=='keydown' and e['key'] in 'A+@_!?')
                 assert await page.evaluate('scrollY') > 0
                 box = await page.locator('#target').bounding_box()
@@ -81,7 +88,8 @@ def test_paced_browser_input_scroll_and_cancellation():
     asyncio.run(asyncio.wait_for(scenario(), 40))
 
 
-def test_pacing_keeps_native_target_checks_and_does_not_retry():
+@pytest.mark.parametrize('preset',list(behavior.TIMING_PRESETS))
+def test_pacing_keeps_native_target_checks_and_does_not_retry(preset):
     async def scenario():
         async with async_playwright() as driver:
             browser = await driver.chromium.launch(channel='chrome')
@@ -89,6 +97,7 @@ def test_pacing_keeps_native_target_checks_and_does_not_retry():
             context._retail_paced_input = True
             page = await context.new_page()
             try:
+                context._retail_input_timing_preset = preset
                 await page.set_content('''<button onclick="window.clicks++">Target</button>
                     <div style="position:fixed;inset:0;z-index:9">Overlay</div>
                     <script>window.clicks=0</script>''')
@@ -149,7 +158,8 @@ def test_paced_typing_checks_overlay_and_emits_balanced_us_modifiers():
     asyncio.run(asyncio.wait_for(scenario(), 30))
 
 
-def test_submission_revalidates_price_after_paced_movement():
+@pytest.mark.parametrize('preset',list(behavior.TIMING_PRESETS))
+def test_submission_revalidates_price_after_paced_movement(preset):
     async def scenario():
         async with async_playwright() as driver:
             browser = await driver.chromium.launch(channel='chrome')
@@ -157,6 +167,7 @@ def test_submission_revalidates_price_after_paced_movement():
             context._retail_paced_input = True
             page = await context.new_page()
             try:
+                context._retail_input_timing_preset = preset
                 await page.route('https://www.amazon.com/checkout/spc', lambda r:r.fulfill(body='<body></body>'))
                 await page.goto('https://www.amazon.com/checkout/spc')
                 await page.set_content('''<div id="spc-orders"><div data-asin="B012345678" data-quantity="1" data-condition="new" data-seller="Amazon.com">
@@ -173,3 +184,62 @@ def test_submission_revalidates_price_after_paced_movement():
             finally:
                 await browser.close()
     asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+@pytest.mark.parametrize('width',[390,1000])
+@pytest.mark.parametrize('recorded',[False,True])
+def test_paced_clicks_vary_inside_controls_and_match_pointer_destination(width,tmp_path,recorded):
+    async def scenario():
+        async with async_playwright() as driver:
+            browser=await driver.chromium.launch()
+            context=await browser.new_context(viewport={'width':width,'height':700})
+            context._retail_paced_input=True
+            if recorded:
+                from test_mouse_calibration import POINTER
+                from test_browsing_calibration import CALIBRATION
+                context._retail_browsing_input=True
+                context._retail_input_calibration={**CALIBRATION,'pointer':POINTER}
+            page=await context.new_page()
+            page._retail_paced_controller=behavior.PacedInput(page,seed=19)
+            try:
+                await page.set_content('''<style>
+                    button,input {position:fixed;box-sizing:border-box}
+                    #target {left:40px;top:70px;width:200px;height:60px;border:8px solid black;border-radius:20px}
+                    #text {left:40px;top:160px;width:200px;height:44px;border:4px solid black}
+                    #tiny {left:40px;top:240px;width:12px;height:12px;padding:0;border:1px solid black}
+                    #partial {left:-70px;top:300px;width:160px;height:44px;border:3px solid black}
+                    </style><button id="target">Fixture target</button><input id="text">
+                    <button id="tiny" aria-label="Tiny"></button><button id="partial">Partial</button>
+                    <script>window.hits=[];window.lastMove=null;
+                    document.addEventListener('mousemove',e=>window.lastMove={x:e.clientX,y:e.clientY});
+                    document.addEventListener('mousedown',e=>{
+                        const r=e.target.getBoundingClientRect();
+                        hits.push({id:e.target.id,x:e.clientX,y:e.clientY,trusted:e.isTrusted,
+                            left:r.left,top:r.top,width:r.width,height:r.height,move:window.lastMove});
+                    });</script>''')
+                for index in range(6):
+                    target=page.locator('#target')
+                    if index%2:target=await target.element_handle()
+                    await behavior.click(page,target)
+                await behavior.fill(page,page.locator('#text'),'Ax2!')
+                await behavior.click(page,page.locator('#tiny'))
+                await behavior.click(page,page.locator('#partial'))
+                hits=await page.evaluate('hits',isolated_context=False)
+                assert [h['id'] for h in hits]==['target']*6+['text','tiny','partial']
+                assert len({(h['x'],h['y']) for h in hits[:6]})>=5
+                for hit in hits:
+                    assert hit['trusted']
+                    assert max(0,hit['left']) < hit['x'] < min(width,hit['left']+hit['width'])
+                    assert hit['top'] < hit['y'] < hit['top']+hit['height']
+                    assert abs(hit['move']['x']-hit['x'])<=1
+                    assert abs(hit['move']['y']-hit['y'])<=1
+                assert sum(abs(h['x']-(h['left']+h['width']/2))>2 for h in hits[:6])>=4
+                assert await page.locator('#text').input_value()=='Ax2!'
+                # Caller-specified points retain their meaning; no mutation replay.
+                await behavior.click(page,page.locator('#target'),position={'x':30,'y':15})
+                explicit=(await page.evaluate('hits',isolated_context=False))[-1]
+                assert explicit['x']==78 and explicit['y']==93  # border + padding-relative offset
+                await page.screenshot(path=str(tmp_path/f'paced-{width}.png'))
+            finally:
+                await browser.close()
+    asyncio.run(asyncio.wait_for(scenario(),30))

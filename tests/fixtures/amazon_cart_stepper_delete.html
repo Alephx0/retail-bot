@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Cart deletion regression fixture</title>
+<style>body{font:16px system-ui;max-width:800px;margin:32px auto} .sc-list-item{padding:20px;border-bottom:1px solid #ddd}.sc-action-links{display:flex;gap:20px;align-items:center}fieldset{display:inline-block}input,button{padding:8px}</style>
+<h1>Captured cart control structure — synthetic items</h1>
+<form id="cart-form">
+<div id="sc-active-cart">
+  <div class="a-row sc-list-item" data-asin="B000000001" data-quantity="1" data-itemid="fixture-other-1">
+    <span class="sc-product-title">Unrelated item one</span>
+    <div class="a-row sc-action-links">
+      <span class="sc-action-quantity"><span class="sc-quantity-stepper">
+        <fieldset class="a-declarative a-stepper-expanding-fieldset" data-action="a-stepper">
+          <div class="a-stepper-inner-container"><div class="a-stepper-controls">
+            <button class="a-declarative" data-action="a-stepper-decrement" aria-label="Delete item" type="button">Trash</button>
+          </div></div>
+        </fieldset>
+      </span></span>
+      <span class="a-size-small sc-action-delete-active" data-action="delete-active" data-feature-id="delete-active">
+        <span class="a-declarative" data-action="sc-item-action">
+          <input name="submit.delete-active.fixture-other-1" value="Delete" data-action="delete-active" aria-label="Delete unrelated item one" type="submit" class="a-color-link" data-feature-id="item-delete-button">
+        </span>
+      </span>
+    </div>
+  </div>
+  <div class="a-row sc-list-item" data-asin="B012345678" data-quantity="2" data-itemid="fixture-target">
+    <span class="sc-product-title">Target item — keep quantity two</span>
+    <div class="a-row sc-action-links">
+      <button data-action="a-stepper-decrement" aria-label="Decrease quantity by one" type="button">Minus</button>
+      <input name="submit.delete-active.fixture-target" value="Delete" data-action="delete-active" aria-label="Delete target item" type="submit" data-feature-id="item-delete-button">
+    </div>
+  </div>
+  <div class="a-row sc-list-item" data-asin="B000000002" data-quantity="1" data-itemid="fixture-other-2">
+    <span class="sc-product-title">Unrelated item two</span>
+    <div class="a-row sc-action-links">
+      <button data-action="a-stepper-decrement" aria-label="Delete item" type="button">Trash</button>
+      <input name="submit.delete-active.fixture-other-2" value="Delete" data-action="delete-active" aria-label="Delete unrelated item two" type="submit" data-feature-id="item-delete-button">
+    </div>
+  </div>
+</div>
+<div id="sc-saved-cart"><div data-asin="B000000003" data-quantity="1">Saved for later — keep</div></div>
+</form>
+<script>
+window.cartEvents=[];
+document.addEventListener('click',e=>{
+  const stepper=e.target.closest('[data-action="a-stepper-decrement"]');
+  if(stepper)cartEvents.push({action:'stepper',asin:stepper.closest('[data-asin]').dataset.asin});
+});
+document.addEventListener('submit',e=>{
+  e.preventDefault();
+  const row=e.submitter.closest('[data-asin]');
+  cartEvents.push({action:'delete',asin:row.dataset.asin});row.remove();
+  const active=document.querySelector('#sc-active-cart');active.innerHTML=active.innerHTML;
+});
+</script>
+</html>
